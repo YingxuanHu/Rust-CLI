@@ -1,0 +1,10 @@
+# Default configuration for llm-cli. Copy to config dir or pass with --config.
+
+model = "llama3"
+llm_timeout_secs = 45
+cmd_timeout_secs = 60
+max_context_tokens = 4096
+streaming = true
+
+# Optional: set a custom history file path
+# history_path = "/path/to/history.jsonl"

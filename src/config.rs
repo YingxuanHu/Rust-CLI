@@ -44,14 +44,6 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn default_config_path() -> Option<PathBuf> {
-        default_config_path()
-    }
-
-    pub fn defaults() -> Self {
-        Config::default()
-    }
-
     fn apply_partial(&mut self, partial: PartialConfig) {
         if let Some(model) = partial.model {
             self.model = model;
