@@ -130,6 +130,14 @@ back to internal implementations with no UX change. This integration
 demonstrates standards-based composition without expanding scope beyond
 a few well-defined tools.
 
+## Operational Considerations
+
+To keep things safe when running commands, we’ll show a preview before anything is executed, such as git add, git commit, or git push. Users will be able to confirm the action before it runs. This will be implemented during Phase 3, along with smooth error handling for any failures.
+If Ollama isn’t available—whether it’s not installed, the server isn’t running, or the model isn’t found—the CLI will display a clear error message in the interface, such as “Can’t reach Ollama – is it running?”. We’ll introduce this basic detection in Phase 1 and refine the reconnect or retry experience in Phase 3.
+We’ll also allow default settings, like the model name and timeout values, and optionally remember command history. This configuration and persistence will tie into the session state work during Phases 2 and 3.
+For handling model responses, we’ll decide whether to stream output token-by-token or display it only after the full reply is generated. This choice will directly affect how we design the TUI and will be finalized in Phase 2.
+Finally, we plan to include lightweight testing early on. This will cover how high-level user intentions are mapped to actual commands and how git workflows behave using temporary directories instead of real remotes. These tests will be added ahead of the broader testing and documentation effort in Phase 5.
+
 ## Tentative Plan
 
 We have about two months to complete the project, which gives us enough
