@@ -30,6 +30,10 @@ impl SessionState {
             history: Vec::new(),
         }
     }
+
+    pub fn record(&mut self, message: Message) {
+        self.history.push(message);
+    }
 }
 
 fn find_git_root(start: &PathBuf) -> Option<PathBuf> {
