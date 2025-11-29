@@ -9,21 +9,25 @@ const DEFAULT_MODEL: &str = "llama3";
 #[derive(Debug, Clone)]
 pub struct Config {
     pub model: String,
+    pub system_prompt: String,
     pub llm_timeout_secs: u64,
     pub cmd_timeout_secs: u64,
     pub max_context_tokens: u32,
     pub streaming: bool,
     pub history_path: PathBuf,
+    pub request_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct PartialConfig {
     model: Option<String>,
+    system_prompt: Option<String>,
     llm_timeout_secs: Option<u64>,
     cmd_timeout_secs: Option<u64>,
     max_context_tokens: Option<u32>,
     streaming: Option<bool>,
     history_path: Option<PathBuf>,
+    request_timeout_secs: Option<u64>,
 }
 
 impl Config {
@@ -48,6 +52,9 @@ impl Config {
         if let Some(model) = partial.model {
             self.model = model;
         }
+        if let Some(system_prompt) = partial.system_prompt {
+            self.system_prompt = system_prompt;
+        }
         if let Some(llm_timeout_secs) = partial.llm_timeout_secs {
             self.llm_timeout_secs = llm_timeout_secs;
         }
@@ -63,12 +70,20 @@ impl Config {
         if let Some(history_path) = partial.history_path {
             self.history_path = history_path;
         }
+        if let Some(request_timeout_secs) = partial.request_timeout_secs {
+            self.request_timeout_secs = request_timeout_secs;
+        }
     }
 
     fn apply_env_overrides(&mut self) {
         if let Ok(val) = env::var("LLM_CLI_MODEL") {
             if !val.is_empty() {
                 self.model = val;
+            }
+        }
+        if let Ok(val) = env::var("LLM_CLI_SYSTEM_PROMPT") {
+            if !val.is_empty() {
+                self.system_prompt = val;
             }
         }
         if let Ok(val) = env::var("LLM_CLI_LLM_TIMEOUT_SECS") {
@@ -96,6 +111,11 @@ impl Config {
                 self.history_path = PathBuf::from(val);
             }
         }
+        if let Ok(val) = env::var("LLM_CLI_REQUEST_TIMEOUT_SECS") {
+            if let Ok(parsed) = val.parse() {
+                self.request_timeout_secs = parsed;
+            }
+        }
     }
 }
 
@@ -103,11 +123,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: DEFAULT_MODEL.to_string(),
+            system_prompt: "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct.".to_string(),
             llm_timeout_secs: 45,
             cmd_timeout_secs: 60,
             max_context_tokens: 4096,
             streaming: true,
             history_path: default_history_path(),
+            request_timeout_secs: 60,
         }
     }
 }
