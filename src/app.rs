@@ -1,12 +1,15 @@
 use std::{
-    io::{Read, stdout},
+    error::Error,
+    fs,
+    io::{self, Read, stdout},
+    path::PathBuf,
     process::Stdio,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -113,25 +116,12 @@ struct App {
 
 impl App {
     fn new(config: Config) -> Self {
-        let mut session = SessionState::new();
-        let mut messages = Vec::new();
         let (assistant_tx, assistant_rx) = mpsc::channel();
-
-        let system_msg = Message {
-            role: Role::System,
-            content: format!(
-                "LLM CLI ready. Model: {} (streaming: {}). Type to chat; Enter to submit; Esc/q/Ctrl+C to exit.",
-                config.model, config.streaming
-            ),
-        };
-        messages.push(system_msg.clone());
-        session.record(system_msg);
-
-        Self {
+        let mut app = Self {
             config,
-            session,
+            session: SessionState::new(),
             input: String::new(),
-            messages,
+            messages: Vec::new(),
             scroll: 0,
             pending_idxs: Vec::new(),
             input_history: Vec::new(),
@@ -140,61 +130,82 @@ impl App {
             assistant_tx,
             assistant_rx,
             should_quit: false,
-        }
+        };
+
+        let system_msg = format!(
+            "LLM CLI ready. Model: {} (streaming: {}). Type to chat; Enter to submit; Esc/q/Ctrl+C to exit.",
+            app.config.model, app.config.streaming
+        );
+        app.push_recorded(Role::System, system_msg);
+        app
     }
 
     fn poll_assistant(&mut self) {
         while let Ok(event) = self.assistant_rx.try_recv() {
             match event {
-                AssistantEvent::Token { idx, chunk } => {
-                    if let Some(msg) = self.messages.get_mut(idx) {
-                        msg.role = Role::Assistant;
-                        msg.content.push_str(&chunk);
-                    }
-                }
-                AssistantEvent::Completed { idx, content } => {
-                    let final_content = if let Some(msg) = self.messages.get(idx) {
-                        msg.content.clone()
-                    } else {
-                        String::new()
-                    };
-
-                    if let Some(msg) = self.messages.get_mut(idx) {
-                        msg.role = Role::Assistant;
-                        if let Some(provided) = content.clone() {
-                            msg.content = provided;
-                        }
-                    } else {
-                        self.messages.push(Message {
-                            role: Role::Assistant,
-                            content: content.clone().unwrap_or_else(String::new),
-                        });
-                    }
-                    self.session.record(Message {
-                        role: Role::Assistant,
-                        content: content.unwrap_or(final_content),
-                    });
-                    self.pending_idxs.retain(|&i| i != idx);
-                }
-                AssistantEvent::Failed { idx, error } => {
-                    let content = format!("Ollama error: {error}");
-                    if let Some(msg) = self.messages.get_mut(idx) {
-                        msg.role = Role::System;
-                        msg.content = content.clone();
-                    } else {
-                        self.messages.push(Message {
-                            role: Role::System,
-                            content: content.clone(),
-                        });
-                    }
-                    self.session.record(Message {
-                        role: Role::System,
-                        content,
-                    });
-                    self.pending_idxs.retain(|&i| i != idx);
-                }
+                AssistantEvent::Token { idx, chunk } => self.append_assistant_chunk(idx, chunk),
+                AssistantEvent::Completed { idx, content } => self.finish_assistant(idx, content),
+                AssistantEvent::Failed { idx, error } => self.fail_assistant(idx, error),
             }
             self.scroll = 0;
+        }
+    }
+
+    fn push_recorded(&mut self, role: Role, content: impl Into<String>) -> usize {
+        let content = content.into();
+        let idx = self.messages.len();
+        self.messages.push(Message {
+            role: role.clone(),
+            content: content.clone(),
+        });
+        self.session.record(Message { role, content });
+        self.scroll = 0;
+        idx
+    }
+
+    fn reply(&mut self, content: impl Into<String>) {
+        self.push_recorded(Role::Assistant, content);
+    }
+
+    fn append_assistant_chunk(&mut self, idx: usize, chunk: String) {
+        if let Some(msg) = self.messages.get_mut(idx) {
+            msg.role = Role::Assistant;
+            msg.content.push_str(&chunk);
+        }
+    }
+
+    fn finish_assistant(&mut self, idx: usize, content: Option<String>) {
+        let fallback = self
+            .messages
+            .get(idx)
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        let final_content = content.unwrap_or(fallback);
+
+        self.upsert_message(idx, Role::Assistant, final_content.clone());
+        self.session.record(Message {
+            role: Role::Assistant,
+            content: final_content,
+        });
+        self.pending_idxs.retain(|&i| i != idx);
+    }
+
+    fn fail_assistant(&mut self, idx: usize, error: String) {
+        let content = format!("Ollama error: {error}");
+        self.upsert_message(idx, Role::System, content.clone());
+        self.session.record(Message {
+            role: Role::System,
+            content,
+        });
+        self.pending_idxs.retain(|&i| i != idx);
+    }
+
+    fn upsert_message(&mut self, idx: usize, role: Role, content: String) {
+        if let Some(msg) = self.messages.get_mut(idx) {
+            msg.role = role;
+            msg.content = content;
+        } else {
+            self.messages.push(Message { role, content });
         }
     }
 }
@@ -241,23 +252,11 @@ fn submit_input(app: &mut App) {
     }
 
     let prompt = app.input.trim().to_string();
-    let user_msg = Message {
-        role: Role::User,
-        content: prompt.clone(),
-    };
-    app.session.record(user_msg.clone());
-    app.messages.push(user_msg);
-    if !prompt.is_empty()
-        && app
-            .input_history
-            .last()
-            .map(|s| s != &prompt)
-            .unwrap_or(true)
-    {
+    app.push_recorded(Role::User, prompt.clone());
+    if app.input_history.last().map_or(true, |s| s != &prompt) {
         app.input_history.push(prompt.clone());
     }
     app.history_idx = None;
-    app.scroll = 0;
     app.input.clear();
 
     if let Some(workflow) = app.pending_workflow.take() {
@@ -463,13 +462,7 @@ fn recall_history_next(app: &mut App) {
 fn handle_workflow_response(app: &mut App, workflow: WorkflowState, prompt: &str) {
     let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "y" | "yes");
     if !confirmed {
-        let msg = Message {
-            role: Role::Assistant,
-            content: "Workflow cancelled.".to_string(),
-        };
-        app.session.record(msg.clone());
-        app.messages.push(msg);
-        app.scroll = 0;
+        app.reply("Workflow cancelled.".to_string());
         return;
     }
 
@@ -481,54 +474,54 @@ fn handle_workflow_response(app: &mut App, workflow: WorkflowState, prompt: &str
 }
 
 fn run_save_work(app: &mut App, repo_root: &std::path::Path) {
-    let mut logs = Vec::new();
-
-    logs.push("Running save-work workflow…".to_string());
+    let mut logs = vec!["Running save-work workflow…".to_string()];
 
     let commit_msg =
         generate_commit_message(app, repo_root).unwrap_or_else(|| "chore: save work".to_string());
     logs.push(format!("Using commit message: {}", commit_msg));
 
-    match run_command(repo_root, "git", &["add", "-A"]) {
-        Ok(out) => logs.push(format!("git add -A OK\n{}", out)),
-        Err(err) => {
-            logs.push(format!("git add -A failed: {err}"));
-            emit_workflow_logs(app, logs);
-            return;
-        }
+    if !run_workflow_step(&mut logs, repo_root, "git add -A", "git", &["add", "-A"]) {
+        app.reply(logs.join("\n"));
+        return;
     }
 
-    match run_command(repo_root, "git", &["commit", "-m", &commit_msg]) {
-        Ok(out) => logs.push(format!("git commit OK\n{}", out)),
-        Err(err) => {
-            logs.push(format!("git commit failed: {err}"));
-            emit_workflow_logs(app, logs);
-            return;
-        }
+    if !run_workflow_step(
+        &mut logs,
+        repo_root,
+        "git commit",
+        "git",
+        &["commit", "-m", &commit_msg],
+    ) {
+        app.reply(logs.join("\n"));
+        return;
     }
 
-    match run_command(repo_root, "git", &["push"]) {
-        Ok(out) => logs.push(format!("git push OK\n{}", out)),
-        Err(err) => {
-            logs.push(format!("git push failed: {err}"));
-            emit_workflow_logs(app, logs);
-            return;
-        }
+    if !run_workflow_step(&mut logs, repo_root, "git push", "git", &["push"]) {
+        app.reply(logs.join("\n"));
+        return;
     }
 
     logs.push("Workflow completed successfully.".to_string());
-    emit_workflow_logs(app, logs);
+    app.reply(logs.join("\n"));
 }
 
-fn emit_workflow_logs(app: &mut App, logs: Vec<String>) {
-    let content = logs.join("\n");
-    let msg = Message {
-        role: Role::Assistant,
-        content,
-    };
-    app.session.record(msg.clone());
-    app.messages.push(msg);
-    app.scroll = 0;
+fn run_workflow_step(
+    logs: &mut Vec<String>,
+    repo_root: &std::path::Path,
+    label: &str,
+    program: &str,
+    args: &[&str],
+) -> bool {
+    match run_command(repo_root, program, args) {
+        Ok(out) => {
+            logs.push(format!("{label} OK\n{out}"));
+            true
+        }
+        Err(err) => {
+            logs.push(format!("{label} failed: {err}"));
+            false
+        }
+    }
 }
 
 fn run_command(cwd: &std::path::Path, program: &str, args: &[&str]) -> Result<String> {
@@ -536,9 +529,21 @@ fn run_command(cwd: &std::path::Path, program: &str, args: &[&str]) -> Result<St
         .args(args)
         .current_dir(cwd)
         .output()
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                anyhow!("command '{program}' not found in PATH")
+            } else {
+                e.into()
+            }
+        })
         .with_context(|| format!("running {program} {:?}", args))?;
 
     if !output.status.success() {
+        // Allow ripgrep exit code 1 (no matches) as a soft success.
+        if program == "rg" && output.status.code() == Some(1) {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            return Ok(stdout.trim().to_string());
+        }
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         bail!(
@@ -552,6 +557,16 @@ fn run_command(cwd: &std::path::Path, program: &str, args: &[&str]) -> Result<St
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     Ok(stdout.trim().to_string())
+}
+
+fn format_error(err: &anyhow::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current: Option<&(dyn Error + 'static)> = err.source();
+    while let Some(src) = current {
+        parts.push(src.to_string());
+        current = src.source();
+    }
+    parts.join(": ")
 }
 
 #[derive(Debug, Clone)]
@@ -586,29 +601,108 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
                 "Type 'yes' to run, anything else to cancel.",
             ]
             .join("\n");
-            let assistant_msg = Message {
-                role: Role::Assistant,
-                content: plan,
-            };
-            app.session.record(assistant_msg.clone());
-            app.messages.push(assistant_msg);
+            app.reply(plan);
             app.pending_workflow = Some(WorkflowState {
                 kind: WorkflowKind::SaveWork,
                 repo_root,
             });
-            app.scroll = 0;
         } else {
-            let assistant_msg = Message {
-                role: Role::Assistant,
-                content: "No git repository detected; cannot save work.".to_string(),
-            };
-            app.session.record(assistant_msg.clone());
-            app.messages.push(assistant_msg);
-            app.scroll = 0;
+            app.reply("No git repository detected; cannot save work.".to_string());
         }
         return true;
     }
+
+    if normalized.contains("git status") || normalized == "status" {
+        if let Some(repo_root) = app.session.repo_root.clone() {
+            match run_command(&repo_root, "git", &["status"]) {
+                Ok(out) => app.reply(out),
+                Err(err) => app.reply(format!("git status failed: {}", format_error(&err))),
+            }
+        } else {
+            app.reply("No git repository detected.".to_string());
+        }
+        return true;
+    }
+
+    if normalized.contains("find todos")
+        || normalized.contains("find todo")
+        || normalized == "todos"
+        || normalized.contains("todo")
+    {
+        let root = app
+            .session
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| app.session.cwd.clone());
+        let pattern = r"(?i)^\s*(?://|#|;|<!--|/\*+)\s*(TODO|FIXME)|^\s*(TODO|FIXME)";
+        match run_command(
+            &root,
+            "rg",
+            &["--no-heading", "--line-number", "--pcre2", pattern],
+        ) {
+            Ok(out) if out.trim().is_empty() => app.reply("No TODO/FIXME found.".to_string()),
+            Ok(out) => app.reply(format!("TODO/FIXME:\n{out}")),
+            Err(err) => app.reply(format!("Search failed: {}", format_error(&err))),
+        }
+        return true;
+    }
+
+    if normalized.contains("run tests") || normalized == "tests" {
+        if let Some(repo_root) = app.session.repo_root.clone() {
+            match run_command(&repo_root, "cargo", &["test"]) {
+                Ok(out) => app.reply(format!("cargo test output:\n{out}")),
+                Err(err) => app.reply(format!("cargo test failed: {}", format_error(&err))),
+            }
+        } else {
+            app.reply("Not in a cargo project; cannot run tests.".to_string());
+        }
+        return true;
+    }
+
+    if normalized.contains("draft commit") || normalized.contains("commit message") {
+        if let Some(repo_root) = app.session.repo_root.clone() {
+            match generate_commit_message(app, &repo_root) {
+                Some(msg) => app.reply(format!("Suggested commit message:\n{msg}")),
+                None => app
+                    .reply("Could not generate commit message (is anything staged?).".to_string()),
+            }
+        } else {
+            app.reply("No git repository detected; cannot draft a commit message.".to_string());
+        }
+        return true;
+    }
+
+    if let Some(path) = parse_show_file(prompt) {
+        let resolved = if path.is_absolute() {
+            path
+        } else if let Some(repo) = app.session.repo_root.clone() {
+            repo.join(path)
+        } else {
+            app.session.cwd.join(path)
+        };
+
+        match fs::read_to_string(&resolved) {
+            Ok(contents) => app.reply(format!("Contents of {}:\n{}", resolved.display(), contents)),
+            Err(err) => app.reply(format!("Could not read {}: {}", resolved.display(), err)),
+        }
+        return true;
+    }
+
     false
+}
+
+fn parse_show_file(prompt: &str) -> Option<PathBuf> {
+    let lower = prompt.to_lowercase();
+    let prefixes = ["show file ", "read file ", "open file ", "show "];
+    for p in prefixes {
+        if lower.starts_with(p) {
+            let rest = prompt[p.len()..].trim();
+            if !rest.is_empty() {
+                return Some(PathBuf::from(rest));
+            }
+        }
+    }
+    None
 }
 
 fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
@@ -640,24 +734,22 @@ fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
 }
 
 fn format_message_body(content: &str) -> Vec<String> {
-    let normalized = content.replace('\r', "");
     let mut lines_out = Vec::new();
 
-    for line in normalized.split('\n') {
+    for line in content.replace('\r', "").lines() {
         let trimmed = line.trim_end();
         if trimmed.contains('•') {
-            for chunk in trimmed.split('•') {
+            lines_out.extend(trimmed.split('•').filter_map(|chunk| {
                 let part = chunk.trim();
                 if part.is_empty() {
-                    continue;
+                    None
+                } else {
+                    Some(format!("• {part}"))
                 }
-                lines_out.push(format!("• {part}"));
-            }
-        } else if trimmed.starts_with("- ") {
-            lines_out.push(trimmed.to_string());
-        } else {
-            lines_out.push(trimmed.to_string());
+            }));
+            continue;
         }
+        lines_out.push(trimmed.to_string());
     }
 
     if lines_out.is_empty() {
@@ -686,13 +778,17 @@ fn generate_commit_message(app: &App, repo_root: &std::path::Path) -> Option<Str
     if !app.config.generate_commit_message {
         return None;
     }
-    let diff = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    let stat = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    let patch = run_command(
+        repo_root,
+        "git",
+        &["diff", "--cached", "--unified=3", "--max-count=1"],
+    )
+    .unwrap_or_default();
     let prompt = format!(
-        "Generate a concise git commit message (imperative mood, <=72 chars) for these staged changes:\n{}",
-        diff
+        "Generate a concise git commit message in imperative mood, <=72 chars.\nInclude scope if obvious. Avoid filler.\nStaged changes (stat):\n{stat}\n\nPatch snippet:\n{patch}\n\nReturn only the commit message."
     );
 
-    // Synchronous call: reuse streaming pipeline for simplicity (blocking here).
     let result = std::process::Command::new("ollama")
         .arg("run")
         .arg(&app.config.model)
