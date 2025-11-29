@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -105,6 +105,7 @@ struct App {
     pending_idxs: Vec<usize>,
     input_history: Vec<String>,
     history_idx: Option<usize>,
+    pending_workflow: Option<WorkflowState>,
     assistant_tx: mpsc::Sender<AssistantEvent>,
     assistant_rx: mpsc::Receiver<AssistantEvent>,
     should_quit: bool,
@@ -135,6 +136,7 @@ impl App {
             pending_idxs: Vec::new(),
             input_history: Vec::new(),
             history_idx: None,
+            pending_workflow: None,
             assistant_tx,
             assistant_rx,
             should_quit: false,
@@ -258,6 +260,15 @@ fn submit_input(app: &mut App) {
     app.scroll = 0;
     app.input.clear();
 
+    if let Some(workflow) = app.pending_workflow.take() {
+        handle_workflow_response(app, workflow, &prompt);
+        return;
+    }
+
+    if maybe_handle_intent(app, &prompt) {
+        return;
+    }
+
     // Insert placeholder assistant message and spawn background generation.
     let placeholder_idx = app.messages.len();
     app.messages.push(Message {
@@ -268,12 +279,19 @@ fn submit_input(app: &mut App) {
 
     let tx = app.assistant_tx.clone();
     let model = app.config.model.clone();
+    let system_prompt = app.config.system_prompt.clone();
+    let timeout_secs = app.config.request_timeout_secs;
     let prompt_for_thread = prompt.clone();
     thread::spawn(move || {
+        let composed_prompt = format!(
+            "{}\n\nUser: {}\nAssistant:",
+            system_prompt, prompt_for_thread
+        );
+
         let mut child = match std::process::Command::new("ollama")
             .arg("run")
             .arg(&model)
-            .arg(&prompt_for_thread)
+            .arg(&composed_prompt)
             .stdout(Stdio::piped())
             .spawn()
         {
@@ -287,9 +305,21 @@ fn submit_input(app: &mut App) {
             }
         };
 
+        let timeout = Duration::from_secs(timeout_secs);
+        let start = Instant::now();
+
         if let Some(mut stdout) = child.stdout.take() {
             let mut buf = [0u8; 1024];
             loop {
+                if start.elapsed() > timeout {
+                    let _ = tx.send(AssistantEvent::Failed {
+                        idx: placeholder_idx,
+                        error: format!("ollama run timed out after {timeout_secs}s"),
+                    });
+                    let _ = child.kill();
+                    return;
+                }
+
                 match stdout.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -304,6 +334,7 @@ fn submit_input(app: &mut App) {
                             idx: placeholder_idx,
                             error: format!("{err}"),
                         });
+                        let _ = child.kill();
                         return;
                     }
                 }
@@ -375,12 +406,20 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         Span::raw(&app.config.model).bold(),
         Span::raw(" | streaming: "),
         Span::raw(if app.config.streaming { "on" } else { "off" }).bold(),
+        Span::raw(" | style: bullets "),
         Span::raw(" | cwd: "),
         Span::raw(cwd_display),
         Span::raw(" | repo: "),
         Span::raw(repo_display),
         Span::raw(" | pending: "),
         Span::raw(app.pending_idxs.len().to_string()).bold(),
+        Span::raw(" | workflow: "),
+        Span::raw(if app.pending_workflow.is_some() {
+            "confirm"
+        } else {
+            "-"
+        })
+        .bold(),
         Span::raw(" | history: Ctrl+P/Ctrl+N | quit: Esc/q/Ctrl+C"),
     ]);
     let status = Paragraph::new(status_text);
@@ -419,6 +458,157 @@ fn recall_history_next(app: &mut App) {
     if let Some(val) = app.input_history.get(next_idx) {
         app.input = val.clone();
     }
+}
+
+fn handle_workflow_response(app: &mut App, workflow: WorkflowState, prompt: &str) {
+    let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "y" | "yes");
+    if !confirmed {
+        let msg = Message {
+            role: Role::Assistant,
+            content: "Workflow cancelled.".to_string(),
+        };
+        app.session.record(msg.clone());
+        app.messages.push(msg);
+        app.scroll = 0;
+        return;
+    }
+
+    match workflow.kind {
+        WorkflowKind::SaveWork => {
+            run_save_work(app, &workflow.repo_root);
+        }
+    }
+}
+
+fn run_save_work(app: &mut App, repo_root: &std::path::Path) {
+    let mut logs = Vec::new();
+
+    logs.push("Running save-work workflow…".to_string());
+
+    let commit_msg =
+        generate_commit_message(app, repo_root).unwrap_or_else(|| "chore: save work".to_string());
+    logs.push(format!("Using commit message: {}", commit_msg));
+
+    match run_command(repo_root, "git", &["add", "-A"]) {
+        Ok(out) => logs.push(format!("git add -A OK\n{}", out)),
+        Err(err) => {
+            logs.push(format!("git add -A failed: {err}"));
+            emit_workflow_logs(app, logs);
+            return;
+        }
+    }
+
+    match run_command(repo_root, "git", &["commit", "-m", &commit_msg]) {
+        Ok(out) => logs.push(format!("git commit OK\n{}", out)),
+        Err(err) => {
+            logs.push(format!("git commit failed: {err}"));
+            emit_workflow_logs(app, logs);
+            return;
+        }
+    }
+
+    match run_command(repo_root, "git", &["push"]) {
+        Ok(out) => logs.push(format!("git push OK\n{}", out)),
+        Err(err) => {
+            logs.push(format!("git push failed: {err}"));
+            emit_workflow_logs(app, logs);
+            return;
+        }
+    }
+
+    logs.push("Workflow completed successfully.".to_string());
+    emit_workflow_logs(app, logs);
+}
+
+fn emit_workflow_logs(app: &mut App, logs: Vec<String>) {
+    let content = logs.join("\n");
+    let msg = Message {
+        role: Role::Assistant,
+        content,
+    };
+    app.session.record(msg.clone());
+    app.messages.push(msg);
+    app.scroll = 0;
+}
+
+fn run_command(cwd: &std::path::Path, program: &str, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("running {program} {:?}", args))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        bail!(
+            "{program} {:?} exited with {}.\nstdout:\n{}\nstderr:\n{}",
+            args,
+            output.status,
+            stdout,
+            stderr
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(stdout.trim().to_string())
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowState {
+    kind: WorkflowKind,
+    repo_root: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone)]
+enum WorkflowKind {
+    SaveWork,
+}
+
+fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
+    let normalized = prompt.to_lowercase();
+    if normalized.contains("save work") {
+        if let Some(repo_root) = app.session.repo_root.clone() {
+            let status_preview = match run_command(&repo_root, "git", &["status", "--short"]) {
+                Ok(out) => out,
+                Err(err) => format!("(git status failed: {err})"),
+            };
+            let plan = [
+                "Planned git workflow:",
+                "• git status (preview)",
+                "• git add -A",
+                "• git commit -m \"chore: save work\"",
+                "• git push",
+                "",
+                "Status preview:",
+                &status_preview,
+                "",
+                "Type 'yes' to run, anything else to cancel.",
+            ]
+            .join("\n");
+            let assistant_msg = Message {
+                role: Role::Assistant,
+                content: plan,
+            };
+            app.session.record(assistant_msg.clone());
+            app.messages.push(assistant_msg);
+            app.pending_workflow = Some(WorkflowState {
+                kind: WorkflowKind::SaveWork,
+                repo_root,
+            });
+            app.scroll = 0;
+        } else {
+            let assistant_msg = Message {
+                role: Role::Assistant,
+                content: "No git repository detected; cannot save work.".to_string(),
+            };
+            app.session.record(assistant_msg.clone());
+            app.messages.push(assistant_msg);
+            app.scroll = 0;
+        }
+        return true;
+    }
+    false
 }
 
 fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
@@ -491,4 +681,33 @@ fn clip_lines_from_bottom<'a>(
     let end = total.saturating_sub(offset);
     let start = end.saturating_sub(height);
     lines[start..end].to_vec()
+}
+fn generate_commit_message(app: &App, repo_root: &std::path::Path) -> Option<String> {
+    if !app.config.generate_commit_message {
+        return None;
+    }
+    let diff = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    let prompt = format!(
+        "Generate a concise git commit message (imperative mood, <=72 chars) for these staged changes:\n{}",
+        diff
+    );
+
+    // Synchronous call: reuse streaming pipeline for simplicity (blocking here).
+    let result = std::process::Command::new("ollama")
+        .arg("run")
+        .arg(&app.config.model)
+        .arg(prompt)
+        .output()
+        .ok()?;
+
+    if !result.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+    let first_line = stdout.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        None
+    } else {
+        Some(first_line.to_string())
+    }
 }
