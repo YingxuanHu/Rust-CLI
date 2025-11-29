@@ -22,6 +22,7 @@ bash scripts/health.sh llama3
 - Max context: 4096 tokens.
 - Streaming responses: on by default.
 - History file: `~/.local/state/llm-cli/history.jsonl` (or `~/Library/Application Support/llm-cli/history.jsonl` on macOS).
+ - Generate commit message: on by default.
 
 ## Setup and Usage
 - Prereqs: Rust toolchain (rustup/cargo), Ollama 0.13+ running (`ollama serve`).
@@ -34,3 +35,15 @@ bash scripts/health.sh llama3
 ## Notes
 - If the health check warns the model is missing, pull it with `ollama pull <model>`.
 - If the daemon is unreachable, start it with `ollama serve` before running the CLI.
+
+## Built-in commands/intents
+- Chat: type any prompt; responses stream live.
+- Save work: `save work` → shows git plan + status preview; reply `yes` to run `git add -A`, `git commit` (LLM-generated message by default), and `git push`.
+- Git status: `git status` or `status` (must be in a git repo).
+- Find TODOs: `find todos`/`find todo`/`todos` (requires `rg`/ripgrep on PATH).
+- Show file: `show file <path>`/`read file <path>`/`show <path>` (relative to repo root or cwd).
+- Input history: `Ctrl+P`/`Ctrl+N`; scroll log with arrows/PgUp/PgDn; quit with Esc/q/Ctrl+C.
+
+## Tooling dependencies
+- Ripgrep (`rg`) for TODO search. Install via Homebrew: `brew install ripgrep` (or your package manager). Ensure `rg` is on `PATH`.
+- Git for status/save-work. Ensure your repo is initialized and remotes set up for push.
