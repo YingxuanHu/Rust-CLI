@@ -16,6 +16,7 @@ pub struct Config {
     pub streaming: bool,
     pub history_path: PathBuf,
     pub request_timeout_secs: u64,
+    pub generate_commit_message: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -28,6 +29,7 @@ struct PartialConfig {
     streaming: Option<bool>,
     history_path: Option<PathBuf>,
     request_timeout_secs: Option<u64>,
+    generate_commit_message: Option<bool>,
 }
 
 impl Config {
@@ -73,6 +75,9 @@ impl Config {
         if let Some(request_timeout_secs) = partial.request_timeout_secs {
             self.request_timeout_secs = request_timeout_secs;
         }
+        if let Some(generate_commit_message) = partial.generate_commit_message {
+            self.generate_commit_message = generate_commit_message;
+        }
     }
 
     fn apply_env_overrides(&mut self) {
@@ -116,6 +121,11 @@ impl Config {
                 self.request_timeout_secs = parsed;
             }
         }
+        if let Ok(val) = env::var("LLM_CLI_GENERATE_COMMIT_MESSAGE") {
+            if let Ok(parsed) = parse_bool(&val) {
+                self.generate_commit_message = parsed;
+            }
+        }
     }
 }
 
@@ -130,6 +140,7 @@ impl Default for Config {
             streaming: true,
             history_path: default_history_path(),
             request_timeout_secs: 60,
+            generate_commit_message: true,
         }
     }
 }

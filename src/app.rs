@@ -485,6 +485,10 @@ fn run_save_work(app: &mut App, repo_root: &std::path::Path) {
 
     logs.push("Running save-work workflow…".to_string());
 
+    let commit_msg =
+        generate_commit_message(app, repo_root).unwrap_or_else(|| "chore: save work".to_string());
+    logs.push(format!("Using commit message: {}", commit_msg));
+
     match run_command(repo_root, "git", &["add", "-A"]) {
         Ok(out) => logs.push(format!("git add -A OK\n{}", out)),
         Err(err) => {
@@ -494,7 +498,7 @@ fn run_save_work(app: &mut App, repo_root: &std::path::Path) {
         }
     }
 
-    match run_command(repo_root, "git", &["commit", "-m", "chore: save work"]) {
+    match run_command(repo_root, "git", &["commit", "-m", &commit_msg]) {
         Ok(out) => logs.push(format!("git commit OK\n{}", out)),
         Err(err) => {
             logs.push(format!("git commit failed: {err}"));
@@ -677,4 +681,33 @@ fn clip_lines_from_bottom<'a>(
     let end = total.saturating_sub(offset);
     let start = end.saturating_sub(height);
     lines[start..end].to_vec()
+}
+fn generate_commit_message(app: &App, repo_root: &std::path::Path) -> Option<String> {
+    if !app.config.generate_commit_message {
+        return None;
+    }
+    let diff = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    let prompt = format!(
+        "Generate a concise git commit message (imperative mood, <=72 chars) for these staged changes:\n{}",
+        diff
+    );
+
+    // Synchronous call: reuse streaming pipeline for simplicity (blocking here).
+    let result = std::process::Command::new("ollama")
+        .arg("run")
+        .arg(&app.config.model)
+        .arg(prompt)
+        .output()
+        .ok()?;
+
+    if !result.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+    let first_line = stdout.lines().next().unwrap_or("").trim();
+    if first_line.is_empty() {
+        None
+    } else {
+        Some(first_line.to_string())
+    }
 }
