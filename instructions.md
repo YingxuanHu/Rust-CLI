@@ -42,6 +42,9 @@ bash scripts/health.sh llama3
 - Git status: `git status` or `status` (must be in a git repo).
 - Find TODOs: `find todos`/`find todo`/`todos` (requires `rg`/ripgrep on PATH).
 - Show file: `show file <path>`/`read file <path>`/`show <path>` (relative to repo root or cwd).
+- Stage changes: `stage all`/`stage`/`git add -A` to stage everything, or `stage <path>`/`git add <path>` to stage specific paths.
+- Draft commit message: `draft commit message` (uses staged diff; returns a suggested message).
+- Run tests: `run tests`/`tests` (runs `cargo test` in the repo).
 - Input history: `Ctrl+P`/`Ctrl+N`; scroll log with arrows/PgUp/PgDn; quit with Esc/q/Ctrl+C.
 
 ## Tooling dependencies

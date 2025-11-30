@@ -151,6 +151,16 @@ impl App {
         }
     }
 
+    fn pending_placeholder(&mut self) -> usize {
+        let idx = self.messages.len();
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: "…".to_string(),
+        });
+        self.pending_idxs.push(idx);
+        idx
+    }
+
     fn push_recorded(&mut self, role: Role, content: impl Into<String>) -> usize {
         let content = content.into();
         let idx = self.messages.len();
@@ -164,7 +174,16 @@ impl App {
     }
 
     fn reply(&mut self, content: impl Into<String>) {
-        self.push_recorded(Role::Assistant, content);
+        let content = content.into();
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: content.clone(),
+        });
+        self.session.record(Message {
+            role: Role::Assistant,
+            content,
+        });
+        self.scroll = 0;
     }
 
     fn append_assistant_chunk(&mut self, idx: usize, chunk: String) {
@@ -460,38 +479,69 @@ fn recall_history_next(app: &mut App) {
 }
 
 fn handle_workflow_response(app: &mut App, workflow: WorkflowState, prompt: &str) {
-    let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "y" | "yes");
-    if !confirmed {
-        app.reply("Workflow cancelled.".to_string());
-        return;
-    }
-
     match workflow.kind {
-        WorkflowKind::SaveWork => {
-            run_save_work(app, &workflow.repo_root);
+        WorkflowKind::SaveWorkPlan => {
+            let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "y" | "yes");
+            if !confirmed {
+                app.reply("Workflow cancelled.".to_string());
+                return;
+            }
+
+            match run_command(&workflow.repo_root, "git", &["add", "-A"]) {
+                Ok(out) => {
+                    if !out.trim().is_empty() {
+                        app.reply(format!("git add -A output:\n{out}"));
+                    }
+                }
+                Err(err) => {
+                    app.reply(format!("git add -A failed: {}", format_error(&err)));
+                    return;
+                }
+            }
+
+            let suggested = generate_commit_message(&app.config, &workflow.repo_root)
+                .unwrap_or_else(|| "chore: save work".to_string());
+            app.pending_workflow = Some(WorkflowState {
+                kind: WorkflowKind::SaveWorkCommit {
+                    suggested: suggested.clone(),
+                },
+                repo_root: workflow.repo_root.clone(),
+            });
+            app.reply(format!(
+                "Suggested commit message:\n{}\nReply 'yes' to accept, or type a custom message. (Type 'cancel' to abort.)",
+                suggested
+            ));
+        }
+        WorkflowKind::SaveWorkCommit { suggested } => {
+            let lower = prompt.trim().to_lowercase();
+            if matches!(lower.as_str(), "cancel" | "no" | "n") {
+                app.reply("Workflow cancelled.".to_string());
+                return;
+            }
+            let commit_msg = if matches!(lower.as_str(), "yes" | "y") {
+                suggested
+            } else {
+                prompt.trim().to_string()
+            };
+            run_save_work(app, &workflow.repo_root, &commit_msg);
         }
     }
 }
 
-fn run_save_work(app: &mut App, repo_root: &std::path::Path) {
+fn run_save_work(app: &mut App, repo_root: &std::path::Path, commit_msg: &str) {
     let mut logs = vec!["Running save-work workflow…".to_string()];
 
-    let commit_msg =
-        generate_commit_message(app, repo_root).unwrap_or_else(|| "chore: save work".to_string());
     logs.push(format!("Using commit message: {}", commit_msg));
 
-    if !run_workflow_step(&mut logs, repo_root, "git add -A", "git", &["add", "-A"]) {
-        app.reply(logs.join("\n"));
-        return;
+    let (subject, body_lines) = split_commit_message(commit_msg);
+    let mut commit_args: Vec<String> = vec!["commit".into(), "-m".into(), subject];
+    for line in body_lines {
+        commit_args.push("-m".into());
+        commit_args.push(line);
     }
+    let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
 
-    if !run_workflow_step(
-        &mut logs,
-        repo_root,
-        "git commit",
-        "git",
-        &["commit", "-m", &commit_msg],
-    ) {
+    if !run_workflow_step(&mut logs, repo_root, "git commit", "git", &commit_arg_refs) {
         app.reply(logs.join("\n"));
         return;
     }
@@ -577,7 +627,8 @@ struct WorkflowState {
 
 #[derive(Debug, Clone)]
 enum WorkflowKind {
-    SaveWork,
+    SaveWorkPlan,
+    SaveWorkCommit { suggested: String },
 }
 
 fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
@@ -603,12 +654,34 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
             .join("\n");
             app.reply(plan);
             app.pending_workflow = Some(WorkflowState {
-                kind: WorkflowKind::SaveWork,
+                kind: WorkflowKind::SaveWorkPlan,
                 repo_root,
             });
         } else {
             app.reply("No git repository detected; cannot save work.".to_string());
         }
+        return true;
+    }
+
+    if normalized.starts_with("stage all")
+        || normalized == "stage"
+        || normalized.starts_with("git add -a")
+        || normalized.starts_with("git add -A")
+    {
+        if stage_paths(app, &[]) {
+            return true;
+        }
+    }
+
+    if normalized.starts_with("stage ") || normalized.starts_with("git add ") {
+        let parts: Vec<&str> = prompt.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 {
+            let path = parts[1].trim();
+            if !path.is_empty() && stage_paths(app, &[path]) {
+                return true;
+            }
+        }
+        app.reply("No path provided to stage.".to_string());
         return true;
     }
 
@@ -647,7 +720,8 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
         return true;
     }
 
-    if normalized.contains("run tests") || normalized == "tests" {
+    if normalized.contains("run tests") || normalized.contains("run test") || normalized == "tests"
+    {
         if let Some(repo_root) = app.session.repo_root.clone() {
             match run_command(&repo_root, "cargo", &["test"]) {
                 Ok(out) => app.reply(format!("cargo test output:\n{out}")),
@@ -661,11 +735,23 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
 
     if normalized.contains("draft commit") || normalized.contains("commit message") {
         if let Some(repo_root) = app.session.repo_root.clone() {
-            match generate_commit_message(app, &repo_root) {
-                Some(msg) => app.reply(format!("Suggested commit message:\n{msg}")),
-                None => app
-                    .reply("Could not generate commit message (is anything staged?).".to_string()),
-            }
+            // Show placeholder and compute in background.
+            let idx = app.pending_placeholder();
+            let tx = app.assistant_tx.clone();
+            let config = app.config.clone();
+            thread::spawn(move || {
+                let event = match generate_commit_message(&config, &repo_root) {
+                    Some(msg) => AssistantEvent::Completed {
+                        idx,
+                        content: Some(format!("Suggested commit message:\n{msg}")),
+                    },
+                    None => AssistantEvent::Failed {
+                        idx,
+                        error: "Could not generate commit message (is anything staged?).".into(),
+                    },
+                };
+                let _ = tx.send(event);
+            });
         } else {
             app.reply("No git repository detected; cannot draft a commit message.".to_string());
         }
@@ -703,6 +789,40 @@ fn parse_show_file(prompt: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn stage_paths(app: &mut App, paths: &[&str]) -> bool {
+    let Some(repo_root) = app.session.repo_root.clone() else {
+        app.reply("No git repository detected; cannot stage.".to_string());
+        return true;
+    };
+
+    let args: Vec<&str> = if paths.is_empty() {
+        vec!["add", "-A"]
+    } else {
+        let mut v = vec!["add"];
+        v.extend(paths.iter().copied());
+        v
+    };
+
+    match run_command(&repo_root, "git", &args) {
+        Ok(out) => {
+            let detail = if out.is_empty() {
+                "ok".to_string()
+            } else {
+                out
+            };
+            app.reply(format!("git {} ok\n{}", args.join(" "), detail));
+        }
+        Err(err) => {
+            app.reply(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                format_error(&err)
+            ));
+        }
+    }
+    true
 }
 
 fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
@@ -774,24 +894,31 @@ fn clip_lines_from_bottom<'a>(
     let start = end.saturating_sub(height);
     lines[start..end].to_vec()
 }
-fn generate_commit_message(app: &App, repo_root: &std::path::Path) -> Option<String> {
-    if !app.config.generate_commit_message {
+fn generate_commit_message(config: &Config, repo_root: &std::path::Path) -> Option<String> {
+    if !config.generate_commit_message {
         return None;
     }
     let stat = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    if stat.trim().is_empty() {
+        return None;
+    }
     let patch = run_command(
         repo_root,
         "git",
         &["diff", "--cached", "--unified=3", "--max-count=1"],
     )
     .unwrap_or_default();
+    let patch_snippet = if patch.len() > 4000 {
+        format!("{}...\n[truncated]", &patch[..4000])
+    } else {
+        patch
+    };
     let prompt = format!(
-        "Generate a concise git commit message in imperative mood, <=72 chars.\nInclude scope if obvious. Avoid filler.\nStaged changes (stat):\n{stat}\n\nPatch snippet:\n{patch}\n\nReturn only the commit message."
+        "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
     );
-
     let result = std::process::Command::new("ollama")
         .arg("run")
-        .arg(&app.config.model)
+        .arg(&config.model)
         .arg(prompt)
         .output()
         .ok()?;
@@ -800,10 +927,24 @@ fn generate_commit_message(app: &App, repo_root: &std::path::Path) -> Option<Str
         return None;
     }
     let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-    let first_line = stdout.lines().next().unwrap_or("").trim();
-    if first_line.is_empty() {
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
         None
     } else {
-        Some(first_line.to_string())
+        Some(trimmed.to_string())
     }
+}
+
+fn split_commit_message(msg: &str) -> (String, Vec<String>) {
+    let mut lines: Vec<String> = msg
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    if lines.is_empty() {
+        return ("chore: save work".to_string(), vec![]);
+    }
+    let subject = lines.remove(0);
+    (subject, lines)
 }
