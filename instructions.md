@@ -38,13 +38,14 @@ bash scripts/health.sh llama3
 
 ## Built-in commands/intents
 - Chat: type any prompt; responses stream live.
-- Save work: `save work` → shows git plan + status preview; reply `yes` to run `git add -A`, `git commit` (LLM-generated message by default), and `git push`.
-- Git status: `git status` or `status` (must be in a git repo).
+- Save work: `save work` → shows git plan + status preview; reply `yes` to stage/commit/push; then accept or override the suggested commit message.
+- Git status: `git status` or `status` (shows `status --short` and `diff --stat`; reply with a file path to view its diff).
 - Find TODOs: `find todos`/`find todo`/`todos` (requires `rg`/ripgrep on PATH).
 - Show file: `show file <path>`/`read file <path>`/`show <path>` (relative to repo root or cwd).
-- Stage changes: `stage all`/`stage`/`git add -A` to stage everything, or `stage <path>`/`git add <path>` to stage specific paths.
-- Draft commit message: `draft commit message` (uses staged diff; returns a suggested message).
-- Run tests: `run tests`/`tests` (runs `cargo test` in the repo).
+- Stage changes: `stage all`/`stage`/`git add -A` (confirms before running) or `stage <path>`/`git add <path>` (confirms before running).
+- Draft commit message: `draft commit message` (uses staged diff; returns a subject + bullets suggestion).
+- Commit only: `commit`/`commit only` (prompts with a suggested message, lets you accept or type your own, then runs `git commit` without push).
+- Run tests: `run tests`/`tests`/`run test` (runs `cargo test` in the repo).
 - Input history: `Ctrl+P`/`Ctrl+N`; scroll log with arrows/PgUp/PgDn; quit with Esc/q/Ctrl+C.
 
 ## Tooling dependencies

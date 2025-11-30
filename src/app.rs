@@ -525,6 +525,87 @@ fn handle_workflow_response(app: &mut App, workflow: WorkflowState, prompt: &str
             };
             run_save_work(app, &workflow.repo_root, &commit_msg);
         }
+        WorkflowKind::StagePlan { args } => {
+            if matches!(prompt.trim().to_lowercase().as_str(), "yes" | "y") {
+                let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                match run_command(&workflow.repo_root, "git", &arg_refs) {
+                    Ok(out) => {
+                        let detail = if out.trim().is_empty() {
+                            "ok".to_string()
+                        } else {
+                            out
+                        };
+                        app.reply(format!("git {} ok\n{}", args.join(" "), detail));
+                    }
+                    Err(err) => app.reply(format!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        format_error(&err)
+                    )),
+                }
+            } else {
+                app.reply("Staging cancelled.".to_string());
+            }
+        }
+        WorkflowKind::DiffPreview { file } => {
+            let input = prompt.trim();
+            if matches!(input.to_lowercase().as_str(), "cancel" | "no" | "n") {
+                app.reply("Cancelled.".to_string());
+                return;
+            }
+            if input.eq_ignore_ascii_case("yes") || input.eq_ignore_ascii_case("y") {
+                app.reply("Ok.".to_string());
+                return;
+            }
+            let target = if input.is_empty() {
+                file.unwrap_or_default()
+            } else {
+                input.to_string()
+            };
+            if target.is_empty() {
+                app.reply("No file specified.".to_string());
+                return;
+            }
+            let diff = run_command(&workflow.repo_root, "git", &["diff", "--", &target])
+                .unwrap_or_else(|e| format!("(git diff failed: {})", format_error(&e)));
+            app.reply(format!("Diff for {}:\n{}", target, diff));
+        }
+        WorkflowKind::CommitOnlyConfirm { suggested } => {
+            let lower = prompt.trim().to_lowercase();
+            if matches!(lower.as_str(), "cancel" | "no" | "n") {
+                app.reply("Commit cancelled.".to_string());
+                return;
+            }
+            let commit_msg = if matches!(lower.as_str(), "yes" | "y") {
+                suggested
+            } else {
+                prompt.trim().to_string()
+            };
+            let mut logs = vec![format!("Using commit message:\n{}", commit_msg)];
+            let (subject, body_lines) = split_commit_message(&commit_msg);
+            let mut commit_args: Vec<String> = vec!["commit".into(), "-m".into(), subject];
+            for line in body_lines {
+                commit_args.push("-m".into());
+                commit_args.push(line);
+            }
+            let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
+            if !run_workflow_step(
+                &mut logs,
+                &workflow.repo_root,
+                "git commit",
+                "git",
+                &commit_arg_refs,
+            ) {
+                app.reply(logs.join("\n"));
+                return;
+            }
+            logs.push("Commit completed (no push).".to_string());
+            app.reply(logs.join("\n"));
+        }
+        WorkflowKind::CommitOnlyPlan => {
+            // Should be replaced immediately by CommitOnlyConfirm in intent handler; keep as guard.
+            app.reply("Please provide or confirm a commit message.".to_string());
+        }
     }
 }
 
@@ -629,6 +710,10 @@ struct WorkflowState {
 enum WorkflowKind {
     SaveWorkPlan,
     SaveWorkCommit { suggested: String },
+    CommitOnlyPlan,
+    CommitOnlyConfirm { suggested: String },
+    StagePlan { args: Vec<String> },
+    DiffPreview { file: Option<String> },
 }
 
 fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
@@ -668,20 +753,90 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
         || normalized.starts_with("git add -a")
         || normalized.starts_with("git add -A")
     {
-        if stage_paths(app, &[]) {
-            return true;
-        }
+        app.pending_workflow = Some(WorkflowState {
+            kind: WorkflowKind::StagePlan {
+                args: vec!["add".into(), "-A".into()],
+            },
+            repo_root: app
+                .session
+                .repo_root
+                .clone()
+                .unwrap_or_else(|| app.session.cwd.clone()),
+        });
+        app.reply("Plan: git add -A\nReply 'yes' to run, anything else to cancel.");
+        return true;
     }
 
     if normalized.starts_with("stage ") || normalized.starts_with("git add ") {
         let parts: Vec<&str> = prompt.splitn(2, char::is_whitespace).collect();
         if parts.len() == 2 {
             let path = parts[1].trim();
-            if !path.is_empty() && stage_paths(app, &[path]) {
+            if !path.is_empty() {
+                app.pending_workflow = Some(WorkflowState {
+                    kind: WorkflowKind::StagePlan {
+                        args: vec!["add".into(), path.to_string()],
+                    },
+                    repo_root: app
+                        .session
+                        .repo_root
+                        .clone()
+                        .unwrap_or_else(|| app.session.cwd.clone()),
+                });
+                app.reply(format!(
+                    "Plan: git add {}\nReply 'yes' to run, anything else to cancel.",
+                    path
+                ));
                 return true;
             }
         }
         app.reply("No path provided to stage.".to_string());
+        return true;
+    }
+
+    if normalized.contains("git status") || normalized == "status" {
+        let root = app
+            .session
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| app.session.cwd.clone());
+        let status = run_command(&root, "git", &["status", "--short"])
+            .unwrap_or_else(|e| format!("(git status failed: {})", format_error(&e)));
+        let diffstat = run_command(&root, "git", &["diff", "--stat"])
+            .unwrap_or_else(|e| format!("(git diff --stat failed: {})", format_error(&e)));
+        app.pending_workflow = Some(WorkflowState {
+            kind: WorkflowKind::DiffPreview { file: None },
+            repo_root: root.clone(),
+        });
+        app.reply(format!(
+            "Status preview:\n{}\n\nDiff stat:\n{}\nReply with a file path to view its diff, 'yes' to continue, or anything else to cancel.",
+            status, diffstat
+        ));
+        return true;
+    }
+
+    if normalized.starts_with("commit ")
+        || normalized == "commit"
+        || normalized.contains("commit only")
+    {
+        if let Some(repo_root) = app.session.repo_root.clone() {
+            let suggested = generate_commit_message(&app.config, &repo_root)
+                .unwrap_or_else(|| "chore: update".to_string());
+            app.pending_workflow = Some(WorkflowState {
+                kind: WorkflowKind::CommitOnlyPlan,
+                repo_root,
+            });
+            app.reply(format!(
+                "Staged commit plan:\n- git commit with message:\n{}\n- (push not included)\nReply 'yes' to accept, or type a custom message. 'cancel' to abort.",
+                suggested
+            ));
+            // store suggestion in pending_workflow state
+            app.pending_workflow = Some(WorkflowState {
+                kind: WorkflowKind::CommitOnlyConfirm { suggested },
+                repo_root: app.session.repo_root.clone().unwrap(),
+            });
+        } else {
+            app.reply("No git repository detected; cannot commit.".to_string());
+        }
         return true;
     }
 
