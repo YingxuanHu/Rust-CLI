@@ -946,40 +946,6 @@ fn parse_show_file(prompt: &str) -> Option<PathBuf> {
     None
 }
 
-fn stage_paths(app: &mut App, paths: &[&str]) -> bool {
-    let Some(repo_root) = app.session.repo_root.clone() else {
-        app.reply("No git repository detected; cannot stage.".to_string());
-        return true;
-    };
-
-    let args: Vec<&str> = if paths.is_empty() {
-        vec!["add", "-A"]
-    } else {
-        let mut v = vec!["add"];
-        v.extend(paths.iter().copied());
-        v
-    };
-
-    match run_command(&repo_root, "git", &args) {
-        Ok(out) => {
-            let detail = if out.is_empty() {
-                "ok".to_string()
-            } else {
-                out
-            };
-            app.reply(format!("git {} ok\n{}", args.join(" "), detail));
-        }
-        Err(err) => {
-            app.reply(format!(
-                "git {} failed: {}",
-                args.join(" "),
-                format_error(&err)
-            ));
-        }
-    }
-    true
-}
-
 fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     for m in messages {
