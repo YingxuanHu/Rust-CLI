@@ -2,7 +2,7 @@ use std::{
     error::Error,
     fs,
     io::{self, Read, stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::mpsc,
     thread,
@@ -748,6 +748,36 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
         return true;
     }
 
+    if normalized.starts_with("rg ")
+        || normalized.starts_with("search ")
+        || normalized.starts_with("find pattern ")
+    {
+        let pattern = prompt
+            .splitn(2, char::is_whitespace)
+            .nth(1)
+            .unwrap_or("")
+            .trim();
+        if pattern.is_empty() {
+            app.reply("No pattern provided for search.".to_string());
+            return true;
+        }
+        let root = app
+            .session
+            .repo_root
+            .clone()
+            .unwrap_or_else(|| app.session.cwd.clone());
+        match run_command(
+            &root,
+            "rg",
+            &["--no-heading", "--line-number", "--color", "never", pattern],
+        ) {
+            Ok(out) if out.trim().is_empty() => app.reply("No matches found.".to_string()),
+            Ok(out) => app.reply(format!("Search results:\n{out}")),
+            Err(err) => app.reply(format!("Search failed: {}", format_error(&err))),
+        }
+        return true;
+    }
+
     if normalized.starts_with("stage all")
         || normalized == "stage"
         || normalized.starts_with("git add -a")
@@ -913,17 +943,120 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
         return true;
     }
 
-    if let Some(path) = parse_show_file(prompt) {
-        let resolved = if path.is_absolute() {
-            path
-        } else if let Some(repo) = app.session.repo_root.clone() {
-            repo.join(path)
-        } else {
-            app.session.cwd.join(path)
+    if normalized.starts_with("summarize ")
+        || normalized.starts_with("summarise ")
+        || normalized.starts_with("summarize file ")
+    {
+        let target = prompt
+            .splitn(2, char::is_whitespace)
+            .nth(1)
+            .unwrap_or("")
+            .trim();
+        if target.is_empty() {
+            app.reply("No path provided to summarize.".to_string());
+            return true;
+        }
+        let parsed = parse_path_with_range(target);
+        let resolved = resolve_path(&app.session, &parsed.path);
+        let content = match read_file_slice(&resolved, parsed.range) {
+            Ok(c) => c,
+            Err(err) => {
+                app.reply(format!("Could not read {}: {}", resolved.display(), err));
+                return true;
+            }
         };
+        let snippet = truncate_for_llm(&content, 6000);
+        let path_display = resolved.display().to_string();
+        let idx = app.pending_placeholder();
+        let tx = app.assistant_tx.clone();
+        let model = app.config.model.clone();
+        thread::spawn(move || {
+            let prompt = format!(
+                "Summarize this code/file. Highlight purpose and key behaviors. Be concise.\nPath: {}\nContent:\n{}",
+                path_display, snippet
+            );
+            let event = match run_ollama_blocking(&model, &prompt) {
+                Some(reply) => AssistantEvent::Completed {
+                    idx,
+                    content: Some(reply),
+                },
+                None => AssistantEvent::Failed {
+                    idx,
+                    error: "Summarization failed.".into(),
+                },
+            };
+            let _ = tx.send(event);
+        });
+        return true;
+    }
 
-        match fs::read_to_string(&resolved) {
-            Ok(contents) => app.reply(format!("Contents of {}:\n{}", resolved.display(), contents)),
+    if normalized.starts_with("explain ") || normalized.starts_with("ask file ") {
+        let parts = prompt.splitn(2, "--").collect::<Vec<_>>();
+        let path_part = parts.get(0).map(|s| s.trim()).unwrap_or("");
+        let question = parts
+            .get(1)
+            .map(|s| s.trim())
+            .unwrap_or("Explain this code.");
+        let path_str = path_part
+            .trim_start_matches("explain")
+            .trim_start_matches("ask file")
+            .trim();
+        if path_str.is_empty() {
+            app.reply("No path provided to explain.".to_string());
+            return true;
+        }
+        let parsed = parse_path_with_range(path_str);
+        let resolved = resolve_path(&app.session, &parsed.path);
+        let content = match read_file_slice(&resolved, parsed.range) {
+            Ok(c) => c,
+            Err(err) => {
+                app.reply(format!("Could not read {}: {}", resolved.display(), err));
+                return true;
+            }
+        };
+        let snippet = truncate_for_llm(&content, 6000);
+        let path_display = resolved.display().to_string();
+        let q = question.to_string();
+        let idx = app.pending_placeholder();
+        let tx = app.assistant_tx.clone();
+        let model = app.config.model.clone();
+        thread::spawn(move || {
+            let prompt = format!(
+                "Answer the question about this code snippet.\nPath: {}\nQuestion: {}\nSnippet:\n{}",
+                path_display, q, snippet
+            );
+            let event = match run_ollama_blocking(&model, &prompt) {
+                Some(reply) => AssistantEvent::Completed {
+                    idx,
+                    content: Some(reply),
+                },
+                None => AssistantEvent::Failed {
+                    idx,
+                    error: "Explain failed.".into(),
+                },
+            };
+            let _ = tx.send(event);
+        });
+        return true;
+    }
+
+    if let Some(path) = parse_show_file(prompt) {
+        let resolved = resolve_path(&app.session, &path.path);
+        match read_file_slice(&resolved, path.range) {
+            Ok(contents) => {
+                let header = if let Some((start, end)) = path.range {
+                    let end_disp = end.map(|e| e.to_string()).unwrap_or_else(|| "...".into());
+                    format!(
+                        "Contents of {} ({}-{}):\n",
+                        resolved.display(),
+                        start,
+                        end_disp
+                    )
+                } else {
+                    format!("Contents of {}:\n", resolved.display())
+                };
+                app.reply(format!("{}{}", header, contents));
+            }
             Err(err) => app.reply(format!("Could not read {}: {}", resolved.display(), err)),
         }
         return true;
@@ -932,18 +1065,81 @@ fn maybe_handle_intent(app: &mut App, prompt: &str) -> bool {
     false
 }
 
-fn parse_show_file(prompt: &str) -> Option<PathBuf> {
+fn parse_show_file(prompt: &str) -> Option<ParsedPath> {
     let lower = prompt.to_lowercase();
     let prefixes = ["show file ", "read file ", "open file ", "show "];
     for p in prefixes {
         if lower.starts_with(p) {
             let rest = prompt[p.len()..].trim();
             if !rest.is_empty() {
-                return Some(PathBuf::from(rest));
+                return Some(parse_path_with_range(rest));
             }
         }
     }
     None
+}
+
+struct ParsedPath {
+    path: PathBuf,
+    range: Option<(usize, Option<usize>)>,
+}
+
+fn parse_path_with_range(input: &str) -> ParsedPath {
+    // Split on the last ':' if the suffix looks like a range (N or N-M).
+    let mut path = input.to_string();
+    let mut range: Option<(usize, Option<usize>)> = None;
+    if let Some(idx) = input.rfind(':') {
+        let (p, rest) = input.split_at(idx);
+        let rest = rest.trim_start_matches(':').trim();
+        if let Some((start, end)) = parse_range(rest) {
+            path = p.to_string();
+            range = Some((start, end));
+        }
+    }
+    ParsedPath {
+        path: PathBuf::from(path),
+        range,
+    }
+}
+
+fn parse_range(s: &str) -> Option<(usize, Option<usize>)> {
+    if s.is_empty() {
+        return None;
+    }
+    if let Some((a, b)) = s.split_once('-') {
+        let start: usize = a.trim().parse().ok()?;
+        if b.trim().is_empty() {
+            return Some((start, None));
+        }
+        let end: usize = b.trim().parse().ok()?;
+        return Some((start, Some(end)));
+    }
+    s.trim().parse::<usize>().ok().map(|start| (start, None))
+}
+
+fn resolve_path(session: &SessionState, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(repo) = session.repo_root.clone() {
+        repo.join(path)
+    } else {
+        session.cwd.join(path)
+    }
+}
+
+fn read_file_slice(path: &Path, range: Option<(usize, Option<usize>)>) -> io::Result<String> {
+    let content = fs::read_to_string(path)?;
+    if let Some((start, end)) = range {
+        let lines: Vec<&str> = content.lines().collect();
+        let start_idx = start.saturating_sub(1);
+        let end_idx = end.map(|e| e.saturating_sub(1)).unwrap_or(start_idx);
+        let end_idx = end_idx.min(lines.len().saturating_sub(1));
+        if start_idx >= lines.len() {
+            return Ok(String::new());
+        }
+        return Ok(lines[start_idx..=end_idx].join("\n"));
+    }
+    Ok(content)
 }
 
 fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
@@ -1037,23 +1233,7 @@ fn generate_commit_message(config: &Config, repo_root: &std::path::Path) -> Opti
     let prompt = format!(
         "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
     );
-    let result = std::process::Command::new("ollama")
-        .arg("run")
-        .arg(&config.model)
-        .arg(prompt)
-        .output()
-        .ok()?;
-
-    if !result.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    run_ollama_blocking(&config.model, &prompt)
 }
 
 fn split_commit_message(msg: &str) -> (String, Vec<String>) {
@@ -1068,4 +1248,30 @@ fn split_commit_message(msg: &str) -> (String, Vec<String>) {
     }
     let subject = lines.remove(0);
     (subject, lines)
+}
+
+fn run_ollama_blocking(model: &str, prompt: &str) -> Option<String> {
+    let output = std::process::Command::new("ollama")
+        .arg("run")
+        .arg(model)
+        .arg(prompt)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn truncate_for_llm(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    format!("{}...\n[truncated]", &text[..max_chars])
 }
