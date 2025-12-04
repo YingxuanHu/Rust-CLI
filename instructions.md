@@ -22,7 +22,7 @@ bash scripts/health.sh llama3
 - Max context: 4096 tokens.
 - Streaming responses: on by default.
 - History file: `~/.local/state/llm-cli/history.jsonl` (or `~/Library/Application Support/llm-cli/history.jsonl` on macOS).
- - Generate commit message: on by default.
+- Generate commit message: on by default.
 
 ## Setup and Usage
 - Prereqs: Rust toolchain (rustup/cargo), Ollama 0.13+ running (`ollama serve`).
@@ -41,11 +41,14 @@ bash scripts/health.sh llama3
 - Save work: `save work` → shows git plan + status preview; reply `yes` to stage/commit/push; then accept or override the suggested commit message.
 - Git status: `git status` or `status` (shows `status --short` and `diff --stat`; reply with a file path to view its diff).
 - Find TODOs: `find todos`/`find todo`/`todos` (requires `rg`/ripgrep on PATH).
-- Show file: `show file <path>`/`read file <path>`/`show <path>` (relative to repo root or cwd).
+- Ripgrep search: `rg <pattern>`/`search <pattern>` (runs from repo root if present, else cwd).
+- Show file: `show file <path>`/`read file <path>`/`show <path>` (relative to repo root or cwd). Supports line ranges: `show src/app.rs:10-40` or single line `:25`.
 - Stage changes: `stage all`/`stage`/`git add -A` (confirms before running) or `stage <path>`/`git add <path>` (confirms before running).
 - Draft commit message: `draft commit message` (uses staged diff; returns a subject + bullets suggestion).
 - Commit only: `commit`/`commit only` (prompts with a suggested message, lets you accept or type your own, then runs `git commit` without push).
 - Run tests: `run tests`/`tests`/`run test` (runs `cargo test` in the repo).
+- Summarize code: `summarize <path>` or `summarize <path>:start-end` to summarize a file/range.
+- Explain code: `explain <path> -- <question>` or `ask file <path> -- <question>` to get an answer about a snippet.
 - Input history: `Ctrl+P`/`Ctrl+N`; scroll log with arrows/PgUp/PgDn; quit with Esc/q/Ctrl+C.
 
 ## Tooling dependencies
