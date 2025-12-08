@@ -34,6 +34,12 @@ impl SessionState {
     pub fn record(&mut self, message: Message) {
         self.history.push(message);
     }
+
+    /// Change the current working directory and update repo_root if needed.
+    pub fn set_cwd(&mut self, new_cwd: PathBuf) {
+        self.cwd = new_cwd;
+        self.repo_root = find_git_root(&self.cwd);
+    }
 }
 
 fn find_git_root(start: &PathBuf) -> Option<PathBuf> {
