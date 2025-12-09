@@ -4,6 +4,8 @@
 //! vector embeddings and cosine similarity.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -13,8 +15,6 @@ use crate::tools::TOOLS;
 /// Default embedding model to use with Ollama.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
 
-/// Minimum similarity threshold to consider a match.
-pub const SIMILARITY_THRESHOLD: f32 = 0.5;
 
 /// Request body for Ollama embedding API.
 #[derive(Serialize)]
@@ -29,6 +29,17 @@ struct EmbeddingResponse {
     embedding: Vec<f32>,
 }
 
+/// Serializable cache structure for persistent storage.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct EmbeddingCacheData {
+    /// Model name used to generate embeddings
+    model: String,
+    /// Map from example phrase to (tool_name, embedding)
+    examples: HashMap<String, (String, Vec<f32>)>,
+    /// Version of the cache format (for future compatibility)
+    version: u32,
+}
+
 /// Cache of pre-computed embeddings for tool examples.
 pub struct EmbeddingCache {
     /// Map from example phrase to (tool_name, embedding)
@@ -39,14 +50,6 @@ pub struct EmbeddingCache {
     model: String,
 }
 
-/// Result of embedding-based intent matching.
-#[derive(Debug, Clone)]
-pub struct EmbeddingMatch {
-    pub tool: String,
-    pub similarity: f32,
-    #[allow(dead_code)] // Useful for debugging/logging
-    pub matched_example: String,
-}
 
 impl EmbeddingCache {
     /// Create a new embedding cache (embeddings not yet loaded).
@@ -58,9 +61,20 @@ impl EmbeddingCache {
         }
     }
 
-    /// Initialize the cache by computing embeddings for all tool examples.
+    /// Initialize the cache by loading from disk or computing embeddings.
     /// This should be called once at startup.
-    pub async fn initialize(&mut self) -> Result<()> {
+    pub async fn initialize(&mut self, cache_path: Option<&Path>) -> Result<()> {
+        // Try to load from cache first
+        if let Some(path) = cache_path {
+            if let Ok(()) = self.load_from_cache(path) {
+                tracing::info!("Loaded embeddings from cache: {}", path.display());
+                return Ok(());
+            } else {
+                tracing::info!("Cache not found or invalid, computing embeddings...");
+            }
+        }
+
+        // Compute embeddings from scratch
         for tool in TOOLS {
             for &example in tool.examples {
                 let embedding = self.get_embedding(example).await?;
@@ -70,6 +84,65 @@ impl EmbeddingCache {
                 );
             }
         }
+
+        // Save to cache if path is provided
+        if let Some(path) = cache_path {
+            if let Err(e) = self.save_to_cache(path) {
+                tracing::warn!("Failed to save embedding cache: {}", e);
+            } else {
+                tracing::info!("Saved embeddings to cache: {}", path.display());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load embeddings from a cache file.
+    fn load_from_cache(&mut self, path: &Path) -> Result<()> {
+        let contents = fs::read_to_string(path)
+            .context("reading embedding cache file")?;
+        
+        let cache_data: EmbeddingCacheData = toml::from_str(&contents)
+            .context("parsing embedding cache")?;
+
+        // Verify the model matches
+        if cache_data.model != self.model {
+            bail!(
+                "Cache model mismatch: cached '{}' vs current '{}'",
+                cache_data.model,
+                self.model
+            );
+        }
+
+        // Check version (currently only version 1 is supported)
+        if cache_data.version != 1 {
+            bail!("Unsupported cache version: {}", cache_data.version);
+        }
+
+        self.examples = cache_data.examples;
+        Ok(())
+    }
+
+    /// Save embeddings to a cache file.
+    fn save_to_cache(&self, path: &Path) -> Result<()> {
+        let cache_data = EmbeddingCacheData {
+            model: self.model.clone(),
+            examples: self.examples.clone(),
+            version: 1,
+        };
+
+        // Create parent directory if it doesn't exist
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .context("creating cache directory")?;
+        }
+
+        let contents = toml::to_string_pretty(&cache_data)
+            .context("serializing embedding cache")?;
+        
+        fs::write(path, contents)
+            .context("writing embedding cache file")?;
+
         Ok(())
     }
 
@@ -107,32 +180,6 @@ impl EmbeddingCache {
         Ok(embedding_response.embedding)
     }
 
-    /// Find the best matching tool for user input using cosine similarity.
-    pub async fn find_match(&self, user_input: &str) -> Result<Option<EmbeddingMatch>> {
-        if self.examples.is_empty() {
-            return Ok(None);
-        }
-
-        let input_embedding = self.get_embedding(user_input).await?;
-
-        let mut best_match: Option<EmbeddingMatch> = None;
-        let mut best_similarity: f32 = SIMILARITY_THRESHOLD;
-
-        for (example, (tool_name, example_embedding)) in &self.examples {
-            let similarity = cosine_similarity(&input_embedding, example_embedding);
-
-            if similarity > best_similarity {
-                best_similarity = similarity;
-                best_match = Some(EmbeddingMatch {
-                    tool: tool_name.clone(),
-                    similarity,
-                    matched_example: example.clone(),
-                });
-            }
-        }
-
-        Ok(best_match)
-    }
 }
 
 /// Compute cosine similarity between two vectors.

@@ -4,6 +4,7 @@ use crate::{
     commands::{format_error, run_command, split_commit_message},
     config::Config,
     file_ops,
+    learned::LearnedAliases,
 };
 
 use tokio::process::Command as TokioCommand;
@@ -26,10 +27,23 @@ pub enum WorkflowKind {
         content: String,
         overwrite: bool,
     },
+    CustomCommandConfirm {
+        original_input: String,
+        generated_cmd: String,
+        save_path: PathBuf,
+    },
+    #[allow(dead_code)]
+    ApplyDiff {
+        file: String,
+        original: String,
+        proposed: String,
+        description: String,
+    },
 }
 
 pub trait WorkflowResponder {
     fn reply(&mut self, content: impl Into<String>);
+    fn execute_shell_command(&mut self, cmd: &str);
 }
 
 pub fn handle_workflow_response<R: WorkflowResponder>(
@@ -60,6 +74,21 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
         } => {
             handle_write_file_confirm(responder, &workflow.repo_root, prompt, path, content, overwrite);
         }
+        WorkflowKind::CustomCommandConfirm {
+            original_input,
+            generated_cmd,
+            save_path,
+        } => {
+            handle_custom_command_confirm(responder, prompt, original_input, generated_cmd, save_path);
+        }
+        WorkflowKind::ApplyDiff {
+            file,
+            original,
+            proposed,
+            description,
+        } => {
+            handle_apply_diff(responder, &workflow.repo_root, prompt, file, original, proposed, description);
+        }
     }
 }
 
@@ -68,7 +97,7 @@ fn handle_save_work_plan<R: WorkflowResponder>(
     repo_root: &std::path::Path,
     prompt: &str,
 ) {
-    let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "y" | "yes");
+    let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "" | "y" | "yes");
     if !confirmed {
         responder.reply("Workflow cancelled.");
         return;
@@ -101,7 +130,7 @@ fn handle_save_work_commit<R: WorkflowResponder>(
         responder.reply("Workflow cancelled.");
         return;
     }
-    let commit_msg = if matches!(lower.as_str(), "yes" | "y") {
+    let commit_msg = if matches!(lower.as_str(), "" | "yes" | "y") {
         suggested
     } else {
         prompt.trim().to_string()
@@ -115,7 +144,7 @@ fn handle_stage_plan<R: WorkflowResponder>(
     prompt: &str,
     args: Vec<String>,
 ) {
-    if matches!(prompt.trim().to_lowercase().as_str(), "yes" | "y") {
+    if matches!(prompt.trim().to_lowercase().as_str(), "" | "yes" | "y") {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         match run_command(repo_root, "git", &arg_refs) {
             Ok(out) => {
@@ -148,7 +177,7 @@ fn handle_diff_preview<R: WorkflowResponder>(
         responder.reply("Cancelled.");
         return;
     }
-    if input.eq_ignore_ascii_case("yes") || input.eq_ignore_ascii_case("y") {
+    if input.is_empty() || input.eq_ignore_ascii_case("yes") || input.eq_ignore_ascii_case("y") {
         responder.reply("Ok.");
         return;
     }
@@ -177,7 +206,7 @@ fn handle_commit_only_confirm<R: WorkflowResponder>(
         responder.reply("Commit cancelled.");
         return;
     }
-    let commit_msg = if matches!(lower.as_str(), "yes" | "y") {
+    let commit_msg = if matches!(lower.as_str(), "" | "yes" | "y") {
         suggested
     } else {
         prompt.trim().to_string()
@@ -213,7 +242,7 @@ fn handle_write_file_confirm<R: WorkflowResponder>(
     overwrite: bool,
 ) {
     let lower = prompt.trim().to_lowercase();
-    if !matches!(lower.as_str(), "yes" | "y") {
+    if !matches!(lower.as_str(), "" | "yes" | "y") {
         responder.reply("File write cancelled.");
         return;
     }
@@ -228,6 +257,42 @@ fn handle_write_file_confirm<R: WorkflowResponder>(
             responder.reply(format!("Failed to write file: {}", err));
         }
     }
+}
+
+fn handle_apply_diff<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    file: String,
+    _original: String,
+    proposed: String,
+    _description: String,
+) {
+    let lower = prompt.trim().to_lowercase();
+    
+    if matches!(lower.as_str(), "cancel" | "no" | "n") {
+        responder.reply("Diff application cancelled.");
+        return;
+    }
+    
+    if matches!(lower.as_str(), "" | "yes" | "y") {
+        let target_path = PathBuf::from(&file);
+        match file_ops::write_file(&target_path, &proposed, repo_root) {
+            Ok(()) => {
+                responder.reply(format!("Applied changes to {}", file));
+            }
+            Err(err) => {
+                responder.reply(format!("Failed to apply changes: {}", err));
+            }
+        }
+        return;
+    }
+    
+    // For any other input, treat as "edit" - show the proposed content and ask again
+    responder.reply(format!(
+        "Edit mode not yet implemented. Press Enter (or type 'yes') to apply or 'no' to cancel.\n\nProposed content:\n{}",
+        &proposed[..proposed.len().min(500)]
+    ));
 }
 
 fn run_save_work_impl<R: WorkflowResponder>(
@@ -366,3 +431,84 @@ pub async fn generate_commit_message_async(
     }
 }
 
+
+fn handle_custom_command_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    prompt: &str,
+    original_input: String,
+    generated_cmd: String,
+    save_path: PathBuf,
+) {
+    let prompt_lower = prompt.trim().to_lowercase();
+    
+    // Check for edit command
+    if let Some(new_cmd) = prompt.trim().strip_prefix("edit:").or_else(|| prompt.trim().strip_prefix("edit ")) {
+        let edited_cmd = new_cmd.trim();
+        if !edited_cmd.is_empty() {
+            let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
+                .unwrap_or_else(|| save_path.clone());
+            let learned_project = if save_path.to_string_lossy().contains(".llm_cli") {
+                Some(save_path.as_path())
+            } else {
+                None
+            };
+            
+            let mut learned = LearnedAliases::load(&learned_global, learned_project).unwrap_or_default();
+            
+            if let Err(e) = learned.save_custom_command(
+                &original_input,
+                edited_cmd,
+                &save_path,
+                "user_custom_edited",
+            ) {
+                responder.reply(format!("Failed to save custom command: {}", e));
+            } else {
+                responder.reply(format!(
+                    "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                    original_input,
+                    edited_cmd
+                ));
+                
+                // Use execute_shell_command to properly expand handlers like {{GEN_COMMIT_MSG}}
+                responder.execute_shell_command(edited_cmd);
+            }
+        } else {
+            responder.reply("Empty command. Custom command not saved.");
+        }
+        return;
+    }
+    
+    if matches!(prompt_lower.as_str(), "" | "y" | "yes") {
+        let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
+            .unwrap_or_else(|| save_path.clone());
+        let learned_project = if save_path.to_string_lossy().contains(".llm_cli") {
+            Some(save_path.as_path())
+        } else {
+            None
+        };
+        
+        let mut learned = LearnedAliases::load(&learned_global, learned_project).unwrap_or_default();
+        
+        if let Err(e) = learned.save_custom_command(
+            &original_input,
+            &generated_cmd,
+            &save_path,
+            "user_custom_generated",
+        ) {
+            responder.reply(format!("Failed to save custom command: {}", e));
+        } else {
+            responder.reply(format!(
+                "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                original_input,
+                generated_cmd
+            ));
+            
+            // Use execute_shell_command to properly expand handlers like {{GEN_COMMIT_MSG}}
+            responder.execute_shell_command(&generated_cmd);
+        }
+    } else if matches!(prompt_lower.as_str(), "n" | "no" | "cancel") {
+        responder.reply("Custom command not saved.");
+    } else {
+        responder.reply("Please press Enter (or type 'yes') to confirm, 'edit: <new command>' to modify, or 'no' to cancel.");
+    }
+}

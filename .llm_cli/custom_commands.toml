@@ -1,0 +1,5 @@
+[[custom_commands]]
+phrase = "save to local"
+command = "git add -A && {{GEN_COMMIT_MSG}}"
+timestamp = "1765238602"
+source = "user_custom_generated"

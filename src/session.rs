@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::repo::RepoInfo;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     User,
@@ -17,6 +19,7 @@ pub struct Message {
 pub struct SessionState {
     pub cwd: PathBuf,
     pub repo_root: Option<PathBuf>,
+    pub repo_info: Option<RepoInfo>,
     pub history: Vec<Message>,
 }
 
@@ -24,9 +27,11 @@ impl SessionState {
     pub fn new() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let repo_root = find_git_root(&cwd);
+        let repo_info = RepoInfo::detect(&cwd);
         Self {
             cwd,
             repo_root,
+            repo_info,
             history: Vec::new(),
         }
     }
@@ -39,6 +44,7 @@ impl SessionState {
     pub fn set_cwd(&mut self, new_cwd: PathBuf) {
         self.cwd = new_cwd;
         self.repo_root = find_git_root(&self.cwd);
+        self.repo_info = RepoInfo::detect(&self.cwd);
     }
 }
 

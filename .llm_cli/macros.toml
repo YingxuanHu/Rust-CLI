@@ -1,0 +1,5 @@
+[[macros]]
+phrase = "yes"
+command = "git add -A && git diff --cached --stat && git commit"
+timestamp = "1765237407"
+source = "user_macro_generated"

@@ -1,6 +1,7 @@
 .venv
 
-
+# Local cache directory
+.cache/
 
 # Added by cargo
 

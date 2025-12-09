@@ -7,15 +7,22 @@ use tracing_subscriber::EnvFilter;
 mod app;
 mod commands;
 mod config;
+mod custom_command_generator;
 mod embedding;
 mod file_ops;
+mod fuzzy;
 mod handlers;
 mod input;
 mod intent;
+mod keyword_classifier;
+mod learned;
+mod llm_classifier;
 mod ollama;
+mod repo;
 mod session;
 mod tools;
 mod ui;
+mod user_feedback;
 mod workflow;
 
 #[derive(Debug, Parser)]

@@ -16,14 +16,18 @@ use std::sync::Arc;
 
 use crate::{
     config::Config,
+    custom_command_generator,
     embedding::EmbeddingCache,
     handlers::{dispatch_intent, AssistantEvent, IntentDispatcher},
     input::{expand_bang_shortcut, HistoryNavigation},
     intent::{self, ParsedIntent},
+    learned::LearnedAliases,
     ollama,
+    repo::ProjectType,
     session::{Message, Role, SessionState},
-    tools::ToolArgs,
+    tools::{ToolArgs, TOOLS},
     ui::{render_ui, AppView, InputMode, TerminalGuard},
+    user_feedback,
     workflow::{generate_commit_message, handle_workflow_response, WorkflowResponder, WorkflowState},
 };
 
@@ -31,14 +35,16 @@ pub async fn run(config: Config) -> Result<()> {
     ollama::ensure_available(&config.model)?;
 
     // Initialize embedding cache for semantic intent matching
-    let mut embedding_cache = EmbeddingCache::new(None);
+    let mut embedding_cache = EmbeddingCache::new(Some(&config.embedding_model));
     eprintln!("Initializing embedding cache (this may take a moment)...");
-    if let Err(e) = embedding_cache.initialize().await {
+    if let Err(e) = embedding_cache.initialize(Some(&config.embedding_cache_path)).await {
         eprintln!(
             "Warning: Could not initialize embeddings: {}. Falling back to direct chat.",
             e
         );
-        eprintln!("Tip: Run 'ollama pull nomic-embed-text' to enable semantic matching.");
+        eprintln!("Tip: Run 'ollama pull {}' to enable semantic matching.", config.embedding_model);
+    } else {
+        eprintln!("Embedding cache ready!");
     }
     let embedding_cache = Arc::new(embedding_cache);
 
@@ -92,6 +98,7 @@ struct App {
     input_history: Vec<String>,
     history_idx: Option<usize>,
     pending_workflow: Option<WorkflowState>,
+    pending_user_feedback: Option<String>,
     assistant_tx: mpsc::UnboundedSender<AssistantEvent>,
     assistant_rx: mpsc::UnboundedReceiver<AssistantEvent>,
     embedding_cache: Arc<EmbeddingCache>,
@@ -113,6 +120,7 @@ impl App {
             input_history: Vec::new(),
             history_idx: None,
             pending_workflow: None,
+            pending_user_feedback: None,
             assistant_tx,
             assistant_rx,
             embedding_cache,
@@ -203,6 +211,63 @@ impl App {
             .unwrap_or_default();
         let final_content = content.unwrap_or(fallback);
 
+        // Check for custom command generation signal
+        if final_content.starts_with("__CUSTOM_COMMAND_GENERATED__:") {
+            self.pending_idxs.retain(|&i| i != idx);
+            // Parse the signal: __CUSTOM_COMMAND_GENERATED__:original_input:generated_cmd:save_path
+            let parts: Vec<&str> = final_content.splitn(4, ':').collect();
+            if parts.len() >= 4 {
+                let original_input = parts[1];
+                let generated_cmd = parts[2];
+                let save_path_str = parts[3];
+                let save_path = std::path::PathBuf::from(save_path_str);
+                
+                // Show the generated command and ask for confirmation
+                self.reply(format!(
+                    "💡 Generated command:\n  {}\n\n\
+                     This will be saved as: \"{}\" → custom shell command\n\n\
+                     Options:\n\
+                     • Press Enter (or type 'yes') to confirm and execute\n\
+                     • Type 'edit: <new command>' to modify\n\
+                     • Type 'no' to cancel",
+                    generated_cmd,
+                    original_input
+                ));
+                
+                // Store for confirmation
+                self.pending_workflow = Some(WorkflowState {
+                    kind: crate::workflow::WorkflowKind::CustomCommandConfirm {
+                        original_input: original_input.to_string(),
+                        generated_cmd: generated_cmd.to_string(),
+                        save_path,
+                    },
+                    repo_root: self.session.repo_root.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
+                });
+                
+                // Clear pending feedback since we're now in confirmation workflow
+                self.pending_user_feedback = None;
+            }
+            return;
+        }
+
+        // Check for ask user signal from background task
+        if final_content.starts_with("__ASK_USER__:") {
+            self.pending_idxs.retain(|&i| i != idx);
+            // Remove the placeholder message
+            if idx < self.messages.len() {
+                self.messages.remove(idx);
+            }
+            // Extract original input
+            let original_input = final_content.strip_prefix("__ASK_USER__:")
+                .unwrap_or("")
+                .to_string();
+            self.pending_user_feedback = Some(original_input.clone());
+            // Show feedback prompt
+            let feedback = user_feedback::generate_feedback_prompt(&original_input);
+            self.reply(feedback);
+            return;
+        }
+
         // Check for intent signal from background task
         if final_content.starts_with("__INTENT__:") {
             self.pending_idxs.retain(|&i| i != idx);
@@ -278,6 +343,10 @@ impl IntentDispatcher for App {
         self.session.repo_root.clone()
     }
 
+    fn get_session_repo_info(&self) -> Option<crate::repo::RepoInfo> {
+        self.session.repo_info.clone()
+    }
+
     fn get_input_history(&self) -> &[String] {
         &self.input_history
     }
@@ -309,6 +378,10 @@ impl IntentDispatcher for App {
 impl WorkflowResponder for App {
     fn reply(&mut self, content: impl Into<String>) {
         self.reply(content);
+    }
+    
+    fn execute_shell_command(&mut self, cmd: &str) {
+        crate::handlers::handle_shell_dispatch(self, cmd);
     }
 }
 
@@ -350,13 +423,34 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 }
 
 fn submit_input(app: &mut App) {
-    if app.input.trim().is_empty() {
+    let raw_input = app.input.trim().to_string();
+    
+    // Allow empty input only if we have a pending workflow or feedback
+    if raw_input.is_empty() && app.pending_workflow.is_none() && app.pending_user_feedback.is_none() {
         return;
     }
 
-    let raw_input = app.input.trim().to_string();
     app.history_idx = None;
     app.input.clear();
+
+    // Handle user feedback response if we're waiting for one
+    if app.pending_user_feedback.is_some() {
+        handle_user_feedback_response(app, &raw_input);
+        return;
+    }
+
+    // Handle pending workflow confirmations first (before recording to history)
+    if app.pending_workflow.is_some() {
+        // Record the confirmation response (or empty for Enter)
+        let display_input = if raw_input.is_empty() { 
+            "[Enter]".to_string() 
+        } else { 
+            raw_input.clone() 
+        };
+        app.push_recorded(Role::User, display_input);
+        handle_pending_workflow(app, &raw_input);
+        return;
+    }
 
     // Handle bang shortcuts (!! and !prefix)
     if let Some(expanded) = expand_bang_shortcut(&app.input_history, &raw_input) {
@@ -390,46 +484,6 @@ fn submit_input(app: &mut App) {
         app.input_history.push(history_entry);
     }
 
-    // Handle pending workflow confirmations first
-    if let Some(workflow) = app.pending_workflow.take() {
-        // Need to handle special case for SaveWorkPlan
-        if matches!(workflow.kind, crate::workflow::WorkflowKind::SaveWorkPlan) {
-            let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "y" | "yes");
-            if confirmed {
-                // Run git add -A first
-                match crate::commands::run_command(&workflow.repo_root, "git", &["add", "-A"]) {
-                    Ok(out) => {
-                        if !out.trim().is_empty() {
-                            app.reply(format!("git add -A output:\n{out}"));
-                        }
-                    }
-                    Err(err) => {
-                        app.reply(format!("git add -A failed: {}", crate::commands::format_error(&err)));
-                        return;
-                    }
-                }
-
-                // Generate commit message and move to next step
-                let suggested = generate_commit_message(&app.config, &workflow.repo_root)
-                    .unwrap_or_else(|| "chore: save work".to_string());
-                app.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::SaveWorkCommit {
-                        suggested: suggested.clone(),
-                    },
-                    repo_root: workflow.repo_root.clone(),
-                });
-                app.reply(format!(
-                    "Suggested commit message:\n{}\nReply 'yes' to accept, or type a custom message. (Type 'cancel' to abort.)",
-                    suggested
-                ));
-            } else {
-                app.reply("Workflow cancelled.");
-            }
-        } else {
-            handle_workflow_response(app, workflow, &prompt);
-        }
-        return;
-    }
 
     // If in Shell mode, execute as shell command directly
     if app.input_mode == InputMode::Shell {
@@ -444,14 +498,33 @@ fn submit_input(app: &mut App) {
         }
     }
 
-    // Use embedding-based intent matching in background
+    // Use tiered intent resolution in background
     let tx = app.assistant_tx.clone();
     let model = app.config.model.clone();
+    let classifier_model = app.config.classifier_model.clone();
     let system_prompt = app.config.system_prompt.clone();
     let timeout_secs = app.config.request_timeout_secs;
     let prompt_for_task = prompt.clone();
     let embedding_cache = Arc::clone(&app.embedding_cache);
-    let use_embeddings = app.embedding_cache.is_initialized();
+    
+    // Load learned aliases
+    let learned_global = app.config.learned_path.clone();
+    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm_cli/learned.toml"));
+    
+    // Capture repo context before spawning
+    let repo_context = if let Some(info) = &app.session.repo_info {
+        let type_str = match info.project_type {
+            crate::repo::ProjectType::Rust => "Rust",
+            crate::repo::ProjectType::Node => "Node.js",
+            crate::repo::ProjectType::Python => "Python",
+            crate::repo::ProjectType::Go => "Go",
+            crate::repo::ProjectType::Unknown => "Unknown",
+        };
+        let name_str = info.name.as_deref().unwrap_or("unnamed");
+        format!("\n\nCurrent project: {} ({})", name_str, type_str)
+    } else {
+        String::new()
+    };
 
     // Insert placeholder for response
     let placeholder_idx = app.messages.len();
@@ -462,30 +535,42 @@ fn submit_input(app: &mut App) {
     app.pending_idxs.push(placeholder_idx);
 
     tokio::spawn(async move {
-        // Try embedding-based intent matching if available
-        if use_embeddings {
-            if let Ok(parsed) =
-                intent::parse_intent_with_embeddings(&embedding_cache, &prompt_for_task).await
-            {
-                // Non-chat intents get dispatched via signal to main thread
-                if parsed.tool != "chat" && parsed.confidence >= 0.5 {
-                    let _ = tx.send(AssistantEvent::Completed {
-                        idx: placeholder_idx,
-                        content: Some(format!(
-                            "__INTENT__:{}:{}",
-                            parsed.tool,
-                            serde_json::to_string(&parsed.args).unwrap_or_default()
-                        )),
-                    });
-                    return;
-                }
+        // Try tiered intent resolution
+        let learned = LearnedAliases::load(&learned_global, learned_project.as_deref()).unwrap_or_default();
+        
+        if let Ok(parsed) = intent::resolve_intent(
+            &prompt_for_task,
+            &embedding_cache,
+            &learned,
+            &classifier_model,
+        ).await {
+            // Check if we need to ask the user
+            if parsed.tool == "ask_user" {
+                let _ = tx.send(AssistantEvent::Completed {
+                    idx: placeholder_idx,
+                    content: Some(format!("__ASK_USER__:{}", prompt_for_task)),
+                });
+                return;
+            }
+            
+            // Non-chat intents get dispatched via signal to main thread
+            if parsed.tool != "chat" && parsed.confidence >= 0.3 {
+                let _ = tx.send(AssistantEvent::Completed {
+                    idx: placeholder_idx,
+                    content: Some(format!(
+                        "__INTENT__:{}:{}",
+                        parsed.tool,
+                        serde_json::to_string(&parsed.args).unwrap_or_default()
+                    )),
+                });
+                return;
             }
         }
 
         // Fall through to regular LLM chat
         let composed_prompt = format!(
-            "{}\n\nUser: {}\nAssistant:",
-            system_prompt, prompt_for_task
+            "{}{}\n\nUser: {}\nAssistant:",
+            system_prompt, repo_context, prompt_for_task
         );
 
         let mut child = match TokioCommand::new("ollama")
@@ -564,6 +649,47 @@ fn submit_input(app: &mut App) {
     });
 }
 
+fn handle_pending_workflow(app: &mut App, prompt: &str) {
+    if let Some(workflow) = app.pending_workflow.take() {
+        // Need to handle special case for SaveWorkPlan
+        if matches!(workflow.kind, crate::workflow::WorkflowKind::SaveWorkPlan) {
+            let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "" | "y" | "yes");
+            if confirmed {
+                // Run git add -A first
+                match crate::commands::run_command(&workflow.repo_root, "git", &["add", "-A"]) {
+                    Ok(out) => {
+                        if !out.trim().is_empty() {
+                            app.reply(format!("git add -A output:\n{out}"));
+                        }
+                    }
+                    Err(err) => {
+                        app.reply(format!("git add -A failed: {}", crate::commands::format_error(&err)));
+                        return;
+                    }
+                }
+
+                // Generate commit message and move to next step
+                let suggested = generate_commit_message(&app.config, &workflow.repo_root)
+                    .unwrap_or_else(|| "chore: save work".to_string());
+                app.pending_workflow = Some(WorkflowState {
+                    kind: crate::workflow::WorkflowKind::SaveWorkCommit {
+                        suggested: suggested.clone(),
+                    },
+                    repo_root: workflow.repo_root.clone(),
+                });
+                app.reply(format!(
+                    "Suggested commit message:\n{}\nPress Enter (or type 'yes') to accept, or type a custom message. (Type 'cancel' to abort.)",
+                    suggested
+                ));
+            } else {
+                app.reply("Workflow cancelled.");
+            }
+        } else {
+            handle_workflow_response(app, workflow, prompt);
+        }
+    }
+}
+
 fn recall_history_prev(app: &mut App) {
     let nav = HistoryNavigation::new(&app.input_history, app.input_mode);
     if let Some((idx, display)) = nav.get_prev(app.history_idx) {
@@ -583,6 +709,125 @@ fn recall_history_next(app: &mut App) {
             // Reached end of history; clear input
             app.history_idx = None;
             app.input.clear();
+        }
+    }
+}
+
+fn handle_user_feedback_response(app: &mut App, response: &str) {
+    let original_input = app.pending_user_feedback.take().unwrap();
+    
+    // Determine save path (prefer project-local if in a repo)
+    let save_path = if let Some(repo_root) = &app.session.repo_root {
+        repo_root.join(".llm_cli/learned.toml")
+    } else {
+        app.config.learned_path.clone()
+    };
+    
+    // Load current learned aliases
+    let learned_global = app.config.learned_path.clone();
+    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm_cli/learned.toml"));
+    let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref())
+        .unwrap_or_default();
+    
+    match user_feedback::parse_feedback_response(response) {
+        user_feedback::FeedbackResponse::None => {
+            app.reply("Okay, I won't learn this.");
+        }
+        
+        user_feedback::FeedbackResponse::ToolSelection(idx) => {
+            let tool = &TOOLS[idx];
+            
+            // Save the new alias
+            if let Err(e) = learned.save_alias(&original_input, tool.name, &save_path, "user_feedback") {
+                app.reply(format!("Failed to save learned alias: {}", e));
+            } else {
+                app.reply(format!("✓ Learned: \"{}\" → {}", original_input, tool.name));
+                
+                // Now execute the tool
+                let intent = ParsedIntent::new(tool.name, 1.0);
+                dispatch_intent(app, &intent, &original_input);
+            }
+        }
+        
+        user_feedback::FeedbackResponse::ExplicitCommand(custom_cmd) => {
+            // Save as a custom shell command
+            if let Err(e) = learned.save_custom_command(
+                &original_input,
+                &custom_cmd,
+                &save_path,
+                "user_custom",
+            ) {
+                app.reply(format!("Failed to save custom command: {}", e));
+            } else {
+                app.reply(format!(
+                    "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                    original_input,
+                    custom_cmd
+                ));
+                
+                // Execute the custom command
+                crate::handlers::handle_shell_dispatch(app, &custom_cmd);
+            }
+        }
+        
+        user_feedback::FeedbackResponse::NaturalLanguageDescription(description) => {
+            // Use LLM to generate the command
+            app.reply(format!("🤔 Generating command for: \"{}\"...", description));
+            
+            // Spawn background task to generate macro
+            let tx = app.assistant_tx.clone();
+            let model = app.config.model.clone();
+            let original_input_clone = original_input.clone();
+            let save_path_clone = save_path.clone();
+            
+            // Get repo context
+            let repo_context = if let Some(info) = &app.session.repo_info {
+                let type_str = match info.project_type {
+                    ProjectType::Rust => "Rust (Cargo)",
+                    ProjectType::Node => "Node.js (npm)",
+                    ProjectType::Python => "Python",
+                    ProjectType::Go => "Go",
+                    ProjectType::Unknown => "Unknown",
+                };
+                Some(format!("{} project", type_str))
+            } else {
+                None
+            };
+            
+            tokio::spawn(async move {
+                match custom_command_generator::generate_custom_command(
+                    &description,
+                    &model,
+                    repo_context.as_deref(),
+                ).await {
+                    Ok(generated_cmd) => {
+                        // Signal back with the generated command
+                        let _ = tx.send(AssistantEvent::Completed {
+                            idx: 0, // Dummy index
+                            content: Some(format!(
+                                "__CUSTOM_COMMAND_GENERATED__:{}:{}:{}",
+                                original_input_clone,
+                                generated_cmd,
+                                save_path_clone.display()
+                            )),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AssistantEvent::Failed {
+                            idx: 0,
+                            error: format!("Failed to generate command: {}", e),
+                        });
+                    }
+                }
+            });
+            
+            // Put the original input back so we can handle it later
+            app.pending_user_feedback = Some(original_input);
+        }
+        
+        user_feedback::FeedbackResponse::Invalid => {
+            app.reply("Invalid selection. Please type:\n  • A number (1-8) to select a tool\n  • Natural language description (e.g., 'stage and commit only')\n  • 'cmd: <command>' for explicit shell command\n  • 'none' to skip");
+            app.pending_user_feedback = Some(original_input);
         }
     }
 }

@@ -38,6 +38,15 @@ pub fn run_command(cwd: &std::path::Path, program: &str, args: &[&str]) -> Resul
 }
 
 pub fn run_shell_command(cwd: &std::path::Path, cmd: &str) -> Result<String> {
+    // Check for potentially interactive commands and provide helpful error messages
+    if is_potentially_interactive(cmd) {
+        bail!(
+            "Command appears to require interactive input: {}\n\
+             Hint: For git commit, use 'git commit -m \"message\"' instead of bare 'git commit'",
+            cmd
+        );
+    }
+
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
@@ -65,6 +74,32 @@ pub fn run_shell_command(cwd: &std::path::Path, cmd: &str) -> Result<String> {
         result.push_str(&stderr);
     }
     Ok(result.trim().to_string())
+}
+
+/// Check if a command is likely to require interactive input
+fn is_potentially_interactive(cmd: &str) -> bool {
+    let cmd_lower = cmd.to_lowercase();
+    
+    // Check for git commit without -m, -F, or --amend flags
+    if cmd_lower.contains("git commit") {
+        // If it has git commit but no message flag, it's likely interactive
+        if !cmd_lower.contains(" -m ") 
+            && !cmd_lower.contains(" -m\"")
+            && !cmd_lower.contains(" -m'")
+            && !cmd_lower.contains(" -f ")
+            && !cmd_lower.contains("--message")
+            && !cmd_lower.contains("--file")
+            && !cmd_lower.contains("--amend")
+            && !cmd_lower.contains("--no-edit")
+        {
+            return true;
+        }
+    }
+    
+    // Add other interactive commands as needed
+    // e.g., vim, nano, less without input, interactive python, etc.
+    
+    false
 }
 
 pub fn format_error(err: &anyhow::Error) -> String {

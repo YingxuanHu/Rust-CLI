@@ -5,9 +5,11 @@ use tokio::sync::mpsc;
 use crate::{
     commands::{format_error, run_command, run_shell_command},
     config::Config,
+    custom_command_generator::expand_command_handlers,
     file_ops,
     intent::ParsedIntent,
     input::is_shell_command,
+    repo::{ProjectType, RepoInfo},
     session::Role,
     tools::ToolArgs,
     workflow::{generate_commit_message, generate_commit_message_async, WorkflowKind, WorkflowState},
@@ -25,6 +27,7 @@ pub trait IntentDispatcher {
     fn set_pending_workflow(&mut self, workflow: WorkflowState);
     fn get_session_cwd(&self) -> PathBuf;
     fn get_session_repo_root(&self) -> Option<PathBuf>;
+    fn get_session_repo_info(&self) -> Option<RepoInfo>;
     fn get_input_history(&self) -> &[String];
     fn get_config(&self) -> &Config;
     fn get_assistant_tx(&self) -> mpsc::UnboundedSender<AssistantEvent>;
@@ -92,6 +95,14 @@ pub fn dispatch_intent<D: IntentDispatcher>(
             handle_write_file_intent(dispatcher, &intent.args, original_input);
             true
         }
+        "build" => {
+            handle_build_intent(dispatcher);
+            true
+        }
+        "explain_project" => {
+            handle_explain_project_intent(dispatcher);
+            true
+        }
         "chat" => false, // Fall through to LLM chat
         _ => false,
     }
@@ -115,9 +126,30 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
         return;
     }
 
+    // Expand composable handlers (like {{GEN_COMMIT_MSG}}) if present
+    let expanded_cmd = if cmd.contains("{{") && cmd.contains("}}") {
+        let repo_root = dispatcher.get_session_repo_root()
+            .unwrap_or_else(|| dispatcher.get_session_cwd());
+        match expand_command_handlers(cmd, dispatcher.get_config(), &repo_root) {
+            Ok(expanded) => {
+                // Show the expanded command to the user
+                if expanded != cmd {
+                    dispatcher.reply(format!("📝 Expanded command:\n  {}", expanded));
+                }
+                expanded
+            }
+            Err(e) => {
+                dispatcher.reply(format!("Failed to expand command handlers: {}", e));
+                return;
+            }
+        }
+    } else {
+        cmd.to_string()
+    };
+
     // Execute the command in the session's cwd
     let cwd = dispatcher.get_session_cwd();
-    match run_shell_command(&cwd, cmd) {
+    match run_shell_command(&cwd, &expanded_cmd) {
         Ok(output) => {
             if output.trim().is_empty() {
                 dispatcher.reply("(command completed with no output)");
@@ -213,7 +245,7 @@ fn handle_save_work_intent<D: IntentDispatcher>(dispatcher: &mut D) {
             "Status preview:",
             &status_preview,
             "",
-            "Type 'yes' to run, anything else to cancel.",
+            "Press Enter (or type 'yes') to run, anything else to cancel.",
         ]
         .join("\n");
         dispatcher.reply(plan);
@@ -243,7 +275,7 @@ fn handle_stage_intent<D: IntentDispatcher>(dispatcher: &mut D, args: &ToolArgs)
         repo_root,
     });
     dispatcher.reply(format!(
-        "Plan: git {}\nReply 'yes' to run, anything else to cancel.",
+        "Plan: git {}\nPress Enter (or type 'yes') to run, anything else to cancel.",
         display_args
     ));
 }
@@ -259,7 +291,7 @@ fn handle_commit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
             repo_root,
         });
         dispatcher.reply(format!(
-            "Staged commit plan:\n- git commit with message:\n{}\n- (push not included)\nReply 'yes' to accept, or type a custom message. 'cancel' to abort.",
+            "Staged commit plan:\n- git commit with message:\n{}\n- (push not included)\nPress Enter (or type 'yes') to accept, or type a custom message. 'cancel' to abort.",
             suggested
         ));
     } else {
@@ -280,7 +312,7 @@ fn handle_status_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         repo_root: root,
     });
     dispatcher.reply(format!(
-        "Status preview:\n{}\n\nDiff stat:\n{}\nReply with a file path to view its diff, 'yes' to continue, or anything else to cancel.",
+        "Status preview:\n{}\n\nDiff stat:\n{}\nReply with a file path to view its diff, press Enter (or type 'yes') to continue, or anything else to cancel.",
         status, diffstat
     ));
 }
@@ -302,13 +334,16 @@ fn handle_find_todos_intent<D: IntentDispatcher>(dispatcher: &mut D) {
 }
 
 fn handle_run_tests_intent<D: IntentDispatcher>(dispatcher: &mut D) {
-    if let Some(repo_root) = dispatcher.get_session_repo_root() {
-        match run_command(&repo_root, "cargo", &["test"]) {
-            Ok(out) => dispatcher.reply(format!("cargo test output:\n{out}")),
-            Err(err) => dispatcher.reply(format!("cargo test failed: {}", format_error(&err))),
+    if let Some(repo_info) = dispatcher.get_session_repo_info() {
+        let (program, args) = repo_info.test_command();
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
+        
+        match run_command(&repo_info.root, program, &args_refs) {
+            Ok(out) => dispatcher.reply(format!("{} {} output:\n{}", program, args.join(" "), out)),
+            Err(err) => dispatcher.reply(format!("{} {} failed: {}", program, args.join(" "), format_error(&err))),
         }
     } else {
-        dispatcher.reply("Not in a cargo project; cannot run tests.");
+        dispatcher.reply("No project detected; cannot run tests.");
     }
 }
 
@@ -476,7 +511,7 @@ fn handle_write_file_intent<D: IntentDispatcher>(
 
     let action = if overwrite { "overwrite" } else { "create" };
     let message = format!(
-        "Confirm {} file: {}\n\nContent preview:\n{}\n\nType 'yes' to proceed, or 'cancel' to abort.",
+        "Confirm {} file: {}\n\nContent preview:\n{}\n\nPress Enter (or type 'yes') to proceed, or 'cancel' to abort.",
         action,
         target_path.display(),
         preview
@@ -518,5 +553,53 @@ fn extract_path_from_list_command(input: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn handle_build_intent<D: IntentDispatcher>(dispatcher: &mut D) {
+    if let Some(repo_info) = dispatcher.get_session_repo_info() {
+        let (program, args) = repo_info.build_command();
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
+        
+        match run_command(&repo_info.root, program, &args_refs) {
+            Ok(out) => dispatcher.reply(format!("{} {} output:\n{}", program, args.join(" "), out)),
+            Err(err) => dispatcher.reply(format!("{} {} failed: {}", program, args.join(" "), format_error(&err))),
+        }
+    } else {
+        dispatcher.reply("No project detected; cannot build.");
+    }
+}
+
+fn handle_explain_project_intent<D: IntentDispatcher>(dispatcher: &mut D) {
+    if let Some(repo_info) = dispatcher.get_session_repo_info() {
+        let type_str = match repo_info.project_type {
+            ProjectType::Rust => "Rust (Cargo)",
+            ProjectType::Node => "Node.js (npm)",
+            ProjectType::Python => "Python",
+            ProjectType::Go => "Go",
+            ProjectType::Unknown => "Unknown",
+        };
+        
+        let name_str = repo_info.name.as_deref().unwrap_or("(unnamed)");
+        let root_str = repo_info.root.display();
+        
+        let source_dirs: Vec<String> = repo_info.source_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        
+        let mut output = vec![
+            format!("Project: {}", name_str),
+            format!("Type: {}", type_str),
+            format!("Root: {}", root_str),
+        ];
+        
+        if !source_dirs.is_empty() {
+            output.push(format!("Source dirs: {}", source_dirs.join(", ")));
+        }
+        
+        dispatcher.reply(output.join("\n"));
+    } else {
+        dispatcher.reply("No project detected in current directory.");
+    }
 }
 

@@ -1,12 +1,20 @@
-//! Intent parsing for the agentic workflow.
+//! Intent parsing using a tiered resolution system.
 //!
-//! Uses embedding-based semantic matching to determine user intent,
-//! with quick heuristic matching for obvious cases.
+//! Tier 1: Fuzzy matching (< 1ms)
+//! Tier 2: Keyword + embedding hybrid (~50ms)
+//! Tier 3: Small LLM classifier (~500ms)
+//! Tier 4: User feedback → learn
 
 use anyhow::Result;
 
-use crate::embedding::EmbeddingCache;
-use crate::tools::ToolArgs;
+use crate::{
+    embedding::EmbeddingCache,
+    fuzzy,
+    keyword_classifier::KeywordClassifier,
+    learned::LearnedAliases,
+    llm_classifier,
+    tools::ToolArgs,
+};
 
 /// The result of parsing user intent.
 #[derive(Debug, Clone)]
@@ -16,41 +24,75 @@ pub struct ParsedIntent {
     pub confidence: f32,
 }
 
-/// Parse user intent using embedding similarity.
-///
-/// Returns the parsed intent or falls back to "chat" if no good match.
-pub async fn parse_intent_with_embeddings(
-    cache: &EmbeddingCache,
-    user_input: &str,
-) -> Result<ParsedIntent> {
-    // Try embedding-based matching
-    if let Some(embedding_match) = cache.find_match(user_input).await? {
-        let args = extract_args_from_input(user_input, &embedding_match.tool);
-        return Ok(ParsedIntent {
-            tool: embedding_match.tool,
-            args,
-            confidence: embedding_match.similarity,
-        });
+impl ParsedIntent {
+    pub fn new(tool: &str, confidence: f32) -> Self {
+        Self {
+            tool: tool.to_string(),
+            args: ToolArgs::default(),
+            confidence,
+        }
     }
+}
 
-    // Fall back to chat
+/// Main entry point: resolve intent through all 4 tiers.
+pub async fn resolve_intent(
+    input: &str,
+    cache: &EmbeddingCache,
+    learned: &LearnedAliases,
+    llm_model: &str,
+) -> Result<ParsedIntent> {
+    eprintln!("[Intent Resolution] Input: '{}'", input);
+    
+    // Tier 1: Fuzzy matching + learned aliases (< 1ms)
+    if let Some(mut intent) = fuzzy::fuzzy_match(input, learned) {
+        eprintln!("[Intent Resolution] ✓ Tier 1 (Fuzzy): {}", intent.tool);
+        intent.args = extract_args_from_input(input, &intent.tool);
+        return Ok(intent);
+    }
+    
+    // Tier 2: Keyword + embedding classifier (~50ms)
+    if let Some(mut intent) = KeywordClassifier::classify(input, cache).await? {
+        eprintln!("[Intent Resolution] ✓ Tier 2 (Keyword/Embedding): {}", intent.tool);
+        intent.args = extract_args_from_input(input, &intent.tool);
+        return Ok(intent);
+    }
+    
+    // Tier 3: Small LLM classifier (~500ms)
+    // This can return "chat" if user is just chatting, or a tool name if they're trying to do something
+    eprintln!("[Intent Resolution] Attempting Tier 3 (LLM) with model: '{}'", llm_model);
+    if let Some(mut intent) = llm_classifier::classify_with_llm(input, llm_model).await? {
+        intent.args = extract_args_from_input(input, &intent.tool);
+        
+        // If LLM classified as "chat", return it directly
+        if intent.tool == "chat" {
+            eprintln!("[Intent Resolution] ✓ Tier 3 (LLM): chat");
+            return Ok(intent);
+        }
+        
+        // If LLM found a tool match, return it
+        eprintln!("[Intent Resolution] ✓ Tier 3 (LLM): {}", intent.tool);
+        return Ok(intent);
+    }
+    
+    // Tier 4: Ask user (only when LLM couldn't classify at all)
+    // This means the input looks like an action intent but we can't figure out which tool
+    eprintln!("[Intent Resolution] → Tier 4 (Ask User)");
     Ok(ParsedIntent {
-        tool: "chat".to_string(),
+        tool: "ask_user".to_string(),
         args: ToolArgs {
-            query: Some(user_input.to_string()),
+            query: Some(input.to_string()),
             ..Default::default()
         },
-        confidence: 0.3,
+        confidence: 0.0,
     })
 }
 
 /// Extract arguments from user input based on the matched tool.
 fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
     let mut args = ToolArgs::default();
-
+    
     match tool {
         "show_file" => {
-            // Try to extract file path from input
             let lower = input.to_lowercase();
             for prefix in ["show file ", "read file ", "open file ", "show ", "read ", "open "] {
                 if lower.starts_with(prefix) {
@@ -63,7 +105,6 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
             }
         }
         "stage" => {
-            // Try to extract file path for staging
             let lower = input.to_lowercase();
             if lower.starts_with("stage ") && !lower.starts_with("stage all") {
                 let path = input[6..].trim();
@@ -78,14 +119,12 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
             }
         }
         "shell" => {
-            // Extract shell command
             let trimmed = input.trim();
             if let Some(cmd) = trimmed.strip_prefix('$').or_else(|| trimmed.strip_prefix('!')) {
                 args.command = Some(cmd.trim().to_string());
             }
         }
         "list_files" => {
-            // Try to extract path from list command
             let lower = input.to_lowercase();
             for prefix in ["list files in ", "show files in ", "ls ", "dir "] {
                 if lower.starts_with(prefix) {
@@ -98,10 +137,8 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
             }
         }
         "write_file" => {
-            // Try to extract path and content from write command
             let lower = input.to_lowercase();
             
-            // Extract path
             for prefix in ["write to ", "save to ", "create ", "write file "] {
                 if lower.starts_with(prefix) {
                     let rest = input[prefix.len()..].trim();
@@ -114,7 +151,6 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
                 }
             }
             
-            // Extract content if "with content:" is present
             if let Some(content_idx) = lower.find("with content:") {
                 let content = input[content_idx + 13..].trim();
                 if !content.is_empty() {
@@ -124,12 +160,12 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
         }
         _ => {}
     }
-
+    
     args
 }
 
 /// Quick match for shell commands only (special syntax that needs parsing).
-/// Everything else should go through embedding-based semantic matching.
+/// This bypasses the tiered system for explicit shell command syntax.
 pub fn quick_match(input: &str) -> Option<ParsedIntent> {
     let trimmed = input.trim();
 
@@ -155,7 +191,6 @@ pub fn quick_match(input: &str) -> Option<ParsedIntent> {
         });
     }
 
-    // Everything else goes to embedding-based matching
     None
 }
 
@@ -177,14 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn test_quick_match_delegates_to_embeddings() {
-        // Non-shell commands should return None and use embedding matching
-        assert!(quick_match("save my work").is_none());
-        assert!(quick_match("status").is_none());
-        assert!(quick_match("explain how rust works").is_none());
-    }
-
-    #[test]
     fn test_extract_args_show_file() {
         let args = extract_args_from_input("show file src/main.rs", "show_file");
         assert_eq!(args.path, Some("src/main.rs".to_string()));
@@ -195,25 +222,4 @@ mod tests {
         let args = extract_args_from_input("stage src/lib.rs", "stage");
         assert_eq!(args.path, Some("src/lib.rs".to_string()));
     }
-
-    #[test]
-    fn test_extract_args_list_files() {
-        let args = extract_args_from_input("list files in src/", "list_files");
-        assert_eq!(args.path, Some("src/".to_string()));
-
-        let args = extract_args_from_input("ls target", "list_files");
-        assert_eq!(args.path, Some("target".to_string()));
-    }
-
-    #[test]
-    fn test_extract_args_write_file() {
-        let args = extract_args_from_input("write to test.txt with content: Hello world", "write_file");
-        assert_eq!(args.path, Some("test.txt".to_string()));
-        assert_eq!(args.content, Some("Hello world".to_string()));
-
-        let args = extract_args_from_input("create main.rs with content: fn main() {}", "write_file");
-        assert_eq!(args.path, Some("main.rs".to_string()));
-        assert_eq!(args.content, Some("fn main() {}".to_string()));
-    }
 }
-

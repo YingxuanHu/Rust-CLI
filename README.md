@@ -102,13 +102,14 @@ not replace existing tools but make them easier to use, helping
 developers stay focused on their main work without being slowed down by
 routine steps.
 
-### Repo Awareness
+### Repo Awareness ✅ IMPLEMENTED
 
-A future enhancement would make the CLI repo-aware. By parsing project
-metadata and source structure, it could tailor responses (e.g., running
-cargo test and explaining results). With that knowledge, it could also
-propose fixes as diffs, previewing changes for users to accept, reject,
-or modify.
+The CLI is now repo-aware and automatically detects project types
+(Rust, Node.js, Python, Go). It tailors commands based on the detected
+project type (e.g., running `cargo test` for Rust or `npm test` for
+Node.js). The infrastructure is also in place for proposing fixes as
+diffs, with a workflow for users to accept, reject, or modify changes.
+See [REPO_AWARENESS.md](REPO_AWARENESS.md) for details.
 
 ### Autocompletion Support
 

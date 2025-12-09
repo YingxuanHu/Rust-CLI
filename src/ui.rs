@@ -71,8 +71,11 @@ pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
         ])
         .split(f.size());
 
-    let message_lines = render_messages(view.messages);
-    let visible = clip_lines_from_bottom(&message_lines, view.scroll, chunks[0].height as usize);
+    // Account for borders when calculating available width for text
+    let available_width = chunks[0].width.saturating_sub(2) as usize;
+    let message_lines = render_messages(view.messages, available_width);
+    let available_height = chunks[0].height.saturating_sub(2) as usize; // Account for borders
+    let visible = clip_lines_from_bottom(&message_lines, view.scroll, available_height);
     let log = Paragraph::new(visible)
         .block(
             Block::default()
@@ -86,15 +89,30 @@ pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
         InputMode::Chat => "Chat Mode (Ctrl+S for Shell)",
         InputMode::Shell => "Shell Mode (Ctrl+S for Chat)",
     };
-    let input = Paragraph::new(view.input).block(
+    
+    // Calculate how much space we have for input text (account for borders)
+    let input_area_width = chunks[1].width.saturating_sub(2) as usize;
+    let input_char_count = view.input.chars().count();
+    
+    // If input is longer than field, scroll to show the end
+    let display_text = if input_char_count > input_area_width {
+        // Show the last N characters that fit
+        let start_char = input_char_count.saturating_sub(input_area_width);
+        view.input.chars().skip(start_char).collect::<String>()
+    } else {
+        view.input.to_string()
+    };
+    
+    let input = Paragraph::new(display_text.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
             .title(format!("Input: {} | Enter to submit", mode_indicator)),
     );
     f.render_widget(input, chunks[1]);
 
-    // Position cursor at the end of input text
-    let cursor_x = chunks[1].x + view.input.len() as u16 + 1;
+    // Position cursor at the end of visible text
+    let visible_chars = display_text.chars().count().min(input_area_width);
+    let cursor_x = chunks[1].x + 1 + visible_chars as u16;
     let cursor_y = chunks[1].y + 1;
     f.set_cursor(cursor_x, cursor_y);
 
@@ -123,7 +141,7 @@ pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
     f.render_widget(status, chunks[2]);
 }
 
-fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
+fn render_messages(messages: &[Message], available_width: usize) -> Vec<Line<'static>> {
     let mut rendered = Vec::new();
     for m in messages {
         let (label, color) = match m.role {
@@ -132,19 +150,30 @@ fn render_messages(messages: &[Message]) -> Vec<Line<'static>> {
             Role::System => ("system", Color::Yellow),
         };
         let label_text = format!("[{label}] ");
+        let label_len = label_text.len();
         let body_lines = format_message_body(&m.content);
 
         for (i, body) in body_lines.into_iter().enumerate() {
-            if i == 0 {
-                rendered.push(Line::from(vec![
-                    Span::styled(label_text.clone(), Style::default().fg(color)),
-                    Span::raw(body),
-                ]));
-            } else {
-                rendered.push(Line::from(vec![
-                    Span::raw(" ".repeat(label_text.len())),
-                    Span::raw(body),
-                ]));
+            let prefix_len = label_len;
+            let content_width = available_width.saturating_sub(prefix_len);
+            
+            // Wrap the body text if it's too long
+            let wrapped_lines = wrap_text(&body, content_width);
+            
+            for (j, wrapped_line) in wrapped_lines.into_iter().enumerate() {
+                if i == 0 && j == 0 {
+                    // First line of first body line: show label
+                    rendered.push(Line::from(vec![
+                        Span::styled(label_text.clone(), Style::default().fg(color)),
+                        Span::raw(wrapped_line),
+                    ]));
+                } else {
+                    // Continuation lines: indent to match label
+                    rendered.push(Line::from(vec![
+                        Span::raw(" ".repeat(label_len)),
+                        Span::raw(wrapped_line),
+                    ]));
+                }
             }
         }
     }
@@ -175,6 +204,48 @@ fn format_message_body(content: &str) -> Vec<String> {
     }
 
     lines_out
+}
+
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+    
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        
+        // If this is the first word in the line, add it regardless of length
+        if current_width == 0 {
+            current_line.push_str(word);
+            current_width = word_len;
+        } else if current_width + 1 + word_len <= max_width {
+            // Add space and word
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_width += 1 + word_len;
+        } else {
+            // Start a new line
+            result.push(current_line);
+            current_line = word.to_string();
+            current_width = word_len;
+        }
+    }
+    
+    // Add the last line if not empty
+    if !current_line.is_empty() {
+        result.push(current_line);
+    }
+    
+    // If the input was empty or only whitespace, return at least one empty line
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    
+    result
 }
 
 fn clip_lines_from_bottom<'a>(

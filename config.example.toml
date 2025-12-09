@@ -9,5 +9,14 @@ streaming = true
 request_timeout_secs = 60
 generate_commit_message = true
 
-# Optional: set a custom history file path
+# Embedding model for semantic intent matching (Tier 2)
+embedding_model = "nomic-embed-text"
+
+# Small LLM model for intent classification fallback (Tier 3)
+# Recommended: qwen2:0.5b (fast), qwen2:1.5b (better), or phi3:mini (best accuracy)
+classifier_model = "qwen2:1.5b"
+
+# Optional: set custom file paths
 # history_path = "/path/to/history.jsonl"
+# embedding_cache_path = ".cache/embeddings.toml"  # Default: local .cache directory
+# learned_path = "~/.config/llm-cli/learned.toml"  # Default: user config directory
