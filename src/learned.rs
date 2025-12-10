@@ -254,6 +254,21 @@ impl LearnedAliases {
         })
     }
     
+    /// Get all learned phrases for autocompletion.
+    pub fn get_all_phrases(&self) -> Vec<String> {
+        let mut phrases = Vec::new();
+        
+        for alias in self.aliases.values() {
+            phrases.push(alias.phrase.clone());
+        }
+        
+        for custom_cmd in self.custom_commands.values() {
+            phrases.push(custom_cmd.phrase.clone());
+        }
+        
+        phrases
+    }
+    
 }
 
 #[derive(Debug, Serialize, Deserialize)]

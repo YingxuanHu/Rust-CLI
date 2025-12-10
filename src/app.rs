@@ -15,10 +15,12 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEv
 use std::sync::Arc;
 
 use crate::{
+    completion::CompletionProvider,
     config::Config,
     context,
     custom_command_generator,
     embedding::EmbeddingCache,
+    frecency::FrecencyTracker,
     handlers::{dispatch_intent, AssistantEvent, IntentDispatcher},
     input::{expand_bang_shortcut, HistoryNavigation},
     intent::{self, ParsedIntent},
@@ -84,6 +86,8 @@ pub async fn run(config: Config) -> Result<()> {
         app.poll_assistant();
 
         if app.should_quit {
+            // Explicitly save frecency data before quitting
+            let _ = app.frecency.save();
             break;
         }
 
@@ -112,12 +116,23 @@ struct App {
     input_mode: InputMode,
     should_quit: bool,
     viewing_history: bool,
+    // Autocompletion state
+    completion_provider: CompletionProvider,
+    ghost_text: Option<String>,
+    frecency: FrecencyTracker,
 }
 
 impl App {
     fn new(config: Config, embedding_cache: Arc<EmbeddingCache>) -> Self {
         let (assistant_tx, assistant_rx) = mpsc::unbounded_channel();
         let embeddings_ready = embedding_cache.is_initialized();
+        
+        // Prepare frecency tracker path before moving config
+        let frecency_path = config.learned_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("frecency.toml");
+        
         let mut app = Self {
             config,
             session: SessionState::new(),
@@ -135,6 +150,9 @@ impl App {
             input_mode: InputMode::Chat,
             should_quit: false,
             viewing_history: false,
+            completion_provider: CompletionProvider::new(),
+            ghost_text: None,
+            frecency: FrecencyTracker::load(&frecency_path),
         };
 
         let status = if embeddings_ready {
@@ -170,6 +188,7 @@ impl App {
                 .map(|p| p.to_string_lossy().to_string()),
             pending_count: self.pending_idxs.len(),
             has_workflow: self.pending_workflow.is_some(),
+            ghost_text: self.ghost_text.as_deref(),
         }
     }
 
@@ -477,6 +496,99 @@ impl App {
             self.messages.push(Message { role, content });
         }
     }
+    
+    /// Update ghost text based on current input.
+    fn update_ghost_text(&mut self) {
+        if self.input.is_empty() {
+            self.ghost_text = None;
+            return;
+        }
+        
+        // Load learned aliases
+        let learned_global = self.config.learned_path.clone();
+        let learned_project = self.session.repo_root.as_ref().map(|r| r.join(".llm-cli/learned.toml"));
+        let learned = LearnedAliases::load(&learned_global, learned_project.as_deref())
+            .unwrap_or_default();
+        
+        self.ghost_text = self.completion_provider.get_ghost_completion(
+            &self.input,
+            &self.session.cwd,
+            &self.input_history,
+            &learned,
+            &self.frecency,
+        );
+    }
+    
+    /// Accept the ghost text completion.
+    fn accept_ghost_text(&mut self) {
+        if let Some(ghost) = self.ghost_text.take() {
+            let completed = format!("{}{}", self.input, ghost);
+            
+            // Record command usage for frecency
+            self.frecency.record_command(&completed);
+            
+            // Check if completed text contains a file path and record it
+            self.record_files_in_text(&completed);
+            
+            self.input = completed;
+            // Update ghost text again in case there's more to complete
+            self.update_ghost_text();
+        }
+    }
+    
+    /// Extract and record any file paths mentioned in text.
+    fn record_files_in_text(&mut self, text: &str) {
+        // Extract potential file paths from the text
+        for word in text.split_whitespace() {
+            // Check if word looks like a file path and exists
+            if self.is_valid_file_path(word) {
+                self.frecency.record_file(word);
+            }
+        }
+    }
+    
+    /// Check if a word is a valid file path that exists.
+    fn is_valid_file_path(&self, word: &str) -> bool {
+        // Must contain path separator or have file extension
+        if !word.contains('/') && !word.contains('.') {
+            return false;
+        }
+        
+        // Skip URLs
+        if word.starts_with("http://") || word.starts_with("https://") {
+            return false;
+        }
+        
+        // Check if file exists relative to cwd or repo root
+        let path = std::path::Path::new(word);
+        if path.is_absolute() {
+            return path.exists();
+        }
+        
+        // Try relative to cwd
+        if self.session.cwd.join(path).exists() {
+            return true;
+        }
+        
+        // Try relative to repo root
+        if let Some(repo) = &self.session.repo_root {
+            if repo.join(path).exists() {
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Record file access for frecency tracking.
+    fn record_file_access(&mut self, file_path: &str) {
+        self.frecency.record_file(file_path);
+    }
+    
+    /// Record command usage for frecency tracking.
+    fn record_command_usage(&mut self, command: &str) {
+        self.frecency.record_command(command);
+    }
 }
 
 // Implement IntentDispatcher for App
@@ -534,6 +646,14 @@ impl IntentDispatcher for App {
     fn record_output(&mut self, kind: &'static str, summary: &str, content: &str) {
         self.session.record_output(kind, summary, content);
     }
+
+    fn record_file_access(&mut self, file_path: &str) {
+        self.record_file_access(file_path);
+    }
+    
+    fn record_command_usage(&mut self, command: &str) {
+        self.record_command_usage(command);
+    }
 }
 
 // Implement WorkflowResponder for App
@@ -562,6 +682,12 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Enter => submit_input(app),
+        KeyCode::Tab => {
+            // Accept ghost text completion
+            if app.ghost_text.is_some() {
+                app.accept_ghost_text();
+            }
+        }
         KeyCode::Up => {
             recall_history_prev(app);
         }
@@ -576,9 +702,11 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.update_ghost_text();
         }
         KeyCode::Char(ch) => {
             app.input.push(ch);
+            app.update_ghost_text();
         }
         _ => {}
     }
@@ -603,6 +731,9 @@ fn submit_input(app: &mut App) {
     if raw_input.is_empty() && app.pending_workflow.is_none() && app.pending_user_feedback.is_none() {
         return;
     }
+    
+    // Track any file paths mentioned in the input
+    app.record_files_in_text(&raw_input);
 
     app.history_idx = None;
     app.input.clear();

@@ -226,6 +226,20 @@ pub static TOOLS: &[Tool] = &[
         ],
         requires_repo: false,
     },
+    Tool {
+        name: "help",
+        description: "Show comprehensive help information about the CLI, commands, and key bindings",
+        examples: &[
+            "help",
+            "?",
+            "how to use",
+            "usage",
+            "show help",
+            "commands",
+            "what can you do",
+        ],
+        requires_repo: false,
+    },
 ];
 
 /// Build a prompt describing all available tools for the LLM.

@@ -43,7 +43,7 @@ developer's toolkit. To achieve this, we have outlined a set of core
 features. Each one is chosen not only for what it adds individually but
 also for how it contributes to the overall experience.
 
-### Stateful CLI Context (System+LLM) ✅ IMPLEMENTED
+### Stateful CLI Context (System+LLM) 
 
 The CLI maintains both system-level and semantic context. On the
 system side, it remembers the current working directory, repository
@@ -104,7 +104,7 @@ not replace existing tools but make them easier to use, helping
 developers stay focused on their main work without being slowed down by
 routine steps.
 
-### Repo Awareness ✅ IMPLEMENTED
+### Repo Awareness 
 
 The CLI is now repo-aware and automatically detects project types
 (Rust, Node.js, Python, Go). It tailors commands based on the detected
