@@ -25,8 +25,7 @@ Each tier tries to understand your intent. If successful, it executes immediatel
 Checks in order:
 1. **Learned aliases** (highest priority)
    - Your previously confirmed commands
-   - Stored in `~/.config/llm-cli/learned.toml` (global)
-   - Or `.llm_cli/learned.toml` (per-project)
+   - Stored in `.llm-cli/learned.toml` in project directory
 
 2. **Exact tool names**
    - `status` → `status` tool
@@ -139,14 +138,9 @@ I'll remember your choice for next time.
 
 ### File Locations
 
-**Global aliases** (all projects):
+**Project aliases** (stored in project directory):
 ```
-~/.config/llm-cli/learned.toml
-```
-
-**Project-local aliases** (override global):
-```
-/path/to/your/project/.llm_cli/learned.toml
+.llm-cli/learned.toml
 ```
 
 ### Format
@@ -165,11 +159,11 @@ timestamp = "1702053700"
 source = "user_feedback"
 ```
 
-### Scoping Behavior
+### Storage
 
-- **Global:** Used in all projects
-- **Project-local:** Overrides global for same phrase
-- **Use case:** Different repos might use "deploy" differently
+- All learned aliases are stored per-project in `.llm-cli/learned.toml`
+- Each project has its own set of learned commands
+- This allows different meanings for the same phrase across different projects (e.g., "deploy" might mean different things in different repos)
 
 ---
 
@@ -192,7 +186,7 @@ source = "user_feedback"
 
 ## Configuration
 
-### Example Config (`~/.config/llm-cli/config.toml`)
+### Example Config (`.llm-cli/config.toml`)
 
 ```toml
 # Main chat model
@@ -202,11 +196,12 @@ model = "llama3"
 embedding_model = "nomic-embed-text"
 
 # Classifier model for Tier 3
-classifier_model = "qwen2:0.5b"  # or "qwen2:1.5b", "phi3:mini"
+classifier_model = "qwen2:1.5b"  # or "qwen2:0.5b", "phi3:mini"
 
-# Paths
-learned_path = "~/.config/llm-cli/learned.toml"
-embedding_cache_path = ".cache/embeddings.toml"
+# Paths (all default to .llm-cli/ directory)
+learned_path = ".llm-cli/learned.toml"
+embedding_cache_path = ".llm-cli/embeddings.toml"
+history_path = ".llm-cli/history.jsonl"
 ```
 
 ### Model Recommendations
@@ -359,7 +354,7 @@ classifier_model = ""  # Disables Tier 3
 
 **Solution:** Check learned aliases:
 ```bash
-cat ~/.config/llm-cli/learned.toml
+cat .llm-cli/learned.toml
 ```
 
 Remove incorrect entry and re-learn correctly.

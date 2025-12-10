@@ -134,7 +134,7 @@ Next time:
 
 ### Optional: Customize Your Config
 
-Create `~/.config/llm-cli/config.toml`:
+Create `.llm-cli/config.toml` in your project directory:
 
 ```toml
 # Main chat model
@@ -144,14 +144,40 @@ model = "llama3"
 embedding_model = "nomic-embed-text"
 
 # Classifier model for Tier 3 (choose based on speed vs accuracy)
-classifier_model = "qwen2:0.5b"    # Fast (default)
-# classifier_model = "qwen2:1.5b"  # Better
-# classifier_model = "phi3:mini"   # Best
+classifier_model = "qwen2:1.5b"    # Recommended (default)
+# classifier_model = "qwen2:0.5b"  # Faster
+# classifier_model = "phi3:mini"   # More accurate
 
-# Optional: custom paths
-# learned_path = "~/.config/llm-cli/learned.toml"
-# embedding_cache_path = ".cache/embeddings.toml"
+# Optional: custom paths (all default to .llm-cli/ directory)
+# learned_path = ".llm-cli/learned.toml"
+# embedding_cache_path = ".llm-cli/embeddings.toml"
+# history_path = ".llm-cli/history.jsonl"
 ```
+
+### Debug Logging
+
+The application uses structured logging via the `tracing` crate. By default, only `info`, `warn`, and `error` messages are shown. To enable debug logging (useful for troubleshooting intent resolution, LLM classification, and embedding cache):
+
+```bash
+# Show all debug messages
+RUST_LOG=debug cargo run --release
+
+# Show debug messages for specific modules
+RUST_LOG=llm_cli::intent=debug,llm_cli::llm_classifier=debug cargo run --release
+
+# Show trace-level messages (very verbose)
+RUST_LOG=trace cargo run --release
+
+# Or set it before running
+export RUST_LOG=debug
+./target/release/llm_cli
+```
+
+Debug logs include:
+- **Intent Resolution**: Which tier matched your input and why
+- **LLM Classifier**: API calls to Ollama and response parsing
+- **Keyword Classifier**: Scoring details for each tool
+- **Embedding Cache**: Cache loading and saving operations
 
 ## Shell Commands
 
@@ -164,14 +190,14 @@ $ git status          # Direct shell execution
 !!                    # Repeat last shell command
 ```
 
-## View Learned Aliases and Macros
+## View Learned Aliases and Commands
 
 ```bash
 # Tool aliases
-cat ~/.config/llm-cli/learned.toml
+cat .llm-cli/learned.toml
 
-# Custom macros
-cat ~/.config/llm-cli/macros.toml
+# Custom commands
+cat .llm-cli/custom_commands.toml
 ```
 
 Example **learned.toml** (tool mappings):
@@ -184,26 +210,26 @@ timestamp = "1702053600"
 source = "user_feedback"
 ```
 
-Example **macros.toml** (shell commands):
+Example **custom_commands.toml** (shell commands):
 
 ```toml
-[[macros]]
+[[custom_commands]]
 phrase = "deploy staging"
 command = "ssh staging 'cd /app && git pull'"
 timestamp = "1702053700"
-source = "user_macro_generated"
+source = "user_custom_generated"
 ```
 
-## Per-Project Aliases
+## Project-Specific Storage
 
-Want different meanings in different projects? Create a local config:
+All data is stored per-project in the `.llm-cli/` directory:
+- **learned.toml**: Tool aliases (e.g., "yeet" → save_work)
+- **custom_commands.toml**: Custom shell commands
+- **embeddings.toml**: Cached embeddings for faster intent matching
+- **history.jsonl**: Conversation history
+- **config.toml**: Project-specific configuration (optional)
 
-```bash
-mkdir -p .llm_cli
-touch .llm_cli/learned.toml
-```
-
-Now learned aliases in this project will be stored locally and override global ones.
+This means each project can have its own learned commands and history!
 
 ## Tips
 
@@ -249,18 +275,13 @@ classifier_model = "qwen2:0.5b"
 
 Check and edit learned aliases:
 ```bash
-cat ~/.config/llm-cli/learned.toml
+cat .llm-cli/learned.toml
 # Remove incorrect entries and re-learn
 ```
 
 ### Embeddings initialization is slow
 
-This only happens once per project. The cache is stored in `.cache/embeddings.toml` and reused on subsequent runs.
-
-To share cache across projects, set in config:
-```toml
-embedding_cache_path = "~/.cache/llm-cli/embeddings.toml"
-```
+This only happens once per project. The cache is stored in `.llm-cli/embeddings.toml` and reused on subsequent runs.
 
 ## Performance Expectations
 
@@ -299,7 +320,7 @@ See [MACROS.md](MACROS.md) for detailed macro documentation.
 - Read [INTENT_SYSTEM.md](INTENT_SYSTEM.md) for detailed architecture
 - Read [MACROS.md](MACROS.md) for custom command workflows
 - Read [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) for technical details
-- Customize your config in `~/.config/llm-cli/config.toml`
+- Customize your config in `.llm-cli/config.toml` (optional)
 - Start using and let it learn your preferences!
 
 ## Example Session

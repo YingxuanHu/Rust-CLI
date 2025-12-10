@@ -3,6 +3,7 @@ use std::io::stdout;
 use anyhow::{Context, Result};
 use crossterm::{
     execute,
+    event::{EnableMouseCapture, DisableMouseCapture},
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
@@ -26,7 +27,7 @@ impl TerminalGuard {
     pub fn new() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("create terminal")?;
         terminal.show_cursor().context("show cursor")?;
@@ -37,7 +38,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
 }
@@ -135,7 +136,7 @@ pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
             "-"
         })
         .bold(),
-        Span::raw(" | mode: Ctrl+S | history: ↑/↓ | scroll: PgUp/PgDn | quit: Esc/q"),
+        Span::raw(" | mode: Ctrl+S | history: ↑/↓ | scroll: mouse/PgUp/PgDn | quit: Esc/q"),
     ]);
     let status = Paragraph::new(status_text);
     f.render_widget(status, chunks[2]);

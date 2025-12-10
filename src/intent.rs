@@ -41,42 +41,42 @@ pub async fn resolve_intent(
     learned: &LearnedAliases,
     llm_model: &str,
 ) -> Result<ParsedIntent> {
-    eprintln!("[Intent Resolution] Input: '{}'", input);
+    tracing::debug!("[Intent Resolution] Input: '{}'", input);
     
     // Tier 1: Fuzzy matching + learned aliases (< 1ms)
     if let Some(mut intent) = fuzzy::fuzzy_match(input, learned) {
-        eprintln!("[Intent Resolution] ✓ Tier 1 (Fuzzy): {}", intent.tool);
+        tracing::debug!("[Intent Resolution] ✓ Tier 1 (Fuzzy): {}", intent.tool);
         intent.args = extract_args_from_input(input, &intent.tool);
         return Ok(intent);
     }
     
     // Tier 2: Keyword + embedding classifier (~50ms)
     if let Some(mut intent) = KeywordClassifier::classify(input, cache).await? {
-        eprintln!("[Intent Resolution] ✓ Tier 2 (Keyword/Embedding): {}", intent.tool);
+        tracing::debug!("[Intent Resolution] ✓ Tier 2 (Keyword/Embedding): {}", intent.tool);
         intent.args = extract_args_from_input(input, &intent.tool);
         return Ok(intent);
     }
     
     // Tier 3: Small LLM classifier (~500ms)
     // This can return "chat" if user is just chatting, or a tool name if they're trying to do something
-    eprintln!("[Intent Resolution] Attempting Tier 3 (LLM) with model: '{}'", llm_model);
+    tracing::debug!("[Intent Resolution] Attempting Tier 3 (LLM) with model: '{}'", llm_model);
     if let Some(mut intent) = llm_classifier::classify_with_llm(input, llm_model).await? {
         intent.args = extract_args_from_input(input, &intent.tool);
         
         // If LLM classified as "chat", return it directly
         if intent.tool == "chat" {
-            eprintln!("[Intent Resolution] ✓ Tier 3 (LLM): chat");
+            tracing::debug!("[Intent Resolution] ✓ Tier 3 (LLM): chat");
             return Ok(intent);
         }
         
         // If LLM found a tool match, return it
-        eprintln!("[Intent Resolution] ✓ Tier 3 (LLM): {}", intent.tool);
+        tracing::debug!("[Intent Resolution] ✓ Tier 3 (LLM): {}", intent.tool);
         return Ok(intent);
     }
     
     // Tier 4: Ask user (only when LLM couldn't classify at all)
     // This means the input looks like an action intent but we can't figure out which tool
-    eprintln!("[Intent Resolution] → Tier 4 (Ask User)");
+    tracing::debug!("[Intent Resolution] → Tier 4 (Ask User)");
     Ok(ParsedIntent {
         tool: "ask_user".to_string(),
         args: ToolArgs {

@@ -1,7 +1,6 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::Deserialize;
 
 const DEFAULT_MODEL: &str = "llama3";
@@ -183,40 +182,30 @@ impl Default for Config {
             generate_commit_message: true,
             embedding_cache_path: default_embedding_cache_path(),
             embedding_model: "nomic-embed-text".to_string(),
-            classifier_model: "qwen2:0.5b".to_string(),
+            classifier_model: "qwen2:1.5b".to_string(),
             learned_path: default_learned_path(),
         }
     }
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    project_dirs().map(|dirs| dirs.config_dir().join("config.toml"))
+    // Look for config in .llm-cli directory in current project
+    Some(PathBuf::from(".llm-cli/config.toml"))
 }
 
 fn default_history_path() -> PathBuf {
-    if let Some(dirs) = project_dirs() {
-        if let Some(state) = dirs.state_dir() {
-            return state.join("history.jsonl");
-        }
-        return dirs.data_dir().join("history.jsonl");
-    }
-    PathBuf::from("~/.local/state/llm-cli/history.jsonl")
+    // Store history in project's .llm-cli directory
+    PathBuf::from(".llm-cli/history.jsonl")
 }
 
 fn default_embedding_cache_path() -> PathBuf {
-    // Use local .cache directory relative to current working directory
-    PathBuf::from(".cache/embeddings.toml")
+    // Store embedding cache in project's .llm-cli directory
+    PathBuf::from(".llm-cli/embeddings.toml")
 }
 
 fn default_learned_path() -> PathBuf {
-    if let Some(dirs) = project_dirs() {
-        return dirs.config_dir().join("learned.toml");
-    }
-    PathBuf::from("~/.config/llm-cli/learned.toml")
-}
-
-fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("dev", "llm-cli", "llm-cli")
+    // Store learned aliases in project's .llm-cli directory
+    PathBuf::from(".llm-cli/learned.toml")
 }
 
 fn parse_bool(input: &str) -> Result<bool, std::str::ParseBoolError> {

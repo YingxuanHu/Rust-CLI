@@ -10,12 +10,13 @@ use tokio::{
 };
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 
 use std::sync::Arc;
 
 use crate::{
     config::Config,
+    context,
     custom_command_generator,
     embedding::EmbeddingCache,
     handlers::{dispatch_intent, AssistantEvent, IntentDispatcher},
@@ -36,15 +37,15 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Initialize embedding cache for semantic intent matching
     let mut embedding_cache = EmbeddingCache::new(Some(&config.embedding_model));
-    eprintln!("Initializing embedding cache (this may take a moment)...");
+    tracing::info!("Initializing embedding cache (this may take a moment)...");
     if let Err(e) = embedding_cache.initialize(Some(&config.embedding_cache_path)).await {
-        eprintln!(
+        tracing::warn!(
             "Warning: Could not initialize embeddings: {}. Falling back to direct chat.",
             e
         );
-        eprintln!("Tip: Run 'ollama pull {}' to enable semantic matching.", config.embedding_model);
+        tracing::info!("Tip: Run 'ollama pull {}' to enable semantic matching.", config.embedding_model);
     } else {
-        eprintln!("Embedding cache ready!");
+        tracing::info!("Embedding cache ready!");
     }
     let embedding_cache = Arc::new(embedding_cache);
 
@@ -67,10 +68,16 @@ pub async fn run(config: Config) -> Result<()> {
             .unwrap_or(Duration::from_millis(0));
 
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key_event(&mut app, key);
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        handle_key_event(&mut app, key);
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse_event(&mut app, mouse);
+                }
+                _ => {}
             }
         }
 
@@ -104,6 +111,7 @@ struct App {
     embedding_cache: Arc<EmbeddingCache>,
     input_mode: InputMode,
     should_quit: bool,
+    viewing_history: bool,
 }
 
 impl App {
@@ -126,6 +134,7 @@ impl App {
             embedding_cache,
             input_mode: InputMode::Chat,
             should_quit: false,
+            viewing_history: false,
         };
 
         let status = if embeddings_ready {
@@ -134,7 +143,7 @@ impl App {
             "embeddings: disabled"
         };
         let system_msg = format!(
-            "LLM CLI ready. Model: {} ({}). Modes: Chat/Shell (Ctrl+S). History: ↑/↓. Enter to submit; Esc/q to exit.",
+            "LLM CLI ready. Model: {} ({}). Modes: Chat/Shell (Ctrl+S). History: ↑/↓. Scroll: mouse/PgUp/PgDn. Enter to submit; Esc/q to exit.",
             app.config.model, status
         );
         app.push_recorded(Role::System, system_msg);
@@ -143,7 +152,11 @@ impl App {
 
     fn create_view(&self) -> AppView<'_> {
         AppView {
-            messages: &self.messages,
+            messages: if self.viewing_history {
+                &self.session.history
+            } else {
+                &self.messages
+            },
             scroll: self.scroll,
             input: &self.input,
             input_mode: self.input_mode,
@@ -168,6 +181,7 @@ impl App {
                 AssistantEvent::Failed { idx, error } => self.fail_assistant(idx, error),
             }
             self.scroll = 0;
+            self.viewing_history = false;
         }
     }
 
@@ -180,6 +194,7 @@ impl App {
         });
         self.session.record(Message { role, content });
         self.scroll = 0;
+        self.viewing_history = false;
         idx
     }
 
@@ -194,6 +209,7 @@ impl App {
             content,
         });
         self.scroll = 0;
+        self.viewing_history = false;
     }
 
     fn append_assistant_chunk(&mut self, idx: usize, chunk: String) {
@@ -211,6 +227,25 @@ impl App {
             .unwrap_or_default();
         let final_content = content.unwrap_or(fallback);
 
+        // Check for commit message generation signal
+        if final_content.starts_with("__COMMIT_MSG__:") {
+            if let Some(msg_end) = final_content.find('\n') {
+                let msg = &final_content[14..msg_end]; // Skip "__COMMIT_MSG__:"
+                self.session.record_output("commit_msg", "Generated commit message", msg);
+            }
+            // Remove the signal prefix and continue with normal display
+            let display_content = final_content.split_once('\n')
+                .map(|(_, rest)| rest)
+                .unwrap_or(&final_content);
+            self.upsert_message(idx, Role::Assistant, display_content.to_string());
+            self.session.record(Message {
+                role: Role::Assistant,
+                content: display_content.to_string(),
+            });
+            self.pending_idxs.retain(|&i| i != idx);
+            return;
+        }
+        
         // Check for custom command generation signal
         if final_content.starts_with("__CUSTOM_COMMAND_GENERATED__:") {
             self.pending_idxs.retain(|&i| i != idx);
@@ -261,8 +296,89 @@ impl App {
             let original_input = final_content.strip_prefix("__ASK_USER__:")
                 .unwrap_or("")
                 .to_string();
+            
+            // Try to generate a suggested command first
+            let tx = self.assistant_tx.clone();
+            let model = self.config.classifier_model.clone();
+            let original_input_clone = original_input.clone();
+            let repo_context = self.session.repo_info.as_ref().map(|info| {
+                let type_str = match info.project_type {
+                    crate::repo::ProjectType::Rust => "Rust",
+                    crate::repo::ProjectType::Node => "Node.js",
+                    crate::repo::ProjectType::Python => "Python",
+                    crate::repo::ProjectType::Go => "Go",
+                    crate::repo::ProjectType::Unknown => "Unknown",
+                };
+                format!("{} project", type_str)
+            });
+            
+            // Show a message that we're generating
+            self.reply(format!("💭 Generating suggested command for \"{}\"...", original_input));
+            
+            tokio::spawn(async move {
+                match custom_command_generator::generate_custom_command(
+                    &original_input_clone,
+                    &model,
+                    repo_context.as_deref(),
+                ).await {
+                    Ok(suggested_cmd) => {
+                        let _ = tx.send(AssistantEvent::Completed {
+                            idx: 0,
+                            content: Some(format!("__SUGGEST_COMMAND__:{}:{}", original_input_clone, suggested_cmd)),
+                        });
+                    }
+                    Err(_) => {
+                        // Fall back to user feedback prompt
+                        let _ = tx.send(AssistantEvent::Completed {
+                            idx: 0,
+                            content: Some(format!("__FALLBACK_ASK_USER__:{}", original_input_clone)),
+                        });
+                    }
+                }
+            });
+            return;
+        }
+        
+        // Handle command suggestion response
+        if final_content.starts_with("__SUGGEST_COMMAND__:") {
+            let parts: Vec<&str> = final_content.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                let original_input = parts[1];
+                let suggested_cmd = parts[2];
+                
+                self.reply(format!(
+                    "💡 Suggested command: `{}`\n\n\
+                     Options:\n\
+                     • [y]es - Execute it\n\
+                     • [s]ave - Save as custom command\n\
+                     • [e]dit - Provide a different command (cmd: ...)\n\
+                     • [n]o - Show tool selection menu instead",
+                    suggested_cmd
+                ));
+                
+                self.pending_workflow = Some(WorkflowState {
+                    kind: crate::workflow::WorkflowKind::CustomCommandConfirm {
+                        original_input: original_input.to_string(),
+                        generated_cmd: suggested_cmd.to_string(),
+                        save_path: self.session.repo_root.clone()
+                            .unwrap_or_else(|| self.session.cwd.clone())
+                            .join(".llm-cli/learned.toml"),
+                    },
+                    repo_root: self.session.repo_root.clone().unwrap_or_else(|| self.session.cwd.clone()),
+                });
+                
+                // Store original input for potential fallback
+                self.pending_user_feedback = Some(original_input.to_string());
+            }
+            return;
+        }
+        
+        // Handle fallback to ask user
+        if final_content.starts_with("__FALLBACK_ASK_USER__:") {
+            let original_input = final_content.strip_prefix("__FALLBACK_ASK_USER__:")
+                .unwrap_or("")
+                .to_string();
             self.pending_user_feedback = Some(original_input.clone());
-            // Show feedback prompt
             let feedback = user_feedback::generate_feedback_prompt(&original_input);
             self.reply(feedback);
             return;
@@ -296,9 +412,51 @@ impl App {
         self.upsert_message(idx, Role::Assistant, final_content.clone());
         self.session.record(Message {
             role: Role::Assistant,
-            content: final_content,
+            content: final_content.clone(),
         });
         self.pending_idxs.retain(|&i| i != idx);
+        
+        // Check if the response contains shell commands
+        let commands = crate::workflow::extract_commands_from_text(&final_content);
+        if !commands.is_empty() {
+            let combined = commands.join(" && ");
+            let original_query = self.input_history.last().cloned().unwrap_or_default();
+            
+            let msg = if commands.len() == 1 {
+                format!(
+                    "\n💡 Found command: `{}`\n\n\
+                     Options:\n\
+                     • [y]es - Execute it\n\
+                     • [s]ave - Save as custom command for \"{}\" \n\
+                     • [n]o - Skip",
+                    combined,
+                    original_query
+                )
+            } else {
+                format!(
+                    "\n💡 Found {} commands:\n{}\n\n\
+                     Combined: `{}`\n\n\
+                     Options:\n\
+                     • [y]es - Execute all\n\
+                     • [s]ave - Save as custom command for \"{}\"\n\
+                     • [n]o - Skip",
+                    commands.len(),
+                    commands.iter().map(|c| format!("  • {}", c)).collect::<Vec<_>>().join("\n"),
+                    combined,
+                    original_query
+                )
+            };
+            
+            self.reply(msg);
+            self.pending_workflow = Some(WorkflowState {
+                kind: crate::workflow::WorkflowKind::ChatCommandsConfirm {
+                    original_query,
+                    commands,
+                    combined_command: combined,
+                },
+                repo_root: self.session.repo_root.clone().unwrap_or_else(|| self.session.cwd.clone()),
+            });
+        }
     }
 
     fn fail_assistant(&mut self, idx: usize, error: String) {
@@ -372,6 +530,10 @@ impl IntentDispatcher for App {
     fn set_session_cwd(&mut self, new_cwd: PathBuf) {
         self.session.set_cwd(new_cwd);
     }
+
+    fn record_output(&mut self, kind: &'static str, summary: &str, content: &str) {
+        self.session.record_output(kind, summary, content);
+    }
 }
 
 // Implement WorkflowResponder for App
@@ -407,16 +569,28 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             recall_history_next(app);
         }
         KeyCode::PageUp => {
-            app.scroll = app.scroll.saturating_add(10);
+            scroll_session_history_up(app);
         }
         KeyCode::PageDown => {
-            app.scroll = app.scroll.saturating_sub(10);
+            scroll_session_history_down(app);
         }
         KeyCode::Backspace => {
             app.input.pop();
         }
         KeyCode::Char(ch) => {
             app.input.push(ch);
+        }
+        _ => {}
+    }
+}
+
+fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            scroll_session_history_up(app);
+        }
+        MouseEventKind::ScrollDown => {
+            scroll_session_history_down(app);
         }
         _ => {}
     }
@@ -509,7 +683,7 @@ fn submit_input(app: &mut App) {
     
     // Load learned aliases
     let learned_global = app.config.learned_path.clone();
-    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm_cli/learned.toml"));
+    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm-cli/learned.toml"));
     
     // Capture repo context before spawning
     let repo_context = if let Some(info) = &app.session.repo_info {
@@ -522,6 +696,13 @@ fn submit_input(app: &mut App) {
         };
         let name_str = info.name.as_deref().unwrap_or("unnamed");
         format!("\n\nCurrent project: {} ({})", name_str, type_str)
+    } else {
+        String::new()
+    };
+    
+    // Inject recent context if user input contains references
+    let context_injection = if context::contains_reference(&prompt_for_task) {
+        context::format_context_for_prompt(&app.session.recent_outputs)
     } else {
         String::new()
     };
@@ -569,8 +750,8 @@ fn submit_input(app: &mut App) {
 
         // Fall through to regular LLM chat
         let composed_prompt = format!(
-            "{}{}\n\nUser: {}\nAssistant:",
-            system_prompt, repo_context, prompt_for_task
+            "{}{}{}\n\nUser: {}\nAssistant:",
+            system_prompt, repo_context, context_injection, prompt_for_task
         );
 
         let mut child = match TokioCommand::new("ollama")
@@ -686,6 +867,19 @@ fn handle_pending_workflow(app: &mut App, prompt: &str) {
             }
         } else {
             handle_workflow_response(app, workflow, prompt);
+            
+            // Check if the last message is the special feedback signal
+            if let Some(last_msg) = app.messages.last() {
+                if last_msg.content == "__SHOW_FEEDBACK_PROMPT__" {
+                    // Remove the signal message
+                    app.messages.pop();
+                    // Show feedback prompt if we have the original input
+                    if let Some(original_input) = &app.pending_user_feedback {
+                        let feedback = user_feedback::generate_feedback_prompt(original_input);
+                        app.reply(feedback);
+                    }
+                }
+            }
         }
     }
 }
@@ -713,19 +907,34 @@ fn recall_history_next(app: &mut App) {
     }
 }
 
+fn scroll_session_history_up(app: &mut App) {
+    // Enable history viewing mode
+    app.viewing_history = true;
+    // Scroll up (increase scroll offset from bottom)
+    app.scroll = app.scroll.saturating_add(3);
+}
+
+fn scroll_session_history_down(app: &mut App) {
+    // Scroll down (decrease scroll offset from bottom)
+    if app.scroll > 0 {
+        app.scroll = app.scroll.saturating_sub(3);
+    }
+    
+    // If we've scrolled all the way to the bottom, return to live view
+    if app.scroll == 0 {
+        app.viewing_history = false;
+    }
+}
+
 fn handle_user_feedback_response(app: &mut App, response: &str) {
     let original_input = app.pending_user_feedback.take().unwrap();
     
-    // Determine save path (prefer project-local if in a repo)
-    let save_path = if let Some(repo_root) = &app.session.repo_root {
-        repo_root.join(".llm_cli/learned.toml")
-    } else {
-        app.config.learned_path.clone()
-    };
+    // Determine save path (always use .llm-cli in current directory)
+    let save_path = PathBuf::from(".llm-cli/learned.toml");
     
     // Load current learned aliases
     let learned_global = app.config.learned_path.clone();
-    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm_cli/learned.toml"));
+    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm-cli/learned.toml"));
     let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref())
         .unwrap_or_default();
     

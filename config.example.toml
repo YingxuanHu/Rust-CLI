@@ -1,4 +1,5 @@
-# Default configuration for llm-cli. Copy to config dir or pass with --config.
+# Default configuration for llm-cli. Copy to .llm-cli/config.toml or pass with --config.
+# All files are stored in .llm-cli/ directory in your project by default.
 
 model = "llama3"
 system_prompt = "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct."
@@ -16,7 +17,7 @@ embedding_model = "nomic-embed-text"
 # Recommended: qwen2:0.5b (fast), qwen2:1.5b (better), or phi3:mini (best accuracy)
 classifier_model = "qwen2:1.5b"
 
-# Optional: set custom file paths
-# history_path = "/path/to/history.jsonl"
-# embedding_cache_path = ".cache/embeddings.toml"  # Default: local .cache directory
-# learned_path = "~/.config/llm-cli/learned.toml"  # Default: user config directory
+# Optional: set custom file paths (all default to .llm-cli/ directory)
+# history_path = ".llm-cli/history.jsonl"
+# embedding_cache_path = ".llm-cli/embeddings.toml"
+# learned_path = ".llm-cli/learned.toml"

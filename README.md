@@ -43,16 +43,18 @@ developer's toolkit. To achieve this, we have outlined a set of core
 features. Each one is chosen not only for what it adds individually but
 also for how it contributes to the overall experience.
 
-### Stateful CLI Context (System+LLM)
+### Stateful CLI Context (System+LLM) ✅ IMPLEMENTED
 
-The CLI will maintain both system-level and semantic context. On the
-system side, it will remember the current working directory, repository
+The CLI maintains both system-level and semantic context. On the
+system side, it remembers the current working directory, repository
 path, and command history, so interactions feel cohesive like in a shell
-or REPL. On the semantic side, future iterations may extend context to
-the model itself, allowing it to interpret references in conversation.
-For example, after reviewing a Git diff, typing "commit it" would
-correctly link "it" to the diff. Together, these layers of memory shift
-the CLI from a pure executor toward a conversational partner.
+or REPL. On the semantic side, the CLI now tracks recent command outputs
+(diffs, files, shell results) and resolves references in conversation.
+For example, after running "show status", typing "commit it" correctly
+links "it" to the shown diff. The system uses Cursor-style context
+injection: when reference words are detected, recent outputs are added
+to the LLM prompt for natural resolution. See
+[SEMANTIC_CONTEXT.md](docs/SEMANTIC_CONTEXT.md) for details.
 
 ### Local Inference with Ollama (Stateless Prompts)
 

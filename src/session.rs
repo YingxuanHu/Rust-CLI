@@ -1,6 +1,8 @@
 use std::path::PathBuf;
+use std::collections::VecDeque;
 
 use crate::repo::RepoInfo;
+use crate::context::RecentOutput;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -21,6 +23,7 @@ pub struct SessionState {
     pub repo_root: Option<PathBuf>,
     pub repo_info: Option<RepoInfo>,
     pub history: Vec<Message>,
+    pub recent_outputs: VecDeque<RecentOutput>,
 }
 
 impl SessionState {
@@ -33,6 +36,7 @@ impl SessionState {
             repo_root,
             repo_info,
             history: Vec::new(),
+            recent_outputs: VecDeque::new(),
         }
     }
 
@@ -45,6 +49,28 @@ impl SessionState {
         self.cwd = new_cwd;
         self.repo_root = find_git_root(&self.cwd);
         self.repo_info = RepoInfo::detect(&self.cwd);
+    }
+
+    /// Record a command output for semantic reference resolution
+    pub fn record_output(&mut self, kind: &'static str, summary: &str, content: &str) {
+        const MAX_OUTPUTS: usize = 5;
+        const MAX_CONTENT: usize = 2000;
+
+        let truncated = if content.len() > MAX_CONTENT {
+            format!("{}...[truncated]", &content[..MAX_CONTENT])
+        } else {
+            content.to_string()
+        };
+
+        self.recent_outputs.push_front(RecentOutput {
+            kind,
+            summary: summary.to_string(),
+            content: truncated,
+        });
+
+        while self.recent_outputs.len() > MAX_OUTPUTS {
+            self.recent_outputs.pop_back();
+        }
     }
 }
 

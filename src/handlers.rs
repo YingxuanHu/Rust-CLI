@@ -33,6 +33,7 @@ pub trait IntentDispatcher {
     fn get_assistant_tx(&self) -> mpsc::UnboundedSender<AssistantEvent>;
     fn pending_placeholder(&mut self) -> usize;
     fn set_session_cwd(&mut self, new_cwd: PathBuf);
+    fn record_output(&mut self, kind: &'static str, summary: &str, content: &str);
 }
 
 /// Dispatch a parsed intent to the appropriate handler.
@@ -151,6 +152,14 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
     let cwd = dispatcher.get_session_cwd();
     match run_shell_command(&cwd, &expanded_cmd) {
         Ok(output) => {
+            // Record output for semantic reference resolution
+            let summary = if output.trim().is_empty() {
+                format!("Ran: {} (no output)", expanded_cmd)
+            } else {
+                format!("Ran: {} (success)", expanded_cmd)
+            };
+            dispatcher.record_output("command", &summary, &output);
+            
             if output.trim().is_empty() {
                 dispatcher.reply("(command completed with no output)");
             } else {
@@ -307,6 +316,17 @@ fn handle_status_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         .unwrap_or_else(|e| format!("(git status failed: {})", format_error(&e)));
     let diffstat = run_command(&root, "git", &["diff", "--stat"])
         .unwrap_or_else(|e| format!("(git diff --stat failed: {})", format_error(&e)));
+    
+    // Record output for semantic reference resolution
+    let summary = if status.trim().is_empty() {
+        "No changes".to_string()
+    } else {
+        let lines: Vec<&str> = status.lines().collect();
+        format!("Git status: {} file(s) changed", lines.len())
+    };
+    let combined = format!("{}\n\n{}", status, diffstat);
+    dispatcher.record_output("diff", &summary, &combined);
+    
     dispatcher.set_pending_workflow(WorkflowState {
         kind: WorkflowKind::DiffPreview { file: None },
         repo_root: root,
@@ -328,7 +348,14 @@ fn handle_find_todos_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         &["--no-heading", "--line-number", "--pcre2", pattern],
     ) {
         Ok(out) if out.trim().is_empty() => dispatcher.reply("No TODO/FIXME found."),
-        Ok(out) => dispatcher.reply(format!("TODO/FIXME:\n{out}")),
+        Ok(out) => {
+            // Record output for semantic reference resolution
+            let count = out.lines().count();
+            let summary = format!("Found {} TODO/FIXME item(s)", count);
+            dispatcher.record_output("todos", &summary, &out);
+            
+            dispatcher.reply(format!("TODO/FIXME:\n{out}"))
+        }
         Err(err) => dispatcher.reply(format!("Search failed: {}", format_error(&err))),
     }
 }
@@ -361,7 +388,7 @@ fn handle_show_file_intent<D: IntentDispatcher>(
 
     if let Some(path) = path {
         let resolved = if path.is_absolute() {
-            path
+            path.clone()
         } else if let Some(repo) = dispatcher.get_session_repo_root() {
             repo.join(&path)
         } else {
@@ -369,11 +396,18 @@ fn handle_show_file_intent<D: IntentDispatcher>(
         };
 
         match fs::read_to_string(&resolved) {
-            Ok(contents) => dispatcher.reply(format!(
-                "Contents of {}:\n{}",
-                resolved.display(),
-                contents
-            )),
+            Ok(contents) => {
+                // Record output for semantic reference resolution
+                let line_count = contents.lines().count();
+                let summary = format!("{} ({} lines)", path.display(), line_count);
+                dispatcher.record_output("file", &summary, &contents);
+                
+                dispatcher.reply(format!(
+                    "Contents of {}:\n{}",
+                    resolved.display(),
+                    contents
+                ))
+            }
             Err(err) => dispatcher.reply(format!("Could not read {}: {}", resolved.display(), err)),
         }
     } else {
@@ -386,12 +420,18 @@ fn handle_draft_commit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         let idx = dispatcher.pending_placeholder();
         let tx = dispatcher.get_assistant_tx();
         let config = dispatcher.get_config().clone();
+        
+        // Note: We'll record the output in App when the async result arrives
+        // since we can't access the dispatcher from the spawned task
         tokio::spawn(async move {
             let event = match generate_commit_message_async(&config, &repo_root).await {
-                Some(msg) => AssistantEvent::Completed {
-                    idx,
-                    content: Some(format!("Suggested commit message:\n{msg}")),
-                },
+                Some(msg) => {
+                    // Signal contains __COMMIT_MSG__ prefix so app.rs can record it
+                    AssistantEvent::Completed {
+                        idx,
+                        content: Some(format!("__COMMIT_MSG__:{}\n\nSuggested commit message:\n{}", msg, msg)),
+                    }
+                }
                 None => AssistantEvent::Failed {
                     idx,
                     error: "Could not generate commit message (is anything staged?).".into(),

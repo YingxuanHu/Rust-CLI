@@ -32,6 +32,11 @@ pub enum WorkflowKind {
         generated_cmd: String,
         save_path: PathBuf,
     },
+    ChatCommandsConfirm {
+        original_query: String,
+        commands: Vec<String>,
+        combined_command: String,
+    },
     #[allow(dead_code)]
     ApplyDiff {
         file: String,
@@ -80,6 +85,13 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
             save_path,
         } => {
             handle_custom_command_confirm(responder, prompt, original_input, generated_cmd, save_path);
+        }
+        WorkflowKind::ChatCommandsConfirm {
+            original_query,
+            commands,
+            combined_command,
+        } => {
+            handle_chat_commands_confirm(responder, &workflow.repo_root, prompt, original_query, commands, combined_command);
         }
         WorkflowKind::ApplyDiff {
             file,
@@ -447,7 +459,7 @@ fn handle_custom_command_confirm<R: WorkflowResponder>(
         if !edited_cmd.is_empty() {
             let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
                 .unwrap_or_else(|| save_path.clone());
-            let learned_project = if save_path.to_string_lossy().contains(".llm_cli") {
+            let learned_project = if save_path.to_string_lossy().contains(".llm-cli") {
                 Some(save_path.as_path())
             } else {
                 None
@@ -478,7 +490,8 @@ fn handle_custom_command_confirm<R: WorkflowResponder>(
         return;
     }
     
-    if matches!(prompt_lower.as_str(), "" | "y" | "yes") {
+    // Handle "save" option - save and execute
+    if matches!(prompt_lower.as_str(), "" | "y" | "yes" | "s" | "save") {
         let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
             .unwrap_or_else(|| save_path.clone());
         let learned_project = if save_path.to_string_lossy().contains(".llm_cli") {
@@ -506,9 +519,144 @@ fn handle_custom_command_confirm<R: WorkflowResponder>(
             // Use execute_shell_command to properly expand handlers like {{GEN_COMMIT_MSG}}
             responder.execute_shell_command(&generated_cmd);
         }
-    } else if matches!(prompt_lower.as_str(), "n" | "no" | "cancel") {
-        responder.reply("Custom command not saved.");
+    } else if matches!(prompt_lower.as_str(), "n" | "no") {
+        // Signal to show feedback prompt instead
+        responder.reply("__SHOW_FEEDBACK_PROMPT__");
+    } else if matches!(prompt_lower.as_str(), "cancel") {
+        responder.reply("Cancelled.");
     } else {
-        responder.reply("Please press Enter (or type 'yes') to confirm, 'edit: <new command>' to modify, or 'no' to cancel.");
+        responder.reply("Please type [y]es to execute, [s]ave to save, [e]dit: <cmd> to edit, or [n]o to see other options.");
     }
+}
+
+fn handle_chat_commands_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    original_query: String,
+    _commands: Vec<String>,
+    combined_command: String,
+) {
+    let prompt_lower = prompt.trim().to_lowercase();
+    
+    // Handle "save" or "s" - save as custom command
+    if matches!(prompt_lower.as_str(), "s" | "save") {
+        let learned_global = repo_root.join(".llm-cli/learned.toml");
+        let learned_project = Some(repo_root.join(".llm-cli/learned.toml"));
+        let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref()).unwrap_or_default();
+        
+        if let Err(e) = learned.save_custom_command(
+            &original_query,
+            &combined_command,
+            &learned_global,
+            "user_chat_extracted",
+        ) {
+            responder.reply(format!("Failed to save custom command: {}", e));
+        } else {
+            responder.reply(format!(
+                "✓ Saved as custom command: \"{}\" → {}\nYou can now use \"{}\" directly.",
+                original_query,
+                combined_command,
+                original_query
+            ));
+        }
+        return;
+    }
+    
+    // Handle "yes" or Enter - execute
+    if matches!(prompt_lower.as_str(), "" | "y" | "yes") {
+        responder.reply(format!("Executing: {}", combined_command));
+        responder.execute_shell_command(&combined_command);
+        return;
+    }
+    
+    // Handle "no" or cancel
+    if matches!(prompt_lower.as_str(), "n" | "no" | "cancel") {
+        responder.reply("Commands not executed.");
+        return;
+    }
+    
+    // Invalid response
+    responder.reply("Please type [y]es to execute, [s]ave to save as custom command, or [n]o to cancel.");
+}
+
+/// Extract shell commands from LLM chat response text.
+/// Looks for code blocks (```bash, ```sh, ```) and inline commands after bullets.
+pub fn extract_commands_from_text(text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut in_code_block = false;
+    let mut code_block_lang = None;
+    
+    for line in lines {
+        let trimmed = line.trim();
+        
+        // Check for code block start
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                // End of code block
+                in_code_block = false;
+                code_block_lang = None;
+            } else {
+                // Start of code block
+                in_code_block = true;
+                let lang = trimmed.strip_prefix("```").unwrap_or("").trim();
+                code_block_lang = if lang.is_empty() || lang == "bash" || lang == "sh" || lang == "shell" {
+                    Some(lang)
+                } else {
+                    None
+                };
+            }
+            continue;
+        }
+        
+        // If we're in a relevant code block, extract the command
+        if in_code_block && code_block_lang.is_some() {
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                commands.push(trimmed.to_string());
+            }
+            continue;
+        }
+        
+        // Look for commands after bullet points (common in chat responses)
+        // Example: "• git checkout ." or "- git reset --hard HEAD"
+        // Also handles: "• **Description**: `git command`"
+        if let Some(rest) = trimmed.strip_prefix('•').or_else(|| trimmed.strip_prefix('-')) {
+            let rest = rest.trim();
+            
+            // Check if there's a backtick-wrapped command
+            if let Some(start_idx) = rest.find('`') {
+                if let Some(end_idx) = rest[start_idx + 1..].find('`') {
+                    let cmd = rest[start_idx + 1..start_idx + 1 + end_idx].trim();
+                    if is_shell_command(cmd) {
+                        commands.push(cmd.to_string());
+                        continue;
+                    }
+                }
+            }
+            
+            // Otherwise check if command directly follows bullet
+            if is_shell_command(rest) {
+                commands.push(rest.to_string());
+            }
+        }
+    }
+    
+    commands
+}
+
+/// Check if a string looks like a shell command
+fn is_shell_command(cmd: &str) -> bool {
+    cmd.starts_with("git ")
+        || cmd.starts_with("cargo ")
+        || cmd.starts_with("npm ")
+        || cmd.starts_with("docker ")
+        || cmd.starts_with("cd ")
+        || cmd.starts_with("ls ")
+        || cmd.starts_with("rm ")
+        || cmd.starts_with("cp ")
+        || cmd.starts_with("mv ")
+        || cmd.starts_with("mkdir ")
+        || cmd.starts_with("chmod ")
+        || cmd.starts_with("chown ")
 }

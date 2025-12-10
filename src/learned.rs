@@ -1,8 +1,7 @@
 //! Learned aliases management.
 //!
 //! Handles loading, saving, and matching user-learned command aliases.
-//! Supports both global (~/.config/llm_cli/learned.toml) and per-project
-//! (.llm_cli/learned.toml) learned aliases, with project overriding global.
+//! Stores learned aliases in .llm-cli/learned.toml in the project directory.
 //!
 //! Custom commands (user-defined shell commands) are stored separately in custom_commands.toml.
 

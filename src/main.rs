@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 mod app;
 mod commands;
 mod config;
+mod context;
 mod custom_command_generator;
 mod embedding;
 mod file_ops;

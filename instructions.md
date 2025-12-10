@@ -23,17 +23,20 @@ bash scripts/health.sh llama3
 - Timeouts: LLM 45s; command 60s; request 60s.
 - Max context: 4096 tokens.
 - Streaming responses: on by default.
-- History file: `~/.local/state/llm-cli/history.jsonl` (or `~/Library/Application Support/llm-cli/history.jsonl` on macOS).
+- All data stored in project's `.llm-cli/` directory (history, learned commands, embeddings, config).
 - Generate commit message: on by default.
 - Embedding model: `nomic-embed-text` (optional, for semantic intent matching).
+- Classifier model: `qwen2:1.5b` (for intent classification fallback).
 
 ## Setup and Usage
 - Prereqs: Rust toolchain (rustup/cargo), Ollama 0.13+ running (`ollama serve`).
 - Pull the default model: `ollama pull "llama3"` (or `llama3:8b`).
 - (Optional) Pull embedding model: `ollama pull "nomic-embed-text"` for semantic intent matching.
+- (Optional) Pull classifier model: `ollama pull "qwen2:1.5b"` for intent classification.
 - Health check: `cargo run -- health --model llama3` (or use `bash scripts/health.sh llama3`).
 - Run the TUI: `cargo run -- run` or simply `cargo run`.
-- Config file: place `config.toml` at `~/.config/llm-cli/config.toml` (Linux) or `~/Library/Application Support/llm-cli/config.toml` (macOS), or pass `--config path`. See `config.example.toml` for keys.
+- Config file: Create `.llm-cli/config.toml` in your project directory, or pass `--config path`. See `config.example.toml` for available options.
+- All files (history, learned commands, embeddings) are stored in `.llm-cli/` directory in your project.
 - Env overrides: `LLM_CLI_MODEL`, `LLM_CLI_SYSTEM_PROMPT`, `LLM_CLI_LLM_TIMEOUT_SECS`, `LLM_CLI_CMD_TIMEOUT_SECS`, `LLM_CLI_MAX_CONTEXT_TOKENS`, `LLM_CLI_STREAMING`, `LLM_CLI_HISTORY_PATH`, `LLM_CLI_REQUEST_TIMEOUT_SECS`, `LLM_CLI_GENERATE_COMMIT_MESSAGE`.
 
 ## Notes
@@ -91,16 +94,23 @@ The CLI uses semantic embedding-based intent matching to understand natural lang
 ### Testing
 - **Run tests**: `run tests`, `test`, `cargo test`, `run the tests`, `execute tests` → Runs `cargo test` in the repo.
 
-### Chat
-- **General chat**: Any other input that doesn't match a specific intent will be sent to the LLM for conversational response. Examples: `explain`, `what is`, `how do I`, `help me`, `tell me about`, `can you`.
+### Chat & Command Extraction
+- **General chat**: Any input that doesn't match a specific intent will be sent to the LLM for conversational response.
+- **Command extraction**: If the LLM's chat response contains shell commands (in code blocks or bullet points), the CLI will detect them and offer to:
+  - `[y]es` - Execute the commands
+  - `[s]ave` - Save as a custom command for future use
+  - `[n]o` - Skip execution
+- **Custom commands**: Saved commands can be reused by typing the exact phrase you used originally (e.g., "discard current changes").
 
 ## Semantic Intent Matching
 
-The CLI uses embedding-based semantic matching to understand user intent. When embeddings are available (via `nomic-embed-text` model), it compares your input against example phrases for each tool using cosine similarity. This allows natural language variations to be understood (e.g., "push my changes" matches "save_work" tool).
+The CLI uses a tiered intent resolution system:
+1. **Tier 1**: Fuzzy matching against learned commands and custom commands
+2. **Tier 2**: Embedding-based semantic matching (requires `nomic-embed-text`)
+3. **Tier 3**: Small LLM classifier (uses `qwen2:1.5b` to classify intent)
+4. **Tier 4**: For unknown intents, the CLI generates a suggested command using the LLM, then falls back to tool selection if declined
 
-If embeddings are not available, the CLI falls back to:
-1. Quick pattern matching for shell commands (`$`, `!`, `!!`)
-2. Direct LLM chat for everything else
+Custom commands are stored in `.llm-cli/custom_commands.toml` and have highest priority in matching.
 
 ## Workflow Confirmations
 
