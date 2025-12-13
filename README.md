@@ -1,208 +1,187 @@
-# LLM-Powered CLI
+# Final Report: Rust Terminal AI Assistant CLI
 
-## Motivation
+**Studnet names:**\
+Ruitong Li, \
+Yingxuan Hu, 1006881377
 
-A lack of a lightweight, Rust-native LLM-powered CLI exists in the
-current ecosystem. Existing solutions, such as Codex CLI and AIChat, are
-often too heavy or tied to other ecosystems, leaving a gap for a simple,
-Rust-based alternative. This gap matters because many developers who
-choose Rust do so precisely for its speed, safety, and efficiency in
-building small, reliable tools. When they want to experiment with
-AI-driven workflows, they often have no choice but to rely on bulky
-tools from other languages, which can feel out of place in the Rust
-ecosystem.
+**Contact email:**\
+ruiton.li@mail.utoronto.ca\
+alvin.hu@mail.utoronto.ca
 
-This project is designed to address that gap while remaining enjoyable
-to build. For us, it represents both a fun challenge and a learning
-opportunity. It brings together three areas we want to practice more
-deeply: systems programming in Rust, the design of text-based user
-interfaces, and the integration of large language models into developer
-tools. A project like this is not only rewarding to implement but also
-relevant to ongoing conversations about how developers can interact with
-AI in their day-to-day work.
 
-Another reason this idea motivates us is its feasibility. By setting a
-realistic scope, we believe two contributors working for one to two
-weeks can create a polished prototype that demonstrates novelty without
-being overwhelming. We see the novelty in its Rust-first design and in
-its ability to demonstrate agentic workflows in a lightweight way.
-Instead of being just a demonstration for this course, the project can
-act as a base for something more ambitious if we decide to keep building
-it later.
+# Table of Contents
 
-## Objective and Key Features
+- [Final Report: Rust Terminal AI Assistant CLI](#final-report-rust-terminal-ai-assistant-cli)
+- [Table of Contents](#table-of-contents)
+- [1. Motivation](#1-motivation)
+- [2. Objectives](#2-objectives)
+- [3. Features](#3-features)
+- [4. User Guide and Developer Guide](#4-user-guide-and-developer-guide)
+- [5. Reproducibility Guide](#5-reproducibility-guide)
+    - [Prerequisites on both macOS and Ubuntu](#prerequisites-on-both-macos-and-ubuntu)
+    - [macOS Sonoma clean setup](#macos-sonoma-clean-setup)
+    - [Ubuntu Linux server clean setup](#ubuntu-linux-server-clean-setup)
+    - [Optional configuration on both platforms](#optional-configuration-on-both-platforms)
+    - [Quick sanity checks after launch](#quick-sanity-checks-after-launch)
+    - [Common issues and expected behavior](#common-issues-and-expected-behavior)
+- [6.Contributions by Each Team Member](#6contributions-by-each-team-member)
+- [7. Lessons Learned and Concluding Remarks](#7-lessons-learned-and-concluding-remarks)
 
-The main objective of this project is to build a lightweight, Rust-based
-CLI powered by local LLM inference. The CLI will support context-aware
-sessions, integrate with a small set of developer tools, and showcase
-basic agentic workflows on a scale that feels practical but still novel.
 
-We want the final tool to feel natural to use in the terminal. It should
-behave less like an isolated demo and more like a familiar part of a
-developer's toolkit. To achieve this, we have outlined a set of core
-features. Each one is chosen not only for what it adds individually but
-also for how it contributes to the overall experience.
+# 1. Motivation
 
-### Stateful CLI Context (System+LLM)
+# 2. Objectives
 
-The CLI will maintain both system-level and semantic context. On the
-system side, it will remember the current working directory, repository
-path, and command history, so interactions feel cohesive like in a shell
-or REPL. On the semantic side, future iterations may extend context to
-the model itself, allowing it to interpret references in conversation.
-For example, after reviewing a Git diff, typing "commit it" would
-correctly link "it" to the diff. Together, these layers of memory shift
-the CLI from a pure executor toward a conversational partner.
+# 3. Features
+The final deliverable is a Rust native terminal application that combines a full screen chat style interface with a local language model running through Ollama and a small set of developer commands that work on the current directory or the current git repository. The main idea is that the user stays in one place. Regular text is treated as a prompt to the model and the reply appears in the same conversation log. Inputs that start with a colon are treated as commands and are handled by deterministic code rather than by the model. The result is a single interface that supports both conversation and practical tooling, so the assistant does not feel separated from the repository context the user is working in.
 
-### Local Inference with Ollama (Stateless Prompts)
+The interface is built with Ratatui and Crossterm and runs in a full screen terminal mode. Messages are shown in a conversation panel and are labeled as System, You, or LLM so it is always clear where each message comes from. Long lines are wrapped to fit the terminal width, which keeps output readable as the conversation grows. The input area stays fixed at the bottom so the user can continue typing while responses stream in. A status line shows the active model, the current working directory, and the detected repo root when applicable. When the program is waiting on the model or running a command, it shows an activity indicator so the user can tell the tool is working.
 
-We will use Ollama to run LLM inference locally. Running locally avoids
-the need for remote APIs, which improves speed and keeps code private.
-For the initial version, prompts will be treated statelessly. This keeps
-the system simple while still offering powerful functionality such as
-generating summaries or drafting commit messages. Even with this limited
-form, the tool gives developers the chance to use AI-powered queries
-directly in their terminal.
+The chat feature uses local inference through Ollama. The program sends prompts to Ollama’s local server and displays responses using streaming output, meaning the user sees text appear gradually instead of waiting for a full response at the end. This makes the experience feel faster and more interactive, especially for longer answers. The default model is llama3, but the model can be changed through an environment variable, which lets users switch models without changing the code. The tool also checks that Ollama is reachable and reports clear errors inside the conversation if the server is not running or the model is missing.
 
-### Ratatui TUI with Conversation Log
+To make the assistant feel consistent across a session, the tool keeps lightweight context that matters in terminal workflows. It tracks the current working directory and detects the git repo root when the user is inside a repository. This repo root becomes the reference point for repo scoped commands, which reduces surprises about where a search or file read is happening. The tool also keeps an in memory prompt history that can be navigated with the keyboard, which supports the common pattern of refining prompts rather than rewriting them from scratch.
 
-The interface will be built with Ratatui. This will give us a clean,
-scrollable conversation log of inputs and outputs, along with a
-straightforward input box for new commands. Having a polished interface
-matters because it makes the tool more approachable. Instead of looking
-like a wall of text, interactions feel organized, easy to follow, and
-engaging.
+Command routing is a core part of the design. The tool includes a small parser that recognizes colon commands and routes them to the correct implementation. When a command is recognized, the program runs a deterministic action and prints the result back into the conversation. When an input is not a command, it is sent to the model as a normal prompt. This separation is important because it prevents model generated text from triggering execution. Commands only run when the user explicitly types the command pattern.
 
-### Agentic Workflow (Basic to Advanced)
+The git save workflow is the main example of controlled automation. Developers often repeat the same steps when saving work, such as staging changes, committing, and pushing. The tool provides a planning command that shows what it would do and an execution command that performs the workflow. The planning form, invoked with :save, prints a structured plan that includes repository and branch context, a status snapshot, and the intended sequence of git operations. The execution form, invoked with :save! followed by a commit message, runs the workflow and prints a report showing what happened and how the repo state changed. This demonstrates an agent like multi step action while keeping execution explicit and transparent.
 
-As a demonstration of agentic behavior, the CLI will support multi-step
-workflows. For example, "save work to remote" could trigger git add, git
-commit with a generated message, and git push. Over time, this may
-expand into a rule-based planner capable of dynamically sequencing
-commands based on higher-level instructions. This progression shows how
-the assistant can evolve from scripted helpers into more flexible
-agents.
+The tool also includes commands that help users inspect repository context quickly. The search command, :find followed by a pattern, runs ripgrep and returns line numbered matches in the conversation. The file reading command, :read followed by a relative path, prints file contents into the conversation so the user can reference them while asking the model questions. File reading is restricted to the repository or current directory to reduce the risk of accessing unrelated paths. Output from search and file reads is truncated when necessary to keep the interface responsive.
+For code review and change understanding, the tool provides diff inspection and diff summarization. The :diff command displays a diff summary and the current git diff. The :summarize-diff command captures that diff and asks the local model to produce a concise summary that is useful for a commit message or review notes. This feature is a practical example of combining deterministic tooling, which provides exact change context, with an LLM, which provides synthesis and clear writing.
 
-## Stretch Goals
+Several usability choices support these features in day to day use. Streaming output reduces perceived latency and makes the tool feel responsive. Wrapped text and consistent truncation prevent the terminal layout from breaking or becoming unreadable. The status bar helps users keep track of which model and which repository context they are operating in. Most importantly, the tool keeps a clear boundary between chat and execution by requiring explicit colon commands for any deterministic action.
 
-If time allows, we have identified some additional features that would
-add depth without shifting the project's main focus. They show how the
-CLI could grow into something much more useful in the future.
+There are also limitations that we accepted for this project scope. The tool does not attempt to maintain long term semantic memory that automatically resolves references like “commit it” without a command. It does not yet provide advanced scrollback controls beyond the wrapped conversation view, and it does not include an interactive confirmation screen before running potentially destructive commands beyond the existing plan versus execute split. These limitations keep the implementation manageable while leaving clear opportunities for future improvement.
 
-### Developer Tool Wrappers
+# 4. User Guide and Developer Guide
 
-The CLI will also include features that make everyday work easier. It
-will handle basic file tasks such as reading, writing, or listing files,
-all within a safe environment so nothing important is changed by
-accident. It will also make searching through code more straightforward
-by connecting natural language requests to tools like ripgrep. For
-instance, if a developer asks to find all TODOs in the project, the CLI
-will return the results in a clear and organized way. These features do
-not replace existing tools but make them easier to use, helping
-developers stay focused on their main work without being slowed down by
-routine steps.
+# 5. Reproducibility Guide
 
-### Repo Awareness
+This section explains how to set up and run the project from a clean environment on macOS Sonoma and on an Ubuntu Linux server. The steps are written so the instructor can follow them exactly without filling in missing details. The project is a Rust native full screen terminal application. You build it with Cargo and run it from a terminal. The chat features and diff summarization depend on a local Ollama server because the tool sends prompts to Ollama over HTTP. If Ollama is not installed, not running, or the model is missing, the UI will still launch but the LLM features will show a clear System error message instead of a response.
 
-A future enhancement would make the CLI repo-aware. By parsing project
-metadata and source structure, it could tailor responses (e.g., running
-cargo test and explaining results). With that knowledge, it could also
-propose fixes as diffs, previewing changes for users to accept, reject,
-or modify.
+Repo related features such as viewing diffs and running the git save workflow require running the tool inside a git repository. If you run it in a directory that is not a repository, repo commands will either report that no repository was found or return empty output, which is expected behavior. The code search command uses ripgrep, so ripgrep must be installed if you want :find to work.
 
-### Autocompletion Support
+### Prerequisites on both macOS and Ubuntu
 
-We may add autocompletion to improve usability when typing commands.
-This could be implemented with existing Rust libraries such as reedline
-or rustyline, offering suggestions as users type, for example, turning
-"save" into "save work to remote." This feature would make the CLI feel
-more interactive and approachable, similar to modern shell experiences.
+You need a working Rust toolchain so Cargo can build the project, and you need Ollama installed to provide local model inference. You also need to pull at least one model into Ollama. The project uses llama3 by default, so pulling llama3 is the simplest way to match expected behavior. Git should be installed if you want to use :diff, :summarize-diff, :save, or :save!, since those features call git under the hood. Ripgrep is optional and only required for :find.
 
-### MCP Integration
+The tool expects to connect to Ollama at the default local address. If Ollama is running elsewhere, you can set OLLAMA_HOST, and if you want a different model you can set OLLAMA_MODEL. Both options are described later.
 
-We will add a minimal MCP client adapter that lets the CLI discover and
-invoke a small, fixed set of MCP tools (e.g., search.ripgrep, fs.read,
-and a composite git.save_work). The agentic workflow will treat MCP
-tools and internal tools uniformly via a shared tool catalog, preserving
-our existing safety rails (sandboxed paths, dry-run previews,
-confirmations). If MCP discovery fails, the CLI will gracefully fall
-back to internal implementations with no UX change. This integration
-demonstrates standards-based composition without expanding scope beyond
-a few well-defined tools.
+### macOS Sonoma clean setup
 
-## Operational Considerations
+Begin by installing Rust using rustup. This is the standard method and ensures Cargo and the compiler are placed in your home directory in a predictable way.
 
-To keep things safe when running commands, we’ll show a preview before anything is executed, such as git add, git commit, or git push. Users will be able to confirm the action before it runs. This will be implemented during Phase 3, along with smooth error handling for any failures.
-If Ollama isn’t available—whether it’s not installed, the server isn’t running, or the model isn’t found—the CLI will display a clear error message in the interface, such as “Can’t reach Ollama – is it running?”. We’ll introduce this basic detection in Phase 1 and refine the reconnect or retry experience in Phase 3.
-We’ll also allow default settings, like the model name and timeout values, and optionally remember command history. This configuration and persistence will tie into the session state work during Phases 2 and 3.
-For handling model responses, we’ll decide whether to stream output token-by-token or display it only after the full reply is generated. This choice will directly affect how we design the TUI and will be finalized in Phase 2.
-Finally, we plan to include lightweight testing early on. This will cover how high-level user intentions are mapped to actual commands and how git workflows behave using temporary directories instead of real remotes. These tests will be added ahead of the broader testing and documentation effort in Phase 5.
+`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 
-## Tentative Plan
+After installation, restart the terminal. This step matters on macOS because the installer updates your shell profile so Cargo can be found in new sessions. Confirm that both rustc and cargo are available.
 
-We have about two months to complete the project, which gives us enough
-time to move carefully from basic foundations to a polished prototype.
-To keep the workload balanced, both of us will handle aspects of
-frontend and backend development. That way, each of us gains experience
-across the full stack, and no one is locked into a single role.
+`rustc --version
+cargo --version`
 
-### Phase 1: Foundations and Setup
+Next install Ollama using Homebrew. This installs the Ollama application, which runs a background service that the CLI tool communicates with.
 
-The first step is to set up the environment and create the skeleton of
-the CLI.
+`brew install --cask ollama`
 
-- Ruitong will prepare the Rust workspace, add the necessary dependencies such as Ratatui, and create the first structure of the CLI. This includes setting up a simple input-and-output loop so the CLI can take user commands.
+Launch Ollama once so the background service starts. You can do this by opening the Ollama app from Spotlight. Once it has been launched, pull the default model used by the project.
 
-- Yingxuan will focus on connecting Ollama for local inference. The goal here is to make sure the CLI can send prompts to the model and display the responses correctly.
+`ollama pull llama3`
 
-By the end of this phase, we should have a basic CLI that runs locally,
-accepts commands, and produces LLM output.
+At this point, Ollama is ready and the model is available locally. If you want to use the :find command, install ripgrep.
 
-### Phase 2: Core Features
+`brew install ripgrep`
 
-Once the groundwork is done, we move to the core features that define
-the CLI.
+Now build and run the project. These commands must be run from the project root directory, meaning the folder that contains Cargo.toml.
 
-- Ruitong will build session state management. The CLI will be able to remember the current directory, repository path, and a history of commands. This will make it feel closer to a real shell, where the user does not need to repeat the same information every time.
+`cargo build
+cargo run`
 
-- Yingxuan will develop the Ratatui interface. The focus is on a scrollable conversation log that shows inputs and outputs in order, along with a clean input box for new commands. This step is important because it shapes how approachable and readable the tool feels.
+When the program starts, it switches the terminal into a full screen interface. You can type normal text and press Enter to chat with the model. You can press Up and Down to move through prompt history and resend a modified prompt. You can also use explicit commands. For example, :diff shows the current git diff when you are inside a repository, and :summarize-diff asks the model to summarize that diff into commit or review style text. The :save command prints a plan for a git add commit push workflow, and :save! followed by a commit message executes that workflow. The :read command prints the contents of a file given a relative path, and :find searches the repository using ripgrep if it is installed.
 
-During this phase, we will also connect the session logic and the model
-output so that prompts can move naturally through the interface, giving
-users a smooth interaction.
+### Ubuntu Linux server clean setup
 
-### Phase 3: Agentic Workflow and Polishing
+Start by installing basic packages needed for building and using the tool. Build essential provides a standard compilation environment, curl is needed to download installers, and git is required for repository features.
 
-In this phase, we will introduce simple agentic workflows to show the
-practical value of the tool.
+`sudo apt update
+sudo apt install -y build-essential curl git`
 
-- Yingxuan will design the logic that maps high-level commands to sequences of smaller tool calls. For example, typing "save work to remote" should trigger git add, git commit with a generated message, and git push automatically.
+Install Rust using rustup in non interactive mode. Then load the Cargo environment into the current shell session so cargo is available immediately without logging out.
 
-- Ruitong connects the LLM so it can generate useful commit messages and then make sure the results are displayed clearly in the interface.
+`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -y
+source "$HOME/.cargo/env"`
 
-At the same time, we will polish the tool. This includes adding error
-handling so the CLI responds gracefully to mistakes, cleaning up any
-rough interactions, and making sure commands feel smooth and not clunky.
+Confirm that Rust is installed.
 
-### Phase 4: Extra Features/Stretch Goal (If Time Is Permitted)
+`rustc --version
+cargo --version`
 
-If progress is faster than expected, we will add extra features to make
-the assistant more useful for daily work.
+Install Ollama using the official Linux installer script.
 
-- Yingxuan may extend file operations. The CLI could support reading, writing, or editing small files, but only inside a safe sandbox to prevent accidental changes outside the project.
+`curl -fsSL https://ollama.com/install.sh | sh`
 
-- Ruitong may add natural language wrappers for search tools such as ripgrep and integrate MCP tools. This would let a user type a request like "find all TODOs" and see the results displayed directly in the interface without having to remember the exact flags.
+Start the Ollama server. On a server, you should run this in a dedicated terminal session because it needs to stay running while the TUI is in use.
 
-If time permits, we may also add features with repo awareness, and
-autocompletion support to make typing commands faster and smoother.
+`ollama serve`
 
-### Phase 5: Testing, Documentation, and Demo Prep
+In a second SSH session, pull the default model. This separates model downloads from the server process and makes it easier to see errors if the pull fails.
 
-In the final stage, we will both focus on testing and polish. We will
-try the CLI on different systems and environments to make sure it
-behaves consistently. We will also refine the documentation so that
-anyone using the tool can understand how it works and what it can do.
-Finally, we will prepare a demo script that highlights the strongest
-features, including session memory, the interface, and the agentic
-workflow. This stage is shared equally because it requires careful
-review and clear communication from both of us.
+`ollama pull llama3`
+
+If you want to use the :find command, install ripgrep.
+
+`sudo apt install -y ripgrep`
+
+Now build and run the project from the repository root directory.
+
+`cargo build
+cargo run`
+
+The program will open the full screen TUI inside the terminal session. The basic interaction is the same as on macOS. Normal input becomes a model prompt, and colon commands trigger deterministic tools. For repo commands, ensure you are running inside a git repository. If you are testing on a server and want to avoid pushing to a real remote, you can still run :save as a safe preview without executing anything.
+
+### Optional configuration on both platforms
+
+The tool supports selecting a different Ollama model. To do that, set OLLAMA_MODEL to the desired model name, pull it into Ollama, then run the tool. The pull step is important because setting the environment variable alone does not download the model.
+
+`export OLLAMA_MODEL=llama3.2:3b
+ollama pull llama3.2:3b
+cargo run`
+
+The tool also supports changing the Ollama server address. This is useful if Ollama is bound to a different interface, if you are running inside a container, or if your environment routes Ollama through a proxy. The host value should include both the protocol and the port. The default port is 11434, so an example override looks like this.
+
+`export OLLAMA_HOST=http://127.0.0.1:11434
+cargo run`
+
+This avoids a common mistake of omitting the port, which would cause the tool to connect to the wrong address and fail.
+
+### Quick sanity checks after launch
+
+After the UI opens, first verify model chat by typing a short prompt such as "Give me a two sentence description of this tool" and confirm that the response streams into the conversation. If you do not see a response, check that Ollama is running and that the model has been pulled.
+
+Next verify prompt history by pressing Up to recall the last prompt, editing it slightly, and resending it. This confirms that the session history is active.
+
+If you are inside a git repository with changes, verify repo features by running :diff to show the diff and then :summarize-diff to generate a summary. If you want to test the workflow planning feature safely, run :save and confirm that a plan is printed without executing git operations.
+
+Finally, verify developer tooling by running :read Cargo.toml or another small file and by running :find TODO if ripgrep is installed.
+
+### Common issues and expected behavior
+
+If the tool reports that it cannot reach Ollama, the server is likely not running. Start ollama serve and try again. If the tool reports that the model is missing, run ollama pull with the model name you are using. If :find does not work, confirm that ripgrep is installed by running rg --version. If git related commands do not work, confirm that git is installed and that you launched the tool inside a git repository.
+# 6.Contributions by Each Team Member
+**Yingxuan**
+
+Yingxuan worked on the parts of the project that connect the chat experience to local inference and to practical repository workflows. A large portion of this work was around the Ollama integration, where the focus was making the assistant feel responsive and reliable in real use. Model requests were implemented with streaming output so replies appear progressively in the interface instead of arriving all at once, and common failure cases such as Ollama not running or a model not being available were handled with clear, user facing error messages inside the conversation log.
+
+Yingxuan also contributed to features that make repeated use comfortable in a terminal setting. This included prompt history navigation so users can recall and refine earlier prompts quickly, and session context tracking such as the current working directory and detection of a git repo root when the tool is used inside a repository. These elements help the assistant behave less like a one off chatbot and more like a tool that understands the user’s working context.
+
+On the developer tooling side, Yingxuan implemented and refined the explicit command routing that separates normal chat prompts from deterministic tool commands. This routing enabled repo oriented features such as code search through a ripgrep wrapper, safe file reading limited to the repository or current directory, and diff inspection that surfaces current changes without leaving the TUI. Yingxuan also implemented the diff summarization flow that captures a git diff and composes a structured prompt for the local model, producing a concise summary that is useful for commit messages or review notes. In addition, Yingxuan helped implement the git save workflow that demonstrates controlled agent like behavior by supporting a planning mode and a separate execution mode, then formatting the results so the workflow is transparent to the user.
+
+To support reliability and grading expectations, Yingxuan added a regression test around the git save planning behavior using a temporary repository to confirm that the expected structured output remains stable as the code evolves. Yingxuan also contributed to documentation updates so the project is easy to reproduce and demo, including quickstart steps, configuration options such as the model selection, and a clear command reference for users and instructors.
+
+**Ruitong**
+
+
+# 7. Lessons Learned and Concluding Remarks
+
+We learned that streaming output is not just a nice extra feature but a major part of how users judge responsiveness. Even when a model takes the same amount of time to finish, showing text as it arrives makes the tool feel faster and reduces uncertainty. Implementing streaming also pushed us to design the program with clearer separation between rendering, session state, and background work, because the UI must update smoothly while new tokens continue to arrive.
+We also learned that “agentic” behavior only feels useful when it is easy to trust. Developers are comfortable with automation when they can predict what will happen and when execution is clearly intentional. If command execution is triggered indirectly through free form text, users lose confidence quickly because the consequences can be real, especially in a git repository. Our plan and execute approach reinforced that it is possible to demonstrate multi step workflows while still keeping the user in control.
+Another lesson was that repository awareness can be valuable without being complicated. We did not need deep project analysis to create something useful. Simply detecting the repo root, exposing diff inspection, and adding a diff summarization command already supports common tasks like writing commit messages and preparing review notes. This incremental approach is practical because it delivers value early and provides a clear path for adding deeper repo features later without redesigning the system.
+We also gained a better understanding of how much work goes into a terminal UI that feels stable. A TUI is easy to get working at a basic level, but small details determine whether it feels polished. Handling raw mode correctly, keeping layout consistent, wrapping text, truncating large outputs, and showing clear error messages all matter for reliability and usability. These details became especially important because our tool needs to remain readable while it is actively streaming output and printing tool results.
+Overall, the project showed us that the best way to build an LLM assisted developer tool is to be deliberate about boundaries. The model is strongest at explanation and summarization, while deterministic commands are best for actions like reading files, searching code, and running git operations. Keeping those roles separate made the tool easier to reason about and safer to use, and it gives us a clear direction for future improvements.
