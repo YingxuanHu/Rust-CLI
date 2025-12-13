@@ -1,6 +1,10 @@
 .venv
 
+# Local cache directory (legacy)
+.cache/
 
+# LLM CLI data directory - stores history, learned commands, embeddings, etc.
+.llm-cli/
 
 # Added by cargo
 

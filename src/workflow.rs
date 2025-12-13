@@ -1,0 +1,662 @@
+use std::path::PathBuf;
+
+use crate::{
+    commands::{format_error, run_command, split_commit_message},
+    config::Config,
+    file_ops,
+    learned::LearnedAliases,
+};
+
+use tokio::process::Command as TokioCommand;
+
+#[derive(Debug, Clone)]
+pub struct WorkflowState {
+    pub kind: WorkflowKind,
+    pub repo_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub enum WorkflowKind {
+    SaveWorkPlan,
+    SaveWorkCommit { suggested: String },
+    CommitOnlyConfirm { suggested: String },
+    StagePlan { args: Vec<String> },
+    DiffPreview { file: Option<String> },
+    WriteFileConfirm {
+        path: String,
+        content: String,
+        overwrite: bool,
+    },
+    CustomCommandConfirm {
+        original_input: String,
+        generated_cmd: String,
+        save_path: PathBuf,
+    },
+    ChatCommandsConfirm {
+        original_query: String,
+        commands: Vec<String>,
+        combined_command: String,
+    },
+    #[allow(dead_code)]
+    ApplyDiff {
+        file: String,
+        original: String,
+        proposed: String,
+        description: String,
+    },
+}
+
+pub trait WorkflowResponder {
+    fn reply(&mut self, content: impl Into<String>);
+    fn execute_shell_command(&mut self, cmd: &str);
+}
+
+pub fn handle_workflow_response<R: WorkflowResponder>(
+    responder: &mut R,
+    workflow: WorkflowState,
+    prompt: &str,
+) {
+    match workflow.kind {
+        WorkflowKind::SaveWorkPlan => {
+            handle_save_work_plan(responder, &workflow.repo_root, prompt);
+        }
+        WorkflowKind::SaveWorkCommit { suggested } => {
+            handle_save_work_commit(responder, &workflow.repo_root, prompt, suggested);
+        }
+        WorkflowKind::StagePlan { args } => {
+            handle_stage_plan(responder, &workflow.repo_root, prompt, args);
+        }
+        WorkflowKind::DiffPreview { file } => {
+            handle_diff_preview(responder, &workflow.repo_root, prompt, file);
+        }
+        WorkflowKind::CommitOnlyConfirm { suggested } => {
+            handle_commit_only_confirm(responder, &workflow.repo_root, prompt, suggested);
+        }
+        WorkflowKind::WriteFileConfirm {
+            path,
+            content,
+            overwrite,
+        } => {
+            handle_write_file_confirm(responder, &workflow.repo_root, prompt, path, content, overwrite);
+        }
+        WorkflowKind::CustomCommandConfirm {
+            original_input,
+            generated_cmd,
+            save_path,
+        } => {
+            handle_custom_command_confirm(responder, prompt, original_input, generated_cmd, save_path);
+        }
+        WorkflowKind::ChatCommandsConfirm {
+            original_query,
+            commands,
+            combined_command,
+        } => {
+            handle_chat_commands_confirm(responder, &workflow.repo_root, prompt, original_query, commands, combined_command);
+        }
+        WorkflowKind::ApplyDiff {
+            file,
+            original,
+            proposed,
+            description,
+        } => {
+            handle_apply_diff(responder, &workflow.repo_root, prompt, file, original, proposed, description);
+        }
+    }
+}
+
+fn handle_save_work_plan<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+) {
+    let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "" | "y" | "yes");
+    if !confirmed {
+        responder.reply("Workflow cancelled.");
+        return;
+    }
+
+    match run_command(repo_root, "git", &["add", "-A"]) {
+        Ok(out) => {
+            if !out.trim().is_empty() {
+                responder.reply(format!("git add -A output:\n{out}"));
+            }
+        }
+        Err(err) => {
+            responder.reply(format!("git add -A failed: {}", format_error(&err)));
+            return;
+        }
+    }
+
+    // Note: The suggested message generation and next workflow step
+    // need to be handled by the caller
+}
+
+fn handle_save_work_commit<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    suggested: String,
+) {
+    let lower = prompt.trim().to_lowercase();
+    if matches!(lower.as_str(), "cancel" | "no" | "n") {
+        responder.reply("Workflow cancelled.");
+        return;
+    }
+    let commit_msg = if matches!(lower.as_str(), "" | "yes" | "y") {
+        suggested
+    } else {
+        prompt.trim().to_string()
+    };
+    run_save_work_impl(responder, repo_root, &commit_msg);
+}
+
+fn handle_stage_plan<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    args: Vec<String>,
+) {
+    if matches!(prompt.trim().to_lowercase().as_str(), "" | "yes" | "y") {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        match run_command(repo_root, "git", &arg_refs) {
+            Ok(out) => {
+                let detail = if out.trim().is_empty() {
+                    "ok".to_string()
+                } else {
+                    out
+                };
+                responder.reply(format!("git {} ok\n{}", args.join(" "), detail));
+            }
+            Err(err) => responder.reply(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                format_error(&err)
+            )),
+        }
+    } else {
+        responder.reply("Staging cancelled.");
+    }
+}
+
+fn handle_diff_preview<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    file: Option<String>,
+) {
+    let input = prompt.trim();
+    if matches!(input.to_lowercase().as_str(), "cancel" | "no" | "n") {
+        responder.reply("Cancelled.");
+        return;
+    }
+    if input.is_empty() || input.eq_ignore_ascii_case("yes") || input.eq_ignore_ascii_case("y") {
+        responder.reply("Ok.");
+        return;
+    }
+    let target = if input.is_empty() {
+        file.unwrap_or_default()
+    } else {
+        input.to_string()
+    };
+    if target.is_empty() {
+        responder.reply("No file specified.");
+        return;
+    }
+    let diff = run_command(repo_root, "git", &["diff", "--", &target])
+        .unwrap_or_else(|e| format!("(git diff failed: {})", format_error(&e)));
+    responder.reply(format!("Diff for {}:\n{}", target, diff));
+}
+
+fn handle_commit_only_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    suggested: String,
+) {
+    let lower = prompt.trim().to_lowercase();
+    if matches!(lower.as_str(), "cancel" | "no" | "n") {
+        responder.reply("Commit cancelled.");
+        return;
+    }
+    let commit_msg = if matches!(lower.as_str(), "" | "yes" | "y") {
+        suggested
+    } else {
+        prompt.trim().to_string()
+    };
+    let mut logs = vec![format!("Using commit message:\n{}", commit_msg)];
+    let (subject, body_lines) = split_commit_message(&commit_msg);
+    let mut commit_args: Vec<String> = vec!["commit".into(), "-m".into(), subject];
+    for line in body_lines {
+        commit_args.push("-m".into());
+        commit_args.push(line);
+    }
+    let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
+    if !run_workflow_step(
+        &mut logs,
+        repo_root,
+        "git commit",
+        "git",
+        &commit_arg_refs,
+    ) {
+        responder.reply(logs.join("\n"));
+        return;
+    }
+    logs.push("Commit completed (no push).".to_string());
+    responder.reply(logs.join("\n"));
+}
+
+fn handle_write_file_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    path: String,
+    content: String,
+    overwrite: bool,
+) {
+    let lower = prompt.trim().to_lowercase();
+    if !matches!(lower.as_str(), "" | "yes" | "y") {
+        responder.reply("File write cancelled.");
+        return;
+    }
+
+    let target_path = PathBuf::from(&path);
+    match file_ops::write_file(&target_path, &content, repo_root) {
+        Ok(()) => {
+            let action = if overwrite { "overwrote" } else { "created" };
+            responder.reply(format!("Successfully {} file: {}", action, path));
+        }
+        Err(err) => {
+            responder.reply(format!("Failed to write file: {}", err));
+        }
+    }
+}
+
+fn handle_apply_diff<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    file: String,
+    _original: String,
+    proposed: String,
+    _description: String,
+) {
+    let lower = prompt.trim().to_lowercase();
+    
+    if matches!(lower.as_str(), "cancel" | "no" | "n") {
+        responder.reply("Diff application cancelled.");
+        return;
+    }
+    
+    if matches!(lower.as_str(), "" | "yes" | "y") {
+        let target_path = PathBuf::from(&file);
+        match file_ops::write_file(&target_path, &proposed, repo_root) {
+            Ok(()) => {
+                responder.reply(format!("Applied changes to {}", file));
+            }
+            Err(err) => {
+                responder.reply(format!("Failed to apply changes: {}", err));
+            }
+        }
+        return;
+    }
+    
+    // For any other input, treat as "edit" - show the proposed content and ask again
+    responder.reply(format!(
+        "Edit mode not yet implemented. Press Enter (or type 'yes') to apply or 'no' to cancel.\n\nProposed content:\n{}",
+        &proposed[..proposed.len().min(500)]
+    ));
+}
+
+fn run_save_work_impl<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    commit_msg: &str,
+) {
+    let mut logs = vec!["Running save-work workflow…".to_string()];
+
+    logs.push(format!("Using commit message: {}", commit_msg));
+
+    let (subject, body_lines) = split_commit_message(commit_msg);
+    let mut commit_args: Vec<String> = vec!["commit".into(), "-m".into(), subject];
+    for line in body_lines {
+        commit_args.push("-m".into());
+        commit_args.push(line);
+    }
+    let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
+
+    if !run_workflow_step(&mut logs, repo_root, "git commit", "git", &commit_arg_refs) {
+        responder.reply(logs.join("\n"));
+        return;
+    }
+
+    if !run_workflow_step(&mut logs, repo_root, "git push", "git", &["push"]) {
+        responder.reply(logs.join("\n"));
+        return;
+    }
+
+    logs.push("Workflow completed successfully.".to_string());
+    responder.reply(logs.join("\n"));
+}
+
+fn run_workflow_step(
+    logs: &mut Vec<String>,
+    repo_root: &std::path::Path,
+    label: &str,
+    program: &str,
+    args: &[&str],
+) -> bool {
+    match run_command(repo_root, program, args) {
+        Ok(out) => {
+            logs.push(format!("{label} OK\n{out}"));
+            true
+        }
+        Err(err) => {
+            logs.push(format!("{label} failed: {err}"));
+            false
+        }
+    }
+}
+
+pub fn generate_commit_message(config: &Config, repo_root: &std::path::Path) -> Option<String> {
+    if !config.generate_commit_message {
+        return None;
+    }
+    let stat = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    if stat.trim().is_empty() {
+        return None;
+    }
+    let patch = run_command(
+        repo_root,
+        "git",
+        &["diff", "--cached", "--unified=3", "--max-count=1"],
+    )
+    .unwrap_or_default();
+    let patch_snippet = if patch.len() > 4000 {
+        format!("{}...\n[truncated]", &patch[..4000])
+    } else {
+        patch
+    };
+    let prompt = format!(
+        "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
+    );
+    let result = std::process::Command::new("ollama")
+        .arg("run")
+        .arg(&config.model)
+        .arg(prompt)
+        .output()
+        .ok()?;
+
+    if !result.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub async fn generate_commit_message_async(
+    config: &Config,
+    repo_root: &std::path::Path,
+) -> Option<String> {
+    if !config.generate_commit_message {
+        return None;
+    }
+    let stat = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    if stat.trim().is_empty() {
+        return None;
+    }
+    let patch = run_command(
+        repo_root,
+        "git",
+        &["diff", "--cached", "--unified=3", "--max-count=1"],
+    )
+    .unwrap_or_default();
+    let patch_snippet = if patch.len() > 4000 {
+        format!("{}...\n[truncated]", &patch[..4000])
+    } else {
+        patch
+    };
+    let prompt = format!(
+        "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
+    );
+    let result = TokioCommand::new("ollama")
+        .arg("run")
+        .arg(&config.model)
+        .arg(prompt)
+        .output()
+        .await
+        .ok()?;
+
+    if !result.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+
+fn handle_custom_command_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    prompt: &str,
+    original_input: String,
+    generated_cmd: String,
+    save_path: PathBuf,
+) {
+    let prompt_lower = prompt.trim().to_lowercase();
+    
+    // Check for edit command
+    if let Some(new_cmd) = prompt.trim().strip_prefix("edit:").or_else(|| prompt.trim().strip_prefix("edit ")) {
+        let edited_cmd = new_cmd.trim();
+        if !edited_cmd.is_empty() {
+            let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
+                .unwrap_or_else(|| save_path.clone());
+            let learned_project = if save_path.to_string_lossy().contains(".llm-cli") {
+                Some(save_path.as_path())
+            } else {
+                None
+            };
+            
+            let mut learned = LearnedAliases::load(&learned_global, learned_project).unwrap_or_default();
+            
+            if let Err(e) = learned.save_custom_command(
+                &original_input,
+                edited_cmd,
+                &save_path,
+                "user_custom_edited",
+            ) {
+                responder.reply(format!("Failed to save custom command: {}", e));
+            } else {
+                responder.reply(format!(
+                    "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                    original_input,
+                    edited_cmd
+                ));
+                
+                // Use execute_shell_command to properly expand handlers like {{GEN_COMMIT_MSG}}
+                responder.execute_shell_command(edited_cmd);
+            }
+        } else {
+            responder.reply("Empty command. Custom command not saved.");
+        }
+        return;
+    }
+    
+    // Handle "save" option - save and execute
+    if matches!(prompt_lower.as_str(), "" | "y" | "yes" | "s" | "save") {
+        let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
+            .unwrap_or_else(|| save_path.clone());
+        let learned_project = if save_path.to_string_lossy().contains(".llm_cli") {
+            Some(save_path.as_path())
+        } else {
+            None
+        };
+        
+        let mut learned = LearnedAliases::load(&learned_global, learned_project).unwrap_or_default();
+        
+        if let Err(e) = learned.save_custom_command(
+            &original_input,
+            &generated_cmd,
+            &save_path,
+            "user_custom_generated",
+        ) {
+            responder.reply(format!("Failed to save custom command: {}", e));
+        } else {
+            responder.reply(format!(
+                "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                original_input,
+                generated_cmd
+            ));
+            
+            // Use execute_shell_command to properly expand handlers like {{GEN_COMMIT_MSG}}
+            responder.execute_shell_command(&generated_cmd);
+        }
+    } else if matches!(prompt_lower.as_str(), "n" | "no") {
+        // Signal to show feedback prompt instead
+        responder.reply("__SHOW_FEEDBACK_PROMPT__");
+    } else if matches!(prompt_lower.as_str(), "cancel") {
+        responder.reply("Cancelled.");
+    } else {
+        responder.reply("Please type [y]es to execute, [s]ave to save, [e]dit: <cmd> to edit, or [n]o to see other options.");
+    }
+}
+
+fn handle_chat_commands_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    repo_root: &std::path::Path,
+    prompt: &str,
+    original_query: String,
+    _commands: Vec<String>,
+    combined_command: String,
+) {
+    let prompt_lower = prompt.trim().to_lowercase();
+    
+    // Handle "save" or "s" - save as custom command
+    if matches!(prompt_lower.as_str(), "s" | "save") {
+        let learned_global = repo_root.join(".llm-cli/learned.toml");
+        let learned_project = Some(repo_root.join(".llm-cli/learned.toml"));
+        let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref()).unwrap_or_default();
+        
+        if let Err(e) = learned.save_custom_command(
+            &original_query,
+            &combined_command,
+            &learned_global,
+            "user_chat_extracted",
+        ) {
+            responder.reply(format!("Failed to save custom command: {}", e));
+        } else {
+            responder.reply(format!(
+                "✓ Saved as custom command: \"{}\" → {}\nYou can now use \"{}\" directly.",
+                original_query,
+                combined_command,
+                original_query
+            ));
+        }
+        return;
+    }
+    
+    // Handle "yes" or Enter - execute
+    if matches!(prompt_lower.as_str(), "" | "y" | "yes") {
+        responder.reply(format!("Executing: {}", combined_command));
+        responder.execute_shell_command(&combined_command);
+        return;
+    }
+    
+    // Handle "no" or cancel
+    if matches!(prompt_lower.as_str(), "n" | "no" | "cancel") {
+        responder.reply("Commands not executed.");
+        return;
+    }
+    
+    // Invalid response
+    responder.reply("Please type [y]es to execute, [s]ave to save as custom command, or [n]o to cancel.");
+}
+
+/// Extract shell commands from LLM chat response text.
+/// Looks for code blocks (```bash, ```sh, ```) and inline commands after bullets.
+pub fn extract_commands_from_text(text: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut in_code_block = false;
+    let mut code_block_lang = None;
+    
+    for line in lines {
+        let trimmed = line.trim();
+        
+        // Check for code block start
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                // End of code block
+                in_code_block = false;
+                code_block_lang = None;
+            } else {
+                // Start of code block
+                in_code_block = true;
+                let lang = trimmed.strip_prefix("```").unwrap_or("").trim();
+                code_block_lang = if lang.is_empty() || lang == "bash" || lang == "sh" || lang == "shell" {
+                    Some(lang)
+                } else {
+                    None
+                };
+            }
+            continue;
+        }
+        
+        // If we're in a relevant code block, extract the command
+        if in_code_block && code_block_lang.is_some() {
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                commands.push(trimmed.to_string());
+            }
+            continue;
+        }
+        
+        // Look for commands after bullet points (common in chat responses)
+        // Example: "• git checkout ." or "- git reset --hard HEAD"
+        // Also handles: "• **Description**: `git command`"
+        if let Some(rest) = trimmed.strip_prefix('•').or_else(|| trimmed.strip_prefix('-')) {
+            let rest = rest.trim();
+            
+            // Check if there's a backtick-wrapped command
+            if let Some(start_idx) = rest.find('`') {
+                if let Some(end_idx) = rest[start_idx + 1..].find('`') {
+                    let cmd = rest[start_idx + 1..start_idx + 1 + end_idx].trim();
+                    if is_shell_command(cmd) {
+                        commands.push(cmd.to_string());
+                        continue;
+                    }
+                }
+            }
+            
+            // Otherwise check if command directly follows bullet
+            if is_shell_command(rest) {
+                commands.push(rest.to_string());
+            }
+        }
+    }
+    
+    commands
+}
+
+/// Check if a string looks like a shell command
+fn is_shell_command(cmd: &str) -> bool {
+    cmd.starts_with("git ")
+        || cmd.starts_with("cargo ")
+        || cmd.starts_with("npm ")
+        || cmd.starts_with("docker ")
+        || cmd.starts_with("cd ")
+        || cmd.starts_with("ls ")
+        || cmd.starts_with("rm ")
+        || cmd.starts_with("cp ")
+        || cmd.starts_with("mv ")
+        || cmd.starts_with("mkdir ")
+        || cmd.starts_with("chmod ")
+        || cmd.starts_with("chown ")
+}

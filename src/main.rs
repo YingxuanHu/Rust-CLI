@@ -5,9 +5,28 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod commands;
+mod completion;
 mod config;
+mod context;
+mod custom_command_generator;
+mod embedding;
+mod file_ops;
+mod frecency;
+mod fuzzy;
+mod handlers;
+mod input;
+mod intent;
+mod keyword_classifier;
+mod learned;
+mod llm_classifier;
 mod ollama;
+mod repo;
 mod session;
+mod tools;
+mod ui;
+mod user_feedback;
+mod workflow;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "LLM-powered CLI (Rust + Ollama)")]
@@ -32,7 +51,8 @@ enum Command {
     Run,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let config = config::Config::load(cli.config.clone()).context("loading config")?;
@@ -54,7 +74,7 @@ fn main() -> Result<()> {
             println!("Ollama is reachable and model '{model}' is available.");
         }
         Command::Run => {
-            app::run(config)?;
+            app::run(config).await?;
         }
     }
 

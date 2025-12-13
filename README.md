@@ -1,4 +1,95 @@
-# Final Report: Rust Terminal AI Assistant CLI
+# LLM-Powered CLI
+
+## Motivation
+
+A lack of a lightweight, Rust-native LLM-powered CLI exists in the
+current ecosystem. Existing solutions, such as Codex CLI and AIChat, are
+often too heavy or tied to other ecosystems, leaving a gap for a simple,
+Rust-based alternative. This gap matters because many developers who
+choose Rust do so precisely for its speed, safety, and efficiency in
+building small, reliable tools. When they want to experiment with
+AI-driven workflows, they often have no choice but to rely on bulky
+tools from other languages, which can feel out of place in the Rust
+ecosystem.
+
+This project is designed to address that gap while remaining enjoyable
+to build. For us, it represents both a fun challenge and a learning
+opportunity. It brings together three areas we want to practice more
+deeply: systems programming in Rust, the design of text-based user
+interfaces, and the integration of large language models into developer
+tools. A project like this is not only rewarding to implement but also
+relevant to ongoing conversations about how developers can interact with
+AI in their day-to-day work.
+
+Another reason this idea motivates us is its feasibility. By setting a
+realistic scope, we believe two contributors working for one to two
+weeks can create a polished prototype that demonstrates novelty without
+being overwhelming. We see the novelty in its Rust-first design and in
+its ability to demonstrate agentic workflows in a lightweight way.
+Instead of being just a demonstration for this course, the project can
+act as a base for something more ambitious if we decide to keep building
+it later.
+
+## Objective and Key Features
+
+The main objective of this project is to build a lightweight, Rust-based
+CLI powered by local LLM inference. The CLI will support context-aware
+sessions, integrate with a small set of developer tools, and showcase
+basic agentic workflows on a scale that feels practical but still novel.
+
+We want the final tool to feel natural to use in the terminal. It should
+behave less like an isolated demo and more like a familiar part of a
+developer's toolkit. To achieve this, we have outlined a set of core
+features. Each one is chosen not only for what it adds individually but
+also for how it contributes to the overall experience.
+
+### Stateful CLI Context (System+LLM) 
+
+The CLI maintains both system-level and semantic context. On the
+system side, it remembers the current working directory, repository
+path, and command history, so interactions feel cohesive like in a shell
+or REPL. On the semantic side, the CLI now tracks recent command outputs
+(diffs, files, shell results) and resolves references in conversation.
+For example, after running "show status", typing "commit it" correctly
+links "it" to the shown diff. The system uses Cursor-style context
+injection: when reference words are detected, recent outputs are added
+to the LLM prompt for natural resolution. See
+[SEMANTIC_CONTEXT.md](docs/SEMANTIC_CONTEXT.md) for details.
+
+### Local Inference with Ollama (Stateless Prompts)
+
+We will use Ollama to run LLM inference locally. Running locally avoids
+the need for remote APIs, which improves speed and keeps code private.
+For the initial version, prompts will be treated statelessly. This keeps
+the system simple while still offering powerful functionality such as
+generating summaries or drafting commit messages. Even with this limited
+form, the tool gives developers the chance to use AI-powered queries
+directly in their terminal.
+
+### Ratatui TUI with Conversation Log
+
+The interface will be built with Ratatui. This will give us a clean,
+scrollable conversation log of inputs and outputs, along with a
+straightforward input box for new commands. Having a polished interface
+matters because it makes the tool more approachable. Instead of looking
+like a wall of text, interactions feel organized, easy to follow, and
+engaging.
+
+### Agentic Workflow (Basic to Advanced)
+
+As a demonstration of agentic behavior, the CLI will support multi-step
+workflows. For example, "save work to remote" could trigger git add, git
+commit with a generated message, and git push. Over time, this may
+expand into a rule-based planner capable of dynamically sequencing
+commands based on higher-level instructions. This progression shows how
+the assistant can evolve from scripted helpers into more flexible
+agents.
+
+## Stretch Goals
+
+If time allows, we have identified some additional features that would
+add depth without shifting the project's main focus. They show how the
+CLI could grow into something much more useful in the future.
 
 **Studnet names:**\
 Ruitong Li, \
@@ -8,6 +99,14 @@ Yingxuan Hu, 1006881377
 ruiton.li@mail.utoronto.ca\
 alvin.hu@mail.utoronto.ca
 
+### Repo Awareness 
+
+The CLI is now repo-aware and automatically detects project types
+(Rust, Node.js, Python, Go). It tailors commands based on the detected
+project type (e.g., running `cargo test` for Rust or `npm test` for
+Node.js). The infrastructure is also in place for proposing fixes as
+diffs, with a workflow for users to accept, reject, or modify changes.
+See [REPO_AWARENESS.md](REPO_AWARENESS.md) for details.
 
 # Table of Contents
 

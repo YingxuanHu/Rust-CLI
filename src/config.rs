@@ -1,7 +1,6 @@
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::Deserialize;
 
 const DEFAULT_MODEL: &str = "llama3";
@@ -17,6 +16,10 @@ pub struct Config {
     pub history_path: PathBuf,
     pub request_timeout_secs: u64,
     pub generate_commit_message: bool,
+    pub embedding_cache_path: PathBuf,
+    pub embedding_model: String,
+    pub classifier_model: String,
+    pub learned_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -30,6 +33,10 @@ struct PartialConfig {
     history_path: Option<PathBuf>,
     request_timeout_secs: Option<u64>,
     generate_commit_message: Option<bool>,
+    embedding_cache_path: Option<PathBuf>,
+    embedding_model: Option<String>,
+    classifier_model: Option<String>,
+    learned_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -77,6 +84,18 @@ impl Config {
         }
         if let Some(generate_commit_message) = partial.generate_commit_message {
             self.generate_commit_message = generate_commit_message;
+        }
+        if let Some(embedding_cache_path) = partial.embedding_cache_path {
+            self.embedding_cache_path = embedding_cache_path;
+        }
+        if let Some(embedding_model) = partial.embedding_model {
+            self.embedding_model = embedding_model;
+        }
+        if let Some(classifier_model) = partial.classifier_model {
+            self.classifier_model = classifier_model;
+        }
+        if let Some(learned_path) = partial.learned_path {
+            self.learned_path = learned_path;
         }
     }
 
@@ -126,6 +145,26 @@ impl Config {
                 self.generate_commit_message = parsed;
             }
         }
+        if let Ok(val) = env::var("LLM_CLI_EMBEDDING_CACHE_PATH") {
+            if !val.is_empty() {
+                self.embedding_cache_path = PathBuf::from(val);
+            }
+        }
+        if let Ok(val) = env::var("LLM_CLI_EMBEDDING_MODEL") {
+            if !val.is_empty() {
+                self.embedding_model = val;
+            }
+        }
+        if let Ok(val) = env::var("LLM_CLI_CLASSIFIER_MODEL") {
+            if !val.is_empty() {
+                self.classifier_model = val;
+            }
+        }
+        if let Ok(val) = env::var("LLM_CLI_LEARNED_PATH") {
+            if !val.is_empty() {
+                self.learned_path = PathBuf::from(val);
+            }
+        }
     }
 }
 
@@ -141,26 +180,32 @@ impl Default for Config {
             history_path: default_history_path(),
             request_timeout_secs: 60,
             generate_commit_message: true,
+            embedding_cache_path: default_embedding_cache_path(),
+            embedding_model: "nomic-embed-text".to_string(),
+            classifier_model: "qwen2:1.5b".to_string(),
+            learned_path: default_learned_path(),
         }
     }
 }
 
 fn default_config_path() -> Option<PathBuf> {
-    project_dirs().map(|dirs| dirs.config_dir().join("config.toml"))
+    // Look for config in .llm-cli directory in current project
+    Some(PathBuf::from(".llm-cli/config.toml"))
 }
 
 fn default_history_path() -> PathBuf {
-    if let Some(dirs) = project_dirs() {
-        if let Some(state) = dirs.state_dir() {
-            return state.join("history.jsonl");
-        }
-        return dirs.data_dir().join("history.jsonl");
-    }
-    PathBuf::from("~/.local/state/llm-cli/history.jsonl")
+    // Store history in project's .llm-cli directory
+    PathBuf::from(".llm-cli/history.jsonl")
 }
 
-fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("dev", "llm-cli", "llm-cli")
+fn default_embedding_cache_path() -> PathBuf {
+    // Store embedding cache in project's .llm-cli directory
+    PathBuf::from(".llm-cli/embeddings.toml")
+}
+
+fn default_learned_path() -> PathBuf {
+    // Store learned aliases in project's .llm-cli directory
+    PathBuf::from(".llm-cli/learned.toml")
 }
 
 fn parse_bool(input: &str) -> Result<bool, std::str::ParseBoolError> {
