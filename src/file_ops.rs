@@ -10,13 +10,14 @@ use anyhow::{Context, Result, bail};
 /// Check if a path is safe (within the allowed base directory).
 #[allow(dead_code)] // Reserved for future validation
 pub fn is_safe_path(path: &Path, base: &Path) -> bool {
+    let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     match path.canonicalize() {
-        Ok(canonical) => canonical.starts_with(base),
+        Ok(canonical) => canonical.starts_with(&canonical_base),
         Err(_) => {
             // If path doesn't exist yet, check if parent is safe
             if let Some(parent) = path.parent() {
                 match parent.canonicalize() {
-                    Ok(canonical_parent) => canonical_parent.starts_with(base),
+                    Ok(canonical_parent) => canonical_parent.starts_with(&canonical_base),
                     Err(_) => false,
                 }
             } else {
@@ -39,8 +40,9 @@ pub fn resolve_path(path_str: &str, base: &Path) -> PathBuf {
 /// List files in a directory.
 pub fn list_directory(path: &Path, base: &Path) -> Result<Vec<FileInfo>> {
     let canonical = path.canonicalize().context("canonicalizing path")?;
+    let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     
-    if !canonical.starts_with(base) {
+    if !canonical.starts_with(&canonical_base) {
         bail!("Access denied: path outside allowed directory");
     }
 
@@ -93,8 +95,9 @@ pub struct FileInfo {
 #[allow(dead_code)] // Used by show_file via fs::read_to_string in app.rs
 pub fn read_file(path: &Path, base: &Path) -> Result<String> {
     let canonical = path.canonicalize().context("canonicalizing path")?;
+    let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     
-    if !canonical.starts_with(base) {
+    if !canonical.starts_with(&canonical_base) {
         bail!("Access denied: path outside allowed directory");
     }
 
@@ -108,8 +111,9 @@ pub fn write_file(path: &Path, content: &str, base: &Path) -> Result<()> {
     let canonical_parent = parent
         .canonicalize()
         .context("parent directory does not exist")?;
+    let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     
-    if !canonical_parent.starts_with(base) {
+    if !canonical_parent.starts_with(&canonical_base) {
         bail!("Access denied: path outside allowed directory");
     }
 
@@ -175,4 +179,3 @@ mod tests {
         assert!(is_safe_path(&safe_path, &temp_dir));
     }
 }
-
