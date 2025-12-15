@@ -22,3 +22,6 @@ fuzzy-matcher = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.dev]
+incremental = false

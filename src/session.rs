@@ -44,13 +44,6 @@ impl SessionState {
         self.history.push(message);
     }
 
-    /// Change the current working directory and update repo_root if needed.
-    pub fn set_cwd(&mut self, new_cwd: PathBuf) {
-        self.cwd = new_cwd;
-        self.repo_root = find_git_root(&self.cwd);
-        self.repo_info = RepoInfo::detect(&self.cwd);
-    }
-
     /// Record a command output for semantic reference resolution
     pub fn record_output(&mut self, kind: &'static str, summary: &str, content: &str) {
         const MAX_OUTPUTS: usize = 5;
