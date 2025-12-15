@@ -12,7 +12,7 @@ alvin.hu@mail.utoronto.ca
 
 # Video Slide Presentation
 
-[Link to be added: Video presentation explaining the project architecture, features, and demonstration]
+https://drive.google.com/file/d/1k9EWQem0jMkhU5A1f3u6RnVxP2bLZsGG/view?usp=sharing
 
 ---
 
