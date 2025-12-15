@@ -22,7 +22,10 @@ One of our major features is workflows. which means we can trigger complex actio
 
 Adding some changes to a file, we can see how the tool detects the changes and includes them in the git plan.
 
-TODO: Delete this message before submission. 
+TODO: Delete this message before submission.
+
+
+If the user input workflows that are not recognized, for example `discard all local changes` our intent handler will direct the prompt to LLM, in our case, llama3, to generate a workflow, which the user can then review and confirm. The learned workflows are saved and can be triggered directly without go through the llm, ensures the speed.
 
 | 4 | **LLM commit message suggestion** | After staging, accept generated message | “We partner with the model to draft commit messages. You can accept/edit before commit so nothing happens blindly.” |
 | 5 | **Shell + bang shortcuts** | Use Ctrl+S to enter Shell mode, run `$ ls` and `!!` | “Toggle Shell mode for direct commands, or prefix with `$` in Chat. History-aware bang shortcuts mirror Bash muscle memory.” |
