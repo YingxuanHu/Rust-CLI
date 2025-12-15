@@ -691,7 +691,7 @@ CONFIGURATION
     • LLM model selection
     • Streaming preferences  
     • Output style (bullets/paragraph)
-    • Macros and custom commands
+    • Macros and custom workflows
 
 REQUIREMENTS
     • Ollama running locally (ollama.com)

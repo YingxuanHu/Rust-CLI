@@ -288,7 +288,7 @@ impl App {
             return;
         }
         
-        // Check for custom command generation signal
+        // Check for custom workflow generation signal
         if final_content.starts_with("__CUSTOM_COMMAND_GENERATED__:") {
             self.pending_idxs.retain(|&i| i != idx);
             // Parse the signal: __CUSTOM_COMMAND_GENERATED__:original_input:generated_cmd:save_path
@@ -301,8 +301,8 @@ impl App {
                 
                 // Show the generated command and ask for confirmation
                 self.reply(format!(
-                    "💡 Generated command:\n  {}\n\n\
-                     This will be saved as: \"{}\" → custom shell command\n\n\
+                    "💡 Generated workflow:\n  {}\n\n\
+                     This will be saved as: \"{}\" → custom workflow\n\n\
                      Options:\n\
                      • Press Enter (or type 'yes') to confirm and execute\n\
                      • Type 'edit: <new command>' to modify\n\
@@ -313,7 +313,7 @@ impl App {
                 
                 // Store for confirmation
                 self.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::CustomCommandConfirm {
+                    kind: crate::workflow::WorkflowKind::CustomWorkflowConfirm {
                         original_input: original_input.to_string(),
                         generated_cmd: generated_cmd.to_string(),
                         save_path,
@@ -368,7 +368,7 @@ impl App {
                     "\n💡 Found command: `{}`\n\n\
                      Options:\n\
                      • [y]es - Execute it\n\
-                     • [s]ave - Save as custom command for \"{}\" \n\
+                     • [s]ave - Save as custom workflow for \"{}\" \n\
                      • [n]o - Skip",
                     combined,
                     original_query
@@ -379,7 +379,7 @@ impl App {
                      Combined: `{}`\n\n\
                      Options:\n\
                      • [y]es - Execute all\n\
-                     • [s]ave - Save as custom command for \"{}\"\n\
+                     • [s]ave - Save as custom workflow for \"{}\"\n\
                      • [n]o - Skip",
                     commands.len(),
                     commands.iter().map(|c| format!("  • {}", c)).collect::<Vec<_>>().join("\n"),

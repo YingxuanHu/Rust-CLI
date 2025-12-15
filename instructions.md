@@ -98,18 +98,18 @@ The CLI uses semantic embedding-based intent matching to understand natural lang
 - **General chat**: Any input that doesn't match a specific intent will be sent to the LLM for conversational response.
 - **Command extraction**: If the LLM's chat response contains shell commands (in code blocks or bullet points), the CLI will detect them and offer to:
   - `[y]es` - Execute the commands
-  - `[s]ave` - Save as a custom command for future use
+  - `[s]ave` - Save as a custom workflow for future use
   - `[n]o` - Skip execution
-- **Custom commands**: Saved commands can be reused by typing the exact phrase you used originally (e.g., "discard current changes").
+- **Custom workflows**: Saved workflows can be reused by typing the exact phrase you used originally (e.g., "discard current changes").
 
 ## Semantic Intent Matching
 
 The CLI uses a 3-tier intent resolution system:
-1. **Tier 1**: Fuzzy matching against learned commands and custom commands (< 1ms)
+1. **Tier 1**: Fuzzy matching against learned commands and custom workflows (< 1ms)
 2. **Tier 2**: Keyword + embedding hybrid classifier (~50ms, requires `nomic-embed-text`)
 3. **Tier 3**: Small LLM classifier (~500ms, uses `qwen2:1.5b`) → falls back to chat if uncertain
 
-If all tiers are uncertain, the system defaults to conversational chat mode. Custom commands are stored in `.llm-cli/learned.toml` and have highest priority in matching.
+If all tiers are uncertain, the system defaults to conversational chat mode. Custom workflows are stored in `.llm-cli/custom_workflows.toml` (legacy `.llm-cli/custom_commands.toml`) and have highest priority in matching.
 
 ## Workflow Confirmations
 

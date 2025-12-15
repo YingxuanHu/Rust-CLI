@@ -147,7 +147,7 @@ source = "user_feedback"
 - **90% of commands:** Resolved in Tier 1 (< 1ms)
 - **9% of commands:** Resolved in Tier 2 (~50ms)
 - **1% of commands:** Resolved in Tier 3 or fall back to chat
-- **Over time:** More commands move to Tier 1 through custom command learning
+- **Over time:** More commands move to Tier 1 through custom workflow learning
 
 ---
 
@@ -329,7 +329,7 @@ Remove incorrect entry and re-learn correctly.
 
 ## Learning Custom Commands
 
-When the LLM generates shell commands during chat, the system offers to save them as custom commands. These are stored in `.llm-cli/learned.toml` and matched instantly in Tier 1 (< 1ms).
+When the LLM generates shell commands during chat, the system offers to save them as custom workflows. These are stored in `.llm-cli/custom_workflows.toml` (legacy `.llm-cli/custom_commands.toml`) and matched instantly in Tier 1 (< 1ms).
 
 ---
 
@@ -342,4 +342,3 @@ The 3-tier intent system provides:
 4. **Clarity** - Explainable, deterministic matches
 
 It's designed to be **fast, local, and clean** - resolving most commands instantly while providing a natural conversational experience for everything else.
-

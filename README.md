@@ -80,7 +80,7 @@ Tracks working directory, repository root, and project type. Maintains input his
 
 ### Intent Routing, Workflows, and Command Learning
 
-In this project, a **workflow** means a user-facing action that expands into a **series of individual commands** (e.g., multiple `git` steps) with **previews + explicit confirmation** before execution. We use this term throughout the CLI because many “smart” behaviors (git automation, running commands suggested by the LLM, and saving custom commands) share the same plan/confirm/execute pattern.
+In this project, a **workflow** means a user-facing action that expands into a **series of individual commands** (e.g., multiple `git` steps) with **previews + explicit confirmation** before execution. We use this term throughout the CLI because many “smart” behaviors (git automation, running commands suggested by the LLM, and saving custom workflows) share the same plan/confirm/execute pattern.
 
 #### Tiered Intent Resolution (how text becomes an action)
 
@@ -409,7 +409,7 @@ After the UI opens:
 **Custom Command Learning:**
 - Built command extraction from LLM responses
 - Implemented learned aliases with TOML persistence
-- Integrated custom commands into Tier 1 for instant recall
+- Integrated custom workflows into Tier 1 for instant recall
 
 **Testing and Documentation:**
 - Added unit tests for key modules

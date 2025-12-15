@@ -127,7 +127,7 @@ Next time:
 
 Next time:
 > deploy staging
-→ Instantly executes your custom command (< 1ms via Tier 1)
+→ Instantly executes your custom workflow (< 1ms via Tier 1)
 ```
 
 ## Configuration
@@ -190,14 +190,14 @@ $ git status          # Direct shell execution
 !!                    # Repeat last shell command
 ```
 
-## View Learned Aliases and Commands
+## View Learned Aliases and Workflows
 
 ```bash
 # Tool aliases
 cat .llm-cli/learned.toml
 
-# Custom commands
-cat .llm-cli/custom_commands.toml
+# Custom workflows
+cat .llm-cli/custom_workflows.toml
 ```
 
 Example **learned.toml** (tool mappings):
@@ -210,10 +210,10 @@ timestamp = "1702053600"
 source = "user_feedback"
 ```
 
-Example **custom_commands.toml** (shell commands):
+Example **custom_workflows.toml** (shell command workflows):
 
 ```toml
-[[custom_commands]]
+[[custom_workflows]]
 phrase = "deploy staging"
 command = "ssh staging 'cd /app && git pull'"
 timestamp = "1702053700"
@@ -224,7 +224,7 @@ source = "user_custom_generated"
 
 All data is stored per-project in the `.llm-cli/` directory:
 - **learned.toml**: Tool aliases (e.g., "yeet" → save_work)
-- **custom_commands.toml**: Custom shell commands
+- **custom_workflows.toml**: Custom shell workflows
 - **embeddings.toml**: Cached embeddings for faster intent matching
 - **history.jsonl**: Conversation history
 - **config.toml**: Project-specific configuration (optional)
@@ -310,7 +310,7 @@ Define your own shell command sequences:
 
 Next time:
 > backup database
-→ Runs your backup command instantly
+→ Runs your backup workflow instantly
 ```
 
 See [MACROS.md](MACROS.md) for detailed macro documentation.
@@ -318,7 +318,7 @@ See [MACROS.md](MACROS.md) for detailed macro documentation.
 ## Next Steps
 
 - Read [INTENT_SYSTEM.md](INTENT_SYSTEM.md) for detailed architecture
-- Read [MACROS.md](MACROS.md) for custom command workflows
+- Read [MACROS.md](MACROS.md) for custom workflows
 - Read [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) for technical details
 - Customize your config in `.llm-cli/config.toml` (optional)
 - Start using and let it learn your preferences!
@@ -343,4 +343,3 @@ See [MACROS.md](MACROS.md) for detailed macro documentation.
 ```
 
 The system gets smarter the more you use it. Enjoy!
-

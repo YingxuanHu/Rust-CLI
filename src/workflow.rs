@@ -27,7 +27,7 @@ pub enum WorkflowKind {
         content: String,
         overwrite: bool,
     },
-    CustomCommandConfirm {
+    CustomWorkflowConfirm {
         original_input: String,
         generated_cmd: String,
         save_path: PathBuf,
@@ -79,12 +79,12 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
         } => {
             handle_write_file_confirm(responder, &workflow.repo_root, prompt, path, content, overwrite);
         }
-        WorkflowKind::CustomCommandConfirm {
+        WorkflowKind::CustomWorkflowConfirm {
             original_input,
             generated_cmd,
             save_path,
         } => {
-            handle_custom_command_confirm(responder, prompt, original_input, generated_cmd, save_path);
+            handle_custom_workflow_confirm(responder, prompt, original_input, generated_cmd, save_path);
         }
         WorkflowKind::ChatCommandsConfirm {
             original_query,
@@ -444,7 +444,7 @@ pub async fn generate_commit_message_async(
 }
 
 
-fn handle_custom_command_confirm<R: WorkflowResponder>(
+fn handle_custom_workflow_confirm<R: WorkflowResponder>(
     responder: &mut R,
     prompt: &str,
     original_input: String,
@@ -467,16 +467,16 @@ fn handle_custom_command_confirm<R: WorkflowResponder>(
             
             let mut learned = LearnedAliases::load(&learned_global, learned_project).unwrap_or_default();
             
-            if let Err(e) = learned.save_custom_command(
+            if let Err(e) = learned.save_custom_workflow(
                 &original_input,
                 edited_cmd,
                 &save_path,
                 "user_custom_edited",
             ) {
-                responder.reply(format!("Failed to save custom command: {}", e));
+                responder.reply(format!("Failed to save custom workflow: {}", e));
             } else {
                 responder.reply(format!(
-                    "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                    "✓ Learned custom workflow: \"{}\" → {}\nExecuting now...",
                     original_input,
                     edited_cmd
                 ));
@@ -502,16 +502,16 @@ fn handle_custom_command_confirm<R: WorkflowResponder>(
         
         let mut learned = LearnedAliases::load(&learned_global, learned_project).unwrap_or_default();
         
-        if let Err(e) = learned.save_custom_command(
+        if let Err(e) = learned.save_custom_workflow(
             &original_input,
             &generated_cmd,
             &save_path,
             "user_custom_generated",
         ) {
-            responder.reply(format!("Failed to save custom command: {}", e));
+            responder.reply(format!("Failed to save custom workflow: {}", e));
         } else {
             responder.reply(format!(
-                "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
+                "✓ Learned custom workflow: \"{}\" → {}\nExecuting now...",
                 original_input,
                 generated_cmd
             ));
@@ -538,23 +538,31 @@ fn handle_chat_commands_confirm<R: WorkflowResponder>(
     combined_command: String,
 ) {
     let prompt_lower = prompt.trim().to_lowercase();
+    let learned_global = repo_root.join(".llm-cli/learned.toml");
+    let learned_project = Some(learned_global.clone());
     
-    // Handle "save" or "s" - save as custom command
+    let save_custom_workflow =
+        |source: &str| -> Result<(), String> {
+            let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref())
+                .map_err(|e| e.to_string())?;
+            
+            learned
+                .save_custom_workflow(
+                    &original_query,
+                    &combined_command,
+                    &learned_global,
+                    source,
+                )
+                .map_err(|e| e.to_string())
+        };
+    
+    // Handle "save" or "s" - save as custom workflow
     if matches!(prompt_lower.as_str(), "s" | "save") {
-        let learned_global = repo_root.join(".llm-cli/learned.toml");
-        let learned_project = Some(repo_root.join(".llm-cli/learned.toml"));
-        let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref()).unwrap_or_default();
-        
-        if let Err(e) = learned.save_custom_command(
-            &original_query,
-            &combined_command,
-            &learned_global,
-            "user_chat_extracted",
-        ) {
-            responder.reply(format!("Failed to save custom command: {}", e));
+        if let Err(e) = save_custom_workflow("user_chat_extracted") {
+            responder.reply(format!("Failed to save custom workflow: {}", e));
         } else {
             responder.reply(format!(
-                "✓ Saved as custom command: \"{}\" → {}\nYou can now use \"{}\" directly.",
+                "✓ Saved as custom workflow: \"{}\" → {}\nYou can now use \"{}\" directly.",
                 original_query,
                 combined_command,
                 original_query
@@ -565,7 +573,18 @@ fn handle_chat_commands_confirm<R: WorkflowResponder>(
     
     // Handle "yes" or Enter - execute
     if matches!(prompt_lower.as_str(), "" | "y" | "yes") {
-        responder.reply(format!("Executing: {}", combined_command));
+        match save_custom_workflow("user_chat_confirmed") {
+            Ok(_) => responder.reply(format!(
+                "✓ Saved and executing \"{}\" → {}\nRunning now...",
+                original_query,
+                combined_command
+            )),
+            Err(e) => responder.reply(format!(
+                "Executing: {}\n(Warning: failed to save custom workflow: {})",
+                combined_command,
+                e
+            )),
+        }
         responder.execute_shell_command(&combined_command);
         return;
     }
@@ -577,7 +596,7 @@ fn handle_chat_commands_confirm<R: WorkflowResponder>(
     }
     
     // Invalid response
-    responder.reply("Please type [y]es to execute, [s]ave to save as custom command, or [n]o to cancel.");
+    responder.reply("Please type [y]es to execute, [s]ave to save as custom workflow, or [n]o to cancel.");
 }
 
 /// Extract shell commands from LLM chat response text.
