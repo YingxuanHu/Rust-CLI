@@ -2,8 +2,7 @@
 //!
 //! Tier 1: Fuzzy matching (< 1ms)
 //! Tier 2: Keyword + embedding hybrid (~50ms)
-//! Tier 3: Small LLM classifier (~500ms)
-//! Tier 4: User feedback → learn
+//! Tier 3: Small LLM classifier (~500ms) → fallback to "chat"
 
 use anyhow::Result;
 
@@ -34,7 +33,7 @@ impl ParsedIntent {
     }
 }
 
-/// Main entry point: resolve intent through all 4 tiers.
+/// Main entry point: resolve intent through all 3 tiers.
 pub async fn resolve_intent(
     input: &str,
     cache: &EmbeddingCache,
@@ -74,16 +73,13 @@ pub async fn resolve_intent(
         return Ok(intent);
     }
     
-    // Tier 4: Ask user (only when LLM couldn't classify at all)
-    // This means the input looks like an action intent but we can't figure out which tool
-    tracing::debug!("[Intent Resolution] → Tier 4 (Ask User)");
+    // Fallback: Default to chat when LLM couldn't classify
+    // This means the input is likely conversational rather than an action intent
+    tracing::debug!("[Intent Resolution] → Fallback to chat");
     Ok(ParsedIntent {
-        tool: "ask_user".to_string(),
-        args: ToolArgs {
-            query: Some(input.to_string()),
-            ..Default::default()
-        },
-        confidence: 0.0,
+        tool: "chat".to_string(),
+        args: ToolArgs::default(),
+        confidence: 0.5,
     })
 }
 

@@ -104,13 +104,12 @@ The CLI uses semantic embedding-based intent matching to understand natural lang
 
 ## Semantic Intent Matching
 
-The CLI uses a tiered intent resolution system:
-1. **Tier 1**: Fuzzy matching against learned commands and custom commands
-2. **Tier 2**: Embedding-based semantic matching (requires `nomic-embed-text`)
-3. **Tier 3**: Small LLM classifier (uses `qwen2:1.5b` to classify intent)
-4. **Tier 4**: For unknown intents, the CLI generates a suggested command using the LLM, then falls back to tool selection if declined
+The CLI uses a 3-tier intent resolution system:
+1. **Tier 1**: Fuzzy matching against learned commands and custom commands (< 1ms)
+2. **Tier 2**: Keyword + embedding hybrid classifier (~50ms, requires `nomic-embed-text`)
+3. **Tier 3**: Small LLM classifier (~500ms, uses `qwen2:1.5b`) → falls back to chat if uncertain
 
-Custom commands are stored in `.llm-cli/custom_commands.toml` and have highest priority in matching.
+If all tiers are uncertain, the system defaults to conversational chat mode. Custom commands are stored in `.llm-cli/learned.toml` and have highest priority in matching.
 
 ## Workflow Confirmations
 

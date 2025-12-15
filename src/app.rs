@@ -18,7 +18,6 @@ use crate::{
     completion::CompletionProvider,
     config::Config,
     context,
-    custom_command_generator,
     embedding::EmbeddingCache,
     frecency::FrecencyTracker,
     handlers::{dispatch_intent, AssistantEvent, IntentDispatcher},
@@ -26,11 +25,9 @@ use crate::{
     intent::{self, ParsedIntent},
     learned::LearnedAliases,
     ollama,
-    repo::ProjectType,
     session::{Message, Role, SessionState},
-    tools::{ToolArgs, TOOLS},
+    tools::ToolArgs,
     ui::{render_ui, AppView, InputMode, TerminalGuard},
-    user_feedback,
     workflow::{generate_commit_message, handle_workflow_response, WorkflowResponder, WorkflowState},
 };
 
@@ -105,11 +102,11 @@ struct App {
     input: String,
     messages: Vec<Message>,
     scroll: usize,
+    scroll_locked: bool, // When true, don't auto-reset scroll to bottom
     pending_idxs: Vec<usize>,
     input_history: Vec<String>,
     history_idx: Option<usize>,
     pending_workflow: Option<WorkflowState>,
-    pending_user_feedback: Option<String>,
     assistant_tx: mpsc::UnboundedSender<AssistantEvent>,
     assistant_rx: mpsc::UnboundedReceiver<AssistantEvent>,
     embedding_cache: Arc<EmbeddingCache>,
@@ -139,11 +136,11 @@ impl App {
             input: String::new(),
             messages: Vec::new(),
             scroll: 0,
+            scroll_locked: false,
             pending_idxs: Vec::new(),
             input_history: Vec::new(),
             history_idx: None,
             pending_workflow: None,
-            pending_user_feedback: None,
             assistant_tx,
             assistant_rx,
             embedding_cache,
@@ -179,9 +176,9 @@ impl App {
             input: &self.input,
             input_mode: self.input_mode,
             model: &self.config.model,
-            streaming: self.config.streaming,
+            _streaming: self.config.streaming,
             cwd: self.session.cwd.to_string_lossy().to_string(),
-            repo_root: self
+            _repo_root: self
                 .session
                 .repo_root
                 .as_ref()
@@ -197,10 +194,13 @@ impl App {
             match event {
                 AssistantEvent::Token { idx, chunk } => self.append_assistant_chunk(idx, chunk),
                 AssistantEvent::Completed { idx, content } => self.finish_assistant(idx, content),
-                AssistantEvent::Failed { idx, error } => self.fail_assistant(idx, error),
+                AssistantEvent::Failed { idx, error} => self.fail_assistant(idx, error),
             }
-            self.scroll = 0;
-            self.viewing_history = false;
+            // Only reset scroll if not locked
+            if !self.scroll_locked {
+                self.scroll = 0;
+                self.viewing_history = false;
+            }
         }
     }
 
@@ -228,6 +228,29 @@ impl App {
             content,
         });
         self.scroll = 0;
+        self.viewing_history = false;
+    }
+
+    fn reply_scroll_to_top(&mut self, content: impl Into<String>) {
+        let content = content.into();
+        
+        // Count lines in the message to set appropriate scroll
+        // We need to estimate rendered lines considering wrapping
+        let line_count = content.lines().count();
+        
+        self.messages.push(Message {
+            role: Role::Assistant,
+            content: content.clone(),
+        });
+        self.session.record(Message {
+            role: Role::Assistant,
+            content,
+        });
+        
+        // Set scroll to a high value to show the top of the message
+        // This will be clamped by the UI rendering logic
+        self.scroll = line_count.saturating_add(100);
+        self.scroll_locked = true; // Lock scroll so it doesn't auto-reset
         self.viewing_history = false;
     }
 
@@ -298,108 +321,7 @@ impl App {
                     repo_root: self.session.repo_root.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
                 });
                 
-                // Clear pending feedback since we're now in confirmation workflow
-                self.pending_user_feedback = None;
             }
-            return;
-        }
-
-        // Check for ask user signal from background task
-        if final_content.starts_with("__ASK_USER__:") {
-            self.pending_idxs.retain(|&i| i != idx);
-            // Remove the placeholder message
-            if idx < self.messages.len() {
-                self.messages.remove(idx);
-            }
-            // Extract original input
-            let original_input = final_content.strip_prefix("__ASK_USER__:")
-                .unwrap_or("")
-                .to_string();
-            
-            // Try to generate a suggested command first
-            let tx = self.assistant_tx.clone();
-            let model = self.config.classifier_model.clone();
-            let original_input_clone = original_input.clone();
-            let repo_context = self.session.repo_info.as_ref().map(|info| {
-                let type_str = match info.project_type {
-                    crate::repo::ProjectType::Rust => "Rust",
-                    crate::repo::ProjectType::Node => "Node.js",
-                    crate::repo::ProjectType::Python => "Python",
-                    crate::repo::ProjectType::Go => "Go",
-                    crate::repo::ProjectType::Unknown => "Unknown",
-                };
-                format!("{} project", type_str)
-            });
-            
-            // Show a message that we're generating
-            self.reply(format!("💭 Generating suggested command for \"{}\"...", original_input));
-            
-            tokio::spawn(async move {
-                match custom_command_generator::generate_custom_command(
-                    &original_input_clone,
-                    &model,
-                    repo_context.as_deref(),
-                ).await {
-                    Ok(suggested_cmd) => {
-                        let _ = tx.send(AssistantEvent::Completed {
-                            idx: 0,
-                            content: Some(format!("__SUGGEST_COMMAND__:{}:{}", original_input_clone, suggested_cmd)),
-                        });
-                    }
-                    Err(_) => {
-                        // Fall back to user feedback prompt
-                        let _ = tx.send(AssistantEvent::Completed {
-                            idx: 0,
-                            content: Some(format!("__FALLBACK_ASK_USER__:{}", original_input_clone)),
-                        });
-                    }
-                }
-            });
-            return;
-        }
-        
-        // Handle command suggestion response
-        if final_content.starts_with("__SUGGEST_COMMAND__:") {
-            let parts: Vec<&str> = final_content.splitn(3, ':').collect();
-            if parts.len() >= 3 {
-                let original_input = parts[1];
-                let suggested_cmd = parts[2];
-                
-                self.reply(format!(
-                    "💡 Suggested command: `{}`\n\n\
-                     Options:\n\
-                     • [y]es - Execute it\n\
-                     • [s]ave - Save as custom command\n\
-                     • [e]dit - Provide a different command (cmd: ...)\n\
-                     • [n]o - Show tool selection menu instead",
-                    suggested_cmd
-                ));
-                
-                self.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::CustomCommandConfirm {
-                        original_input: original_input.to_string(),
-                        generated_cmd: suggested_cmd.to_string(),
-                        save_path: self.session.repo_root.clone()
-                            .unwrap_or_else(|| self.session.cwd.clone())
-                            .join(".llm-cli/learned.toml"),
-                    },
-                    repo_root: self.session.repo_root.clone().unwrap_or_else(|| self.session.cwd.clone()),
-                });
-                
-                // Store original input for potential fallback
-                self.pending_user_feedback = Some(original_input.to_string());
-            }
-            return;
-        }
-        
-        // Handle fallback to ask user
-        if final_content.starts_with("__FALLBACK_ASK_USER__:") {
-            let original_input = final_content.strip_prefix("__FALLBACK_ASK_USER__:")
-                .unwrap_or("")
-                .to_string();
-            self.pending_user_feedback = Some(original_input.clone());
-            let feedback = user_feedback::generate_feedback_prompt(&original_input);
-            self.reply(feedback);
             return;
         }
 
@@ -597,6 +519,10 @@ impl IntentDispatcher for App {
         self.reply(content);
     }
 
+    fn reply_scroll_to_top(&mut self, content: impl Into<String>) {
+        self.reply_scroll_to_top(content);
+    }
+
     fn push_recorded(&mut self, role: Role, content: impl Into<String>) -> usize {
         self.push_recorded(role, content)
     }
@@ -727,8 +653,8 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
 fn submit_input(app: &mut App) {
     let raw_input = app.input.trim().to_string();
     
-    // Allow empty input only if we have a pending workflow or feedback
-    if raw_input.is_empty() && app.pending_workflow.is_none() && app.pending_user_feedback.is_none() {
+    // Allow empty input only if we have a pending workflow
+    if raw_input.is_empty() && app.pending_workflow.is_none() {
         return;
     }
     
@@ -737,12 +663,9 @@ fn submit_input(app: &mut App) {
 
     app.history_idx = None;
     app.input.clear();
-
-    // Handle user feedback response if we're waiting for one
-    if app.pending_user_feedback.is_some() {
-        handle_user_feedback_response(app, &raw_input);
-        return;
-    }
+    
+    // User is submitting new input, unlock scroll so new responses appear at bottom
+    app.scroll_locked = false;
 
     // Handle pending workflow confirmations first (before recording to history)
     if app.pending_workflow.is_some() {
@@ -856,15 +779,6 @@ fn submit_input(app: &mut App) {
             &learned,
             &classifier_model,
         ).await {
-            // Check if we need to ask the user
-            if parsed.tool == "ask_user" {
-                let _ = tx.send(AssistantEvent::Completed {
-                    idx: placeholder_idx,
-                    content: Some(format!("__ASK_USER__:{}", prompt_for_task)),
-                });
-                return;
-            }
-            
             // Non-chat intents get dispatched via signal to main thread
             if parsed.tool != "chat" && parsed.confidence >= 0.3 {
                 let _ = tx.send(AssistantEvent::Completed {
@@ -998,19 +912,6 @@ fn handle_pending_workflow(app: &mut App, prompt: &str) {
             }
         } else {
             handle_workflow_response(app, workflow, prompt);
-            
-            // Check if the last message is the special feedback signal
-            if let Some(last_msg) = app.messages.last() {
-                if last_msg.content == "__SHOW_FEEDBACK_PROMPT__" {
-                    // Remove the signal message
-                    app.messages.pop();
-                    // Show feedback prompt if we have the original input
-                    if let Some(original_input) = &app.pending_user_feedback {
-                        let feedback = user_feedback::generate_feedback_prompt(original_input);
-                        app.reply(feedback);
-                    }
-                }
-            }
         }
     }
 }
@@ -1043,6 +944,8 @@ fn scroll_session_history_up(app: &mut App) {
     app.viewing_history = true;
     // Scroll up (increase scroll offset from bottom)
     app.scroll = app.scroll.saturating_add(3);
+    // User is manually scrolling, unlock auto-scroll
+    app.scroll_locked = false;
 }
 
 fn scroll_session_history_down(app: &mut App) {
@@ -1055,119 +958,6 @@ fn scroll_session_history_down(app: &mut App) {
     if app.scroll == 0 {
         app.viewing_history = false;
     }
-}
-
-fn handle_user_feedback_response(app: &mut App, response: &str) {
-    let original_input = app.pending_user_feedback.take().unwrap();
-    
-    // Determine save path (always use .llm-cli in current directory)
-    let save_path = PathBuf::from(".llm-cli/learned.toml");
-    
-    // Load current learned aliases
-    let learned_global = app.config.learned_path.clone();
-    let learned_project = app.session.repo_root.as_ref().map(|r| r.join(".llm-cli/learned.toml"));
-    let mut learned = LearnedAliases::load(&learned_global, learned_project.as_deref())
-        .unwrap_or_default();
-    
-    match user_feedback::parse_feedback_response(response) {
-        user_feedback::FeedbackResponse::None => {
-            app.reply("Okay, I won't learn this.");
-        }
-        
-        user_feedback::FeedbackResponse::ToolSelection(idx) => {
-            let tool = &TOOLS[idx];
-            
-            // Save the new alias
-            if let Err(e) = learned.save_alias(&original_input, tool.name, &save_path, "user_feedback") {
-                app.reply(format!("Failed to save learned alias: {}", e));
-            } else {
-                app.reply(format!("✓ Learned: \"{}\" → {}", original_input, tool.name));
-                
-                // Now execute the tool
-                let intent = ParsedIntent::new(tool.name, 1.0);
-                dispatch_intent(app, &intent, &original_input);
-            }
-        }
-        
-        user_feedback::FeedbackResponse::ExplicitCommand(custom_cmd) => {
-            // Save as a custom shell command
-            if let Err(e) = learned.save_custom_command(
-                &original_input,
-                &custom_cmd,
-                &save_path,
-                "user_custom",
-            ) {
-                app.reply(format!("Failed to save custom command: {}", e));
-            } else {
-                app.reply(format!(
-                    "✓ Learned custom command: \"{}\" → {}\nExecuting now...",
-                    original_input,
-                    custom_cmd
-                ));
-                
-                // Execute the custom command
-                crate::handlers::handle_shell_dispatch(app, &custom_cmd);
-            }
-        }
-        
-        user_feedback::FeedbackResponse::NaturalLanguageDescription(description) => {
-            // Use LLM to generate the command
-            app.reply(format!("🤔 Generating command for: \"{}\"...", description));
-            
-            // Spawn background task to generate macro
-            let tx = app.assistant_tx.clone();
-            let model = app.config.model.clone();
-            let original_input_clone = original_input.clone();
-            let save_path_clone = save_path.clone();
-            
-            // Get repo context
-            let repo_context = if let Some(info) = &app.session.repo_info {
-                let type_str = match info.project_type {
-                    ProjectType::Rust => "Rust (Cargo)",
-                    ProjectType::Node => "Node.js (npm)",
-                    ProjectType::Python => "Python",
-                    ProjectType::Go => "Go",
-                    ProjectType::Unknown => "Unknown",
-                };
-                Some(format!("{} project", type_str))
-            } else {
-                None
-            };
-            
-            tokio::spawn(async move {
-                match custom_command_generator::generate_custom_command(
-                    &description,
-                    &model,
-                    repo_context.as_deref(),
-                ).await {
-                    Ok(generated_cmd) => {
-                        // Signal back with the generated command
-                        let _ = tx.send(AssistantEvent::Completed {
-                            idx: 0, // Dummy index
-                            content: Some(format!(
-                                "__CUSTOM_COMMAND_GENERATED__:{}:{}:{}",
-                                original_input_clone,
-                                generated_cmd,
-                                save_path_clone.display()
-                            )),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AssistantEvent::Failed {
-                            idx: 0,
-                            error: format!("Failed to generate command: {}", e),
-                        });
-                    }
-                }
-            });
-            
-            // Put the original input back so we can handle it later
-            app.pending_user_feedback = Some(original_input);
-        }
-        
-        user_feedback::FeedbackResponse::Invalid => {
-            app.reply("Invalid selection. Please type:\n  • A number (1-8) to select a tool\n  • Natural language description (e.g., 'stage and commit only')\n  • 'cmd: <command>' for explicit shell command\n  • 'none' to skip");
-            app.pending_user_feedback = Some(original_input);
-        }
-    }
+    // User is manually scrolling, unlock auto-scroll
+    app.scroll_locked = false;
 }

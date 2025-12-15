@@ -25,7 +25,6 @@ mod repo;
 mod session;
 mod tools;
 mod ui;
-mod user_feedback;
 mod workflow;
 
 #[derive(Debug, Parser)]

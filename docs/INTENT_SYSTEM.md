@@ -4,14 +4,14 @@ This document explains how the LLM CLI determines what you want to do when you t
 
 ## Overview
 
-The system uses **4 tiers** of intent resolution, from fastest to most flexible:
+The system uses **3 tiers** of intent resolution, from fastest to most flexible:
 
 ```
-User Input → Tier 1 → Tier 2 → Tier 3 → Tier 4 → Execute
-              (< 1ms)   (~50ms)  (~500ms)  (ask user)
+User Input → Tier 1 → Tier 2 → Tier 3 → Execute or Chat
+              (< 1ms)   (~50ms)  (~500ms)
 ```
 
-Each tier tries to understand your intent. If successful, it executes immediately. If uncertain, it falls through to the next tier.
+Each tier tries to understand your intent. If successful, it executes immediately. If uncertain, it falls through to the next tier, ultimately defaulting to conversational chat.
 
 ---
 
@@ -98,39 +98,7 @@ Tool name:
 - `qwen2:1.5b` - Better accuracy (~400-500ms)
 - `phi3:mini` - Best accuracy (~800ms-1s)
 
-**Why this tier:** Handles novel phrasing and edge cases that don't match patterns.
-
----
-
-### Tier 4: User Feedback & Learning (manual)
-**Method:** Ask the user for clarification  
-**Technology:** Interactive prompt  
-**Confidence:** 1.0 (user-confirmed)
-
-When all tiers fail:
-
-```
-I'm not sure what you want to do with: "yeet my code"
-
-Did you mean:
-  [1] save_work - Stage all changes, generate a commit message, commit, and push to remote
-  [2] status - Show git status and diff summary
-  [3] commit - Commit staged changes with a message (without pushing)
-  [4] stage - Stage files for commit using git add
-  [5] find_todos - Search for TODO and FIXME comments in the codebase
-  ...
-
-Type a number to select, or 'none' to skip.
-I'll remember your choice for next time.
-```
-
-**Learning:**
-- User confirms: `1`
-- System saves: `"yeet my code" → save_work`
-- Stored in `learned.toml`
-- **Next time:** Tier 1 matches instantly (< 1ms)
-
-**Why this tier:** Self-improving system. Gets smarter over time without code changes.
+**Why this tier:** Handles novel phrasing and edge cases that don't match patterns. Falls back to conversational chat when uncertain, providing a natural user experience.
 
 ---
 
@@ -173,14 +141,13 @@ source = "user_feedback"
 |------|---------|----------|------------|----------|
 | 1 | < 1ms | Very High | Fuzzy matching | Yes |
 | 2 | ~50ms | High | Keyword + Embeddings | Yes |
-| 3 | ~500ms | High | Small LLM | Yes |
-| 4 | Manual | Perfect | User confirmation | Execute |
+| 3 | ~500ms | High | Small LLM | Chat |
 
 **Real-world performance:**
 - **90% of commands:** Resolved in Tier 1 (< 1ms)
 - **9% of commands:** Resolved in Tier 2 (~50ms)
-- **1% of commands:** Resolved in Tier 3 or ask user
-- **Over time:** More commands move to Tier 1 through learning
+- **1% of commands:** Resolved in Tier 3 or fall back to chat
+- **Over time:** More commands move to Tier 1 through custom command learning
 
 ---
 
@@ -261,7 +228,6 @@ src/
 ├── fuzzy.rs              # Tier 1: Fuzzy matching
 ├── keyword_classifier.rs # Tier 2: Keyword + embedding hybrid
 ├── llm_classifier.rs     # Tier 3: Small LLM fallback
-├── user_feedback.rs      # Tier 4: User prompts
 ├── learned.rs            # Learned alias management
 └── intent.rs             # Orchestrates all tiers
 ```
@@ -287,8 +253,8 @@ async fn resolve_intent(input: &str) -> Intent {
         return intent;  // ~500ms
     }
     
-    // Tier 4: Ask user
-    Intent::AskUser(input)
+    // Fallback: Default to chat
+    Intent::Chat
 }
 ```
 
@@ -298,7 +264,7 @@ async fn resolve_intent(input: &str) -> Intent {
 
 ✅ **Fast:** 90% of queries resolved in < 1ms  
 ✅ **Flexible:** Handles natural language and novel phrasing  
-✅ **Self-improving:** Gets better over time through learning  
+✅ **Natural fallback:** Defaults to conversational chat when uncertain  
 ✅ **Explainable:** Can see why each match succeeded  
 ✅ **100% Rust:** No Python, no C++ dependencies  
 ✅ **Offline:** Works without internet (Ollama runs locally)  
@@ -331,7 +297,7 @@ Potential improvements (not yet implemented):
 
 ## Troubleshooting
 
-### "I'm not sure what you want to do" appears too often
+### Commands not being recognized
 
 **Solution:** Lower Tier 2 threshold in `src/keyword_classifier.rs`:
 ```rust
@@ -345,7 +311,7 @@ const CONFIDENCE_THRESHOLD: f32 = 0.6;  // Default: 0.7
 classifier_model = "qwen2:0.5b"  # Fastest
 ```
 
-Or skip Tier 3 entirely (will ask user more often):
+Or skip Tier 3 entirely (will default to chat):
 ```toml
 classifier_model = ""  # Disables Tier 3
 ```
@@ -361,29 +327,19 @@ Remove incorrect entry and re-learn correctly.
 
 ---
 
-## Comparison to Old System
+## Learning Custom Commands
 
-**Old approach:**
-- Single tier: Embedding similarity only
-- Fixed 0.5 threshold
-- No learning capability
-- Unpredictable matches
-
-**New approach:**
-- Four tiers: Fast → Accurate → Flexible → Learn
-- Adaptive thresholds
-- Self-improving
-- Deterministic + flexible balance
+When the LLM generates shell commands during chat, the system offers to save them as custom commands. These are stored in `.llm-cli/learned.toml` and matched instantly in Tier 1 (< 1ms).
 
 ---
 
 ## Summary
 
-The tiered intent system provides:
-1. **Speed** - Most queries resolve instantly
-2. **Flexibility** - Handles natural language
-3. **Learning** - Improves over time
-4. **Clarity** - Explainable matches
+The 3-tier intent system provides:
+1. **Speed** - Most queries resolve instantly (< 1ms)
+2. **Flexibility** - Handles natural language via semantic matching and LLM
+3. **Natural fallback** - Defaults to chat when uncertain
+4. **Clarity** - Explainable, deterministic matches
 
-It's designed to feel like **vim** - fast, local, clean, and gets better the more you use it.
+It's designed to be **fast, local, and clean** - resolving most commands instantly while providing a natural conversational experience for everything else.
 

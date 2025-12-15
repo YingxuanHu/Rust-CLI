@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::workflow::generate_commit_message;
 
 /// Generate a shell command from natural language description using LLM.
+#[allow(dead_code)]
 pub async fn generate_custom_command(
     description: &str,
     model: &str,
@@ -99,6 +100,7 @@ pub async fn generate_custom_command(
 }
 
 /// Clean up LLM-generated command (remove markdown, explanations, etc.)
+#[allow(dead_code)]
 fn clean_generated_command(cmd: &str) -> String {
     let mut lines: Vec<&str> = cmd.lines().collect();
     

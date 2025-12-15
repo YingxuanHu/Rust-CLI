@@ -134,6 +134,7 @@ impl LearnedAliases {
     }
     
     /// Save a new learned alias to the specified file.
+    #[allow(dead_code)]
     pub fn save_alias(
         &mut self,
         phrase: &str,
