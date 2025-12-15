@@ -201,7 +201,6 @@ find todos               # Search TODO/FIXME (requires ripgrep)
 
 **Shell mode:**
 - Toggle with Ctrl+S to run shell commands directly
-- Built-in: `cd <path>`, `pwd`
 
 **Bang shortcuts in Chat mode:**
 ```
@@ -441,7 +440,7 @@ After the UI opens:
 **Input Processing:**
 - Implemented mode-aware input history with Up/Down navigation
 - Built bang shortcuts (`!!`, `!prefix`) with bash-style expansion
-- Added built-in commands (`cd`, `pwd`) with path expansion
+- Improved shell shortcut handling
 - Created input deduplication
 
 **Completion System:**

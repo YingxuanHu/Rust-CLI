@@ -33,7 +33,6 @@ pub trait IntentDispatcher {
     fn get_config(&self) -> &Config;
     fn get_assistant_tx(&self) -> mpsc::UnboundedSender<AssistantEvent>;
     fn pending_placeholder(&mut self) -> usize;
-    fn set_session_cwd(&mut self, new_cwd: PathBuf);
     fn record_output(&mut self, kind: &'static str, summary: &str, content: &str);
     fn record_file_access(&mut self, file_path: &str);
     fn record_command_usage(&mut self, command: &str);
@@ -129,18 +128,6 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
         return;
     }
 
-    // Handle 'cd' builtin specially
-    if cmd == "cd" || cmd.starts_with("cd ") {
-        handle_cd(dispatcher, cmd);
-        return;
-    }
-
-    // Handle 'pwd' as a quick built-in
-    if cmd == "pwd" {
-        dispatcher.reply(format!("{}", dispatcher.get_session_cwd().display()));
-        return;
-    }
-
     // Expand composable handlers (like {{GEN_COMMIT_MSG}}) if present
     let expanded_cmd = if cmd.contains("{{") && cmd.contains("}}") {
         let repo_root = dispatcher.get_session_repo_root()
@@ -205,50 +192,6 @@ fn handle_shell_repeat<D: IntentDispatcher>(dispatcher: &mut D) {
         handle_shell_dispatch(dispatcher, &cmd);
     } else {
         dispatcher.reply("No previous shell command in history.");
-    }
-}
-
-fn handle_cd<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str) {
-    let target = cmd.strip_prefix("cd").unwrap_or("").trim();
-
-    let cwd = dispatcher.get_session_cwd();
-
-    let new_path = if target.is_empty() || target == "~" {
-        // cd with no args or ~ goes to home
-        dirs::home_dir().unwrap_or_else(|| cwd.clone())
-    } else if target == "-" {
-        // cd - not supported, just stay
-        dispatcher.reply("cd - not supported; use absolute path");
-        return;
-    } else if target.starts_with('/') {
-        // Absolute path
-        PathBuf::from(target)
-    } else if target.starts_with("~/") {
-        // Home-relative path
-        if let Some(home) = dirs::home_dir() {
-            home.join(&target[2..])
-        } else {
-            dispatcher.reply("Cannot resolve home directory");
-            return;
-        }
-    } else {
-        // Relative path
-        cwd.join(target)
-    };
-
-    // Canonicalize and check existence
-    match new_path.canonicalize() {
-        Ok(canonical) => {
-            if canonical.is_dir() {
-                dispatcher.set_session_cwd(canonical.clone());
-                dispatcher.reply(format!("cd {}", canonical.display()));
-            } else {
-                dispatcher.reply(format!("Not a directory: {}", new_path.display()));
-            }
-        }
-        Err(err) => {
-            dispatcher.reply(format!("cd: {}: {}", new_path.display(), err));
-        }
     }
 }
 
@@ -692,7 +635,6 @@ MODES
         
     Shell Mode (prefix: $ or ! or Ctrl+S to switch)
         • Execute shell commands directly
-        • Built-in cd and pwd support
         • Macro expansion for composable workflows
 
 KEY BINDINGS
@@ -728,8 +670,6 @@ COMMON COMMANDS
     $ <command>         Execute a shell command
     ! <command>         Execute a shell command (alias)
     !!                  Repeat last shell command
-    cd <path>           Change current directory
-    pwd                 Show current directory
 
   Other
     help                Show this help message

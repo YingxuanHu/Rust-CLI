@@ -565,10 +565,6 @@ impl IntentDispatcher for App {
         idx
     }
 
-    fn set_session_cwd(&mut self, new_cwd: PathBuf) {
-        self.session.set_cwd(new_cwd);
-    }
-
     fn record_output(&mut self, kind: &'static str, summary: &str, content: &str) {
         self.session.record_output(kind, summary, content);
     }
