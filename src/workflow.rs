@@ -494,7 +494,7 @@ fn handle_custom_workflow_confirm<R: WorkflowResponder>(
     if matches!(prompt_lower.as_str(), "" | "y" | "yes" | "s" | "save") {
         let learned_global = save_path.parent().and_then(|p| p.parent()).map(|p| p.join("learned.toml"))
             .unwrap_or_else(|| save_path.clone());
-        let learned_project = if save_path.to_string_lossy().contains(".llm_cli") {
+        let learned_project = if save_path.to_string_lossy().contains(".llm-cli") {
             Some(save_path.as_path())
         } else {
             None
