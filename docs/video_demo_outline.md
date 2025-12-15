@@ -18,7 +18,11 @@ we also have auto-completion for workflows and file paths. for example, if we ty
 
 | 3 | **Intent-based workflows** | Type “save work” to trigger git plan preview | “Natural language triggers workflows. ‘Save work’ expands into plan + confirmation before staging, committing, pushing.” |
 
-we also have intent-based workflows, which means we can trigger complex actions with simple natural language commands. for example, if we type "save work", it will generate a git plan that shows the steps it will take to stage, commit, and push our changes. we can review the plan and confirm before proceeding. 
+One of our major features is workflows. which means we can trigger complex actions with simple natural language commands. for example, if we type "save work", it will generate a git plan that shows the steps it will take to stage, commit, and push our changes. we can review the plan and confirm before proceeding. 
+
+Adding some changes to a file, we can see how the tool detects the changes and includes them in the git plan.
+
+TODO: Delete this message before submission. 
 
 | 4 | **LLM commit message suggestion** | After staging, accept generated message | “We partner with the model to draft commit messages. You can accept/edit before commit so nothing happens blindly.” |
 | 5 | **Shell + bang shortcuts** | Use Ctrl+S to enter Shell mode, run `$ ls` and `!!` | “Toggle Shell mode for direct commands, or prefix with `$` in Chat. History-aware bang shortcuts mirror Bash muscle memory.” |
