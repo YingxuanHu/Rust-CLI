@@ -32,6 +32,24 @@ pub struct ToolArgs {
     pub content: Option<String>,
 }
 
+impl ToolArgs {
+    /// Merge another ToolArgs, filling only fields that are currently None.
+    pub fn merge_missing(&mut self, other: ToolArgs) {
+        if self.path.is_none() {
+            self.path = other.path;
+        }
+        if self.query.is_none() {
+            self.query = other.query;
+        }
+        if self.command.is_none() {
+            self.command = other.command;
+        }
+        if self.content.is_none() {
+            self.content = other.content;
+        }
+    }
+}
+
 /// All available tools in the system.
 pub static TOOLS: &[Tool] = &[
     Tool {
@@ -278,4 +296,3 @@ mod tests {
         assert!(get_tool("nonexistent").is_none());
     }
 }
-

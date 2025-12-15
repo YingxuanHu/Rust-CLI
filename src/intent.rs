@@ -45,14 +45,16 @@ pub async fn resolve_intent(
     // Tier 1: Fuzzy matching + learned aliases (< 1ms)
     if let Some(mut intent) = fuzzy::fuzzy_match(input, learned) {
         tracing::debug!("[Intent Resolution] ✓ Tier 1 (Fuzzy): {}", intent.tool);
-        intent.args = extract_args_from_input(input, &intent.tool);
+        let extracted = extract_args_from_input(input, &intent.tool);
+        intent.args.merge_missing(extracted);
         return Ok(intent);
     }
     
     // Tier 2: Keyword + embedding classifier (~50ms)
     if let Some(mut intent) = KeywordClassifier::classify(input, cache).await? {
         tracing::debug!("[Intent Resolution] ✓ Tier 2 (Keyword/Embedding): {}", intent.tool);
-        intent.args = extract_args_from_input(input, &intent.tool);
+        let extracted = extract_args_from_input(input, &intent.tool);
+        intent.args.merge_missing(extracted);
         return Ok(intent);
     }
     
@@ -60,7 +62,8 @@ pub async fn resolve_intent(
     // This can return "chat" if user is just chatting, or a tool name if they're trying to do something
     tracing::debug!("[Intent Resolution] Attempting Tier 3 (LLM) with model: '{}'", llm_model);
     if let Some(mut intent) = llm_classifier::classify_with_llm(input, llm_model).await? {
-        intent.args = extract_args_from_input(input, &intent.tool);
+        let extracted = extract_args_from_input(input, &intent.tool);
+        intent.args.merge_missing(extracted);
         
         // If LLM classified as "chat", return it directly
         if intent.tool == "chat" {

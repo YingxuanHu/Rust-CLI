@@ -333,4 +333,27 @@ mod tests {
         assert!(loaded.match_phrase("yeet").is_some());
         assert!(loaded.match_phrase("YEET").is_some());
     }
+
+    #[test]
+    fn test_custom_workflow_roundtrip() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let learned_path = temp_dir.path().join("learned.toml");
+        
+        let mut learned = LearnedAliases::default();
+        learned
+            .save_custom_workflow(
+                "discard unstaged changes",
+                "git reset --hard HEAD",
+                &learned_path,
+                "test",
+            )
+            .unwrap();
+        
+        let loaded = LearnedAliases::load(&learned_path, Some(&learned_path)).unwrap();
+        let intent = loaded
+            .match_phrase("discard unstaged changes")
+            .expect("custom workflow should be matched");
+        assert_eq!(intent.tool, "shell");
+        assert_eq!(intent.args.command.as_deref(), Some("git reset --hard HEAD"));
+    }
 }
