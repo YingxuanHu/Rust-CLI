@@ -657,7 +657,7 @@ COMMON COMMANDS
 
   File Operations
     show <file>         Display file contents
-    list files [path]   List directory contents
+    list files <path>   List directory contents
     write file <path>   Create or overwrite a file (with confirmation)
     find todos          Search for TODO/FIXME comments
 
@@ -701,7 +701,6 @@ REQUIREMENTS
 
 MORE INFORMATION
     Documentation: docs/
-    • QUICKSTART.md - Getting started guide
     • SEMANTIC_CONTEXT.md - Context system details
     • REPO_AWARENESS.md - Project detection features
     • AUTOCOMPLETION.md - Completion system

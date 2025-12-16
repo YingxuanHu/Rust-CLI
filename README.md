@@ -166,6 +166,8 @@ After starting, the full-screen interface opens with a conversation panel at top
 
 A `help` page is available inside the app with 'help' or '?' in `Chat` mode, showing all available commands and key bindings.
 
+NOTE: Changing the CLI’s working directory from inside the TUI is not yet available, because we lock it to the repo root to keep git workflows and session context consistent.
+
 **Essential keyboard shortcuts:**
 - Type naturally and press Enter to chat
 - Up/Down: Navigate input history
@@ -275,7 +277,6 @@ cargo --version
 **3. Install Ollama:**
 ```bash
 brew install --cask ollama
-# Launch Ollama from Spotlight to start the service
 ```
 
 **4. Pull models:**
