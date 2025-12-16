@@ -18,8 +18,7 @@ https://drive.google.com/file/d/1k9EWQem0jMkhU5A1f3u6RnVxP2bLZsGG/view?usp=shari
 
 # Video Demo
 
-[Link to be added: Screencast demonstration of the LLM CLI in use]
-
+https://drive.google.com/file/d/1Zn_lr4jAE4M_RqhSJq5vAKVMID7bcl23/view?usp=drive_link
 ---
 
 # Final Report
