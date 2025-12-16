@@ -246,6 +246,7 @@ export LLM_CLI_STREAMING="true"
 All project-specific files are stored in `.llm-cli/` directory (history, learned commands, embeddings, frecency data).
 
 An example config file with comments is provided as `config.example.toml`. Feel free to copy it to `.llm-cli/config.toml` and modify as needed.
+
 ---
 
 ## 5. Reproducibility Guide
