@@ -259,7 +259,7 @@ An example config file with comments is provided as `config.example.toml`. Feel 
 - Git (for repository features)
 - Ripgrep (optional, for TODO search)
 
-Run `bash scripts/health.sh` whenever you want to verify the setup—it checks for the Rust/Ollama toolchain plus the chat (`MODEL`), embedding (`EMBED_MODEL`), and classifier (`CLASSIFIER_MODEL`) models you plan to use.
+Run `bash scripts/health.sh` whenever you want to verify the setup—it checks for the Rust/Ollama toolchain plus the chat, embedding, and classifier models you plan to use.
 
 ### macOS Sonoma Setup
 
