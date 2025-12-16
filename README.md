@@ -251,8 +251,6 @@ An example config file with comments is provided as `config.example.toml`. Feel 
 
 ## 5. Reproducibility Guide
 
-The instructor will follow these steps on Ubuntu Linux server and macOS Sonoma. The project is a Rust terminal application built with Cargo. Chat features depend on Ollama running locally. Git features require running inside a git repository. TODO search requires ripgrep.
-
 ### Prerequisites (Both Platforms)
 
 - Rust toolchain (via rustup)
