@@ -76,7 +76,7 @@ Uses Ollama for local inference with streaming output—text appears progressive
 
 ### Session Context and Semantic References
 
-Tracks working directory, repository root, and project type. Maintains input history and a window of recent outputs (last 5, max 2000 chars each). When reference words like "it", "that", or "the diff" are detected, relevant context is injected into the LLM prompt. This enables natural follow-up: "show status" followed by "commit it" works as expected.
+Tracks working directory, repository root, and project type. The repo-awareness layer auto-detects manifests (Cargo.toml, package.json, etc.) so we can label the session (`Current project: llm_cli (Rust)`), route “run tests” or “build” to the correct toolchain, and keep workflows scoped to the right tree. Maintains input history and a window of recent outputs (last 5, max 2000 chars each). When reference words like "it", "that", or "the diff" are detected, relevant context is injected into the LLM prompt. 
 
 ### Intent Routing, Workflows, and Command Learning
 
@@ -182,7 +182,7 @@ Pre-configured git workflows are available when running inside a git repository.
 ```
 status                    # Show git status and diffstat
 save work                 # Stage, commit with generated message, and push
-commit                    # Commit without push
+commit                    # Commit with generated message  
 stage all                 # Stage all changes
 draft commit message      # Generate commit message from staged changes
 ```
@@ -191,9 +191,9 @@ If you forget commands or key bindings at any time, type `help` (or `?`) inside 
 
 **File operations:**
 ```
-show src/main.rs         # Display file contents
-list files in src        # List directory
-write to notes.txt with content: ...  # Create/overwrite file
+show src/main.rs                         # Display file contents
+list files in src                        # List directory
+write to <file> with content: <content>  # Create/overwrite file
 ```
 
 **Code search:**
@@ -260,6 +260,8 @@ The instructor will follow these steps on Ubuntu Linux server and macOS Sonoma. 
 - Git (for repository features)
 - Ripgrep (optional, for TODO search)
 
+Run `bash scripts/health.sh` whenever you want to verify the setup—it checks for the Rust/Ollama toolchain plus the chat (`MODEL`), embedding (`EMBED_MODEL`), and classifier (`CLASSIFIER_MODEL`) models you plan to use.
+
 ### macOS Sonoma Setup
 
 **1. Install Rust:**
@@ -286,7 +288,7 @@ ollama pull nomic-embed-text
 ollama pull qwen2:1.5b
 ```
 
-**5. Install ripgrep (optional):**
+**5. Install ripgrep (optional, used for 'find todos' only):**
 ```bash
 brew install ripgrep
 ```
@@ -366,7 +368,7 @@ After the UI opens:
 
 1. **Test chat**: Type "describe this repo" and confirm streaming response appears
 2. **Test history**: Press Up to recall last prompt, edit, and resend
-3. **Test git workflow** (if in repo): Type `save work` to show git status and diffstat
+3. **Test git workflow** (if in repo): Type `save work` to show git status then stage, commit with generated message, and push 
 4. **Test file operations**: Type `show Cargo.toml` or `list files in src`
 5. **Test TODO search** (if ripgrep installed): Type `find todos`
 
@@ -476,7 +478,7 @@ After the UI opens:
 
 **Terminal UI stability requires attention to detail.** Handling raw mode correctly, keeping layout consistent, wrapping text, truncating large outputs, and showing clear error messages all matter for reliability. These details became especially important because the tool must remain readable while actively streaming output.
 
-**Startup performance has outsized impact.** The embedding cache system's 10-20x speedup transformed the tool from "slow to start" to "instant," fundamentally changing how willing we were to restart it frequently. Performance optimizations that improve iteration speed matter significantly for developer tools.
+**Startup performance has outsized impact.** The embedding cache system's 10-20x speedup, fundamentally changing how willing we were to restart it frequently. Performance optimizations that improve iteration speed matter significantly for developer tools.
 
 **Simple heuristics can enable natural interaction.** Semantic context resolution via reference detection doesn't require sophisticated NLP. Simple string matching for pronouns and explicit references combined with a small queue of recent outputs created a surprisingly effective system for follow-up interactions.
 

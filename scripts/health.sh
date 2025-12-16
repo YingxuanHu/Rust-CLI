@@ -2,7 +2,8 @@
 set -euo pipefail
 
 MODEL="${1:-${MODEL:-llama3}}"
-MODEL_BARE="${MODEL%%:*}"
+EMBED_MODEL="${EMBED_MODEL:-${LLM_CLI_EMBEDDING_MODEL:-nomic-embed-text}}"
+CLASSIFIER_MODEL="${CLASSIFIER_MODEL:-${LLM_CLI_CLASSIFIER_MODEL:-qwen2:1.5b}}"
 
 log() {
   printf '==> %s\n' "$*"
@@ -12,6 +13,30 @@ require() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "error: required command '$1' is not installed or in PATH" >&2
     exit 1
+  fi
+}
+
+check_model() {
+  local label="$1"
+  local requested="$2"
+  local bare="${requested%%:*}"
+  local found=0
+
+  while IFS= read -r name; do
+    local base="${name%%:*}"
+    if [ "$name" = "$requested" ] || [ "$base" = "$bare" ]; then
+      found=1
+      break
+    fi
+  done <<<"$available_models"
+
+  if [ "$found" -ne 1 ]; then
+    cat <<EOF
+warn: ${label} model "$requested" not found locally.
+Pull it with: ollama pull "$requested"
+EOF
+  else
+    log "$label model $requested is available (matched $bare)"
   fi
 }
 
@@ -32,24 +57,10 @@ EOF
   exit 1
 fi
 
-log "Validating model availability ($MODEL)"
 available_models=$(ollama list | awk 'NR>1 {print $1}')
-found=0
-while IFS= read -r name; do
-  base="${name%%:*}"
-  if [ "$name" = "$MODEL" ] || [ "$base" = "$MODEL_BARE" ]; then
-    found=1
-    break
-  fi
-done <<<"$available_models"
 
-if [ "$found" -ne 1 ]; then
-  cat <<EOF
-warn: model "$MODEL" not found locally.
-Pull it with: ollama pull "$MODEL"
-EOF
-else
-  log "Model $MODEL is available (matched $MODEL_BARE)"
-fi
+check_model "chat" "$MODEL"
+check_model "embedding" "$EMBED_MODEL"
+check_model "classifier" "$CLASSIFIER_MODEL"
 
 log "Health check completed"
