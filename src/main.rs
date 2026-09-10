@@ -21,6 +21,7 @@ mod keyword_classifier;
 mod learned;
 mod llm_classifier;
 mod ollama;
+mod patch;
 mod repo;
 mod session;
 #[cfg(test)]

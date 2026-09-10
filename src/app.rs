@@ -28,6 +28,7 @@ use crate::{
     intent::{self, ParsedIntent},
     learned::LearnedAliases,
     ollama,
+    patch::{self, AppliedPatch, PatchReview},
     session::{Message, Role, SessionState},
     tools::ToolArgs,
     ui::{render_ui, AppView, InputMode, TerminalGuard},
@@ -122,6 +123,7 @@ struct App {
     input_history: Vec<String>,
     history_idx: Option<usize>,
     pending_workflow: Option<WorkflowState>,
+    last_applied_patch: Option<AppliedPatch>,
     assistant_tx: mpsc::UnboundedSender<AssistantEvent>,
     assistant_rx: mpsc::UnboundedReceiver<AssistantEvent>,
     embedding_cache: Arc<EmbeddingCache>,
@@ -157,6 +159,7 @@ impl App {
             input_history,
             history_idx: None,
             pending_workflow: None,
+            last_applied_patch: None,
             assistant_tx,
             assistant_rx,
             embedding_cache,
@@ -211,6 +214,7 @@ impl App {
                 AssistantEvent::Token { idx, chunk } => self.append_assistant_chunk(idx, chunk),
                 AssistantEvent::Completed { idx, content } => self.finish_assistant(idx, content),
                 AssistantEvent::Failed { idx, error} => self.fail_assistant(idx, error),
+                AssistantEvent::PatchReady { idx, review } => self.finish_patch_review(idx, review),
             }
             // Only reset scroll if not locked
             if !self.scroll_locked {
@@ -496,6 +500,58 @@ impl App {
             content,
         });
         self.pending_idxs.retain(|&i| i != idx);
+        if matches!(
+            self.pending_workflow.as_ref().map(|workflow| &workflow.kind),
+            Some(crate::workflow::WorkflowKind::EditPatchPending { .. })
+        ) {
+            self.pending_workflow = None;
+        }
+    }
+
+    fn finish_patch_review(&mut self, idx: usize, review: PatchReview) {
+        let repo_root = match self.pending_workflow.take() {
+            Some(WorkflowState {
+                kind: crate::workflow::WorkflowKind::EditPatchPending { file },
+                repo_root,
+            }) if file == review.file => repo_root,
+            workflow => {
+                self.pending_workflow = workflow;
+                self.fail_assistant(idx, "edit request was superseded before its patch arrived".to_string());
+                return;
+            }
+        };
+
+        if let Err(error) = patch::check_patch(
+            &repo_root,
+            &review.patch,
+            Duration::from_secs(self.config.cmd_timeout_secs),
+        ) {
+            let content = format!("Patch review unavailable: {error}");
+            self.upsert_message(idx, Role::System, content.clone());
+            self.session.record(Message {
+                role: Role::System,
+                content,
+            });
+            self.pending_idxs.retain(|&i| i != idx);
+            return;
+        }
+
+        let display_content = format!(
+            "Edit plan for {}\nRequested change: {}\n\nChecked unified diff:\n{}\n\nPress Enter (or type 'yes') to apply this patch. Type 'no' to cancel.",
+            review.file,
+            review.description,
+            patch::preview_patch(&review.patch, 12_000),
+        );
+        self.upsert_message(idx, Role::Assistant, display_content.clone());
+        self.session.record(Message {
+            role: Role::Assistant,
+            content: display_content,
+        });
+        self.pending_idxs.retain(|&i| i != idx);
+        self.pending_workflow = Some(WorkflowState {
+            kind: crate::workflow::WorkflowKind::ApplyDiff { review },
+            repo_root,
+        });
     }
 
     fn upsert_message(&mut self, idx: usize, role: Role, content: String) {
@@ -783,6 +839,14 @@ impl IntentDispatcher for App {
     fn record_command_usage(&mut self, command: &str) {
         self.record_command_usage(command);
     }
+
+    fn get_last_applied_patch(&self) -> Option<AppliedPatch> {
+        self.last_applied_patch.clone()
+    }
+
+    fn clear_last_applied_patch(&mut self) {
+        self.last_applied_patch = None;
+    }
 }
 
 // Implement WorkflowResponder for App
@@ -797,6 +861,10 @@ impl WorkflowResponder for App {
 
     fn command_timeout_secs(&self) -> u64 {
         self.config.cmd_timeout_secs
+    }
+
+    fn set_last_applied_patch(&mut self, patch: AppliedPatch) {
+        self.last_applied_patch = Some(patch);
     }
 }
 

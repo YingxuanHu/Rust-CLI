@@ -208,6 +208,22 @@ pub static TOOLS: &[Tool] = &[
         requires_repo: false,
     },
     Tool {
+        name: "edit_file",
+        description: "Propose a reviewed unified diff for one existing repository file",
+        examples: &[
+            "edit src/main.rs: add a version flag",
+            "edit README.md: document installation",
+            "edit Cargo.toml: add package metadata",
+        ],
+        requires_repo: true,
+    },
+    Tool {
+        name: "rollback_edit",
+        description: "Reverse the most recently applied reviewed patch",
+        examples: &["rollback last edit", "undo last edit"],
+        requires_repo: true,
+    },
+    Tool {
         name: "build",
         description: "Build the project using the appropriate build system",
         examples: &[

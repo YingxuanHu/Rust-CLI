@@ -135,6 +135,11 @@ In Chat mode, prefix commands with `$` or `!` for shell execution. Bang shortcut
 
 **Write file**: Creates/overwrites files with confirmation (e.g., "write to notes.txt with content: ...")
 
+**Reviewed code edit**: `edit path/to/file: describe the change` asks the model
+for a single-file unified diff. The CLI rejects patches that touch another file,
+performs a Git dry run before preview and application, and leaves the exact
+patch available for `rollback last edit` while the file remains unchanged.
+
 **Find TODOs**: Ripgrep-based search for TODO/FIXME comments (requires `rg` on PATH)
 
 #### Custom Command Learning (workflow special case)
@@ -211,6 +216,8 @@ If you forget commands or key bindings at any time, type `help` (or `?`) inside 
 show src/main.rs                         # Display file contents
 list files in src                        # List directory
 write to <file> with content: <content>  # Create/overwrite file
+edit src/main.rs: add a --version flag    # Generate and review a checked patch
+rollback last edit                         # Reverse the latest reviewed patch
 ```
 
 **Code search:**

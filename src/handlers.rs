@@ -9,6 +9,7 @@ use crate::{
     file_ops,
     intent::ParsedIntent,
     input::is_shell_command,
+    patch::{self, AppliedPatch},
     repo::{ProjectType, RepoInfo},
     session::Role,
     tools::ToolArgs,
@@ -19,6 +20,7 @@ pub enum AssistantEvent {
     Token { idx: usize, chunk: String },
     Completed { idx: usize, content: Option<String> },
     Failed { idx: usize, error: String },
+    PatchReady { idx: usize, review: patch::PatchReview },
 }
 
 pub trait IntentDispatcher {
@@ -36,6 +38,8 @@ pub trait IntentDispatcher {
     fn record_output(&mut self, kind: &'static str, summary: &str, content: &str);
     fn record_file_access(&mut self, file_path: &str);
     fn record_command_usage(&mut self, command: &str);
+    fn get_last_applied_patch(&self) -> Option<AppliedPatch>;
+    fn clear_last_applied_patch(&mut self);
 }
 
 fn run_tool_command<D: IntentDispatcher>(
@@ -110,6 +114,14 @@ pub fn dispatch_intent<D: IntentDispatcher>(
         }
         "write_file" => {
             handle_write_file_intent(dispatcher, &intent.args, original_input);
+            true
+        }
+        "edit_file" => {
+            handle_edit_file_intent(dispatcher, &intent.args, original_input);
+            true
+        }
+        "rollback_edit" => {
+            handle_rollback_edit_intent(dispatcher);
             true
         }
         "build" => {
@@ -549,6 +561,110 @@ fn handle_write_file_intent<D: IntentDispatcher>(
     });
 }
 
+fn handle_edit_file_intent<D: IntentDispatcher>(
+    dispatcher: &mut D,
+    args: &ToolArgs,
+    original_input: &str,
+) {
+    let parsed = crate::intent::parse_edit_request(original_input);
+    let path = args.path.clone().or_else(|| parsed.as_ref().and_then(|edit| edit.path.clone()));
+    let instruction = args
+        .query
+        .clone()
+        .or_else(|| parsed.and_then(|edit| edit.query));
+    let (Some(path), Some(instruction)) = (path, instruction) else {
+        dispatcher.reply(
+            "Use `edit path/to/file: describe the requested change`. The assistant will show a checked diff before changing anything.",
+        );
+        return;
+    };
+    if PathBuf::from(&path).is_absolute() {
+        dispatcher.reply("Use a repository-relative path for edits.");
+        return;
+    }
+    let Some(repo_root) = dispatcher.get_session_repo_root() else {
+        dispatcher.reply("No git repository detected; code edits require a repository root.");
+        return;
+    };
+    let target = file_ops::resolve_path(&path, &repo_root);
+    let source = match file_ops::read_file(&target, &repo_root) {
+        Ok(source) => source,
+        Err(error) => {
+            dispatcher.reply(format!("Cannot prepare an edit for {path}: {error}"));
+            return;
+        }
+    };
+    let canonical_target = match target.canonicalize() {
+        Ok(target) => target,
+        Err(error) => {
+            dispatcher.reply(format!("Cannot resolve {path}: {error}"));
+            return;
+        }
+    };
+    let canonical_root = match repo_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            dispatcher.reply(format!("Cannot resolve repository root: {error}"));
+            return;
+        }
+    };
+    let relative_file = match canonical_target.strip_prefix(&canonical_root) {
+        Ok(path) => path.to_string_lossy().replace('\\', "/"),
+        Err(_) => {
+            dispatcher.reply("Refusing to edit a file outside the repository.");
+            return;
+        }
+    };
+
+    let idx = dispatcher.pending_placeholder();
+    let tx = dispatcher.get_assistant_tx();
+    let config = dispatcher.get_config().clone();
+    dispatcher.set_pending_workflow(WorkflowState {
+        kind: WorkflowKind::EditPatchPending {
+            file: relative_file.clone(),
+        },
+        repo_root,
+    });
+    tokio::spawn(async move {
+        let event = match patch::generate_edit_patch_async(
+            &config,
+            &relative_file,
+            &source,
+            &instruction,
+        )
+        .await
+        {
+            Ok(review) => AssistantEvent::PatchReady { idx, review },
+            Err(error) => AssistantEvent::Failed {
+                idx,
+                error: format!("could not prepare an edit: {error}"),
+            },
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn handle_rollback_edit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
+    let Some(applied) = dispatcher.get_last_applied_patch() else {
+        dispatcher.reply("There is no reviewed edit available to roll back in this session.");
+        return;
+    };
+    match patch::rollback_patch(
+        &applied.repo_root,
+        &applied.review.patch,
+        Duration::from_secs(dispatcher.get_config().cmd_timeout_secs),
+    ) {
+        Ok(()) => {
+            dispatcher.clear_last_applied_patch();
+            dispatcher.reply(format!("Rolled back the last edit to {}.", applied.review.file));
+        }
+        Err(error) => dispatcher.reply(format!(
+            "Could not roll back {} because the file may have changed since the edit: {error}",
+            applied.review.file
+        )),
+    }
+}
+
 fn parse_show_file(prompt: &str) -> Option<PathBuf> {
     let lower = prompt.to_lowercase();
     let prefixes = ["show file ", "read file ", "open file ", "show "];
@@ -684,6 +800,8 @@ COMMON COMMANDS
     show <file>         Display file contents
     list files <path>   List directory contents
     write file <path>   Create or overwrite a file (with confirmation)
+    edit <file>: <task> Generate, check, and review a single-file patch
+    rollback last edit   Reverse the most recently applied reviewed patch
     find todos          Search for TODO/FIXME comments
 
   Project Commands

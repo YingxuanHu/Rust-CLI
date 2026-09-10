@@ -166,16 +166,59 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
                 }
             }
         }
+        "edit_file" => {
+            if let Some(edit) = parse_edit_request(input) {
+                args = edit;
+            }
+        }
         _ => {}
     }
     
     args
 }
 
-/// Quick match for shell commands only (special syntax that needs parsing).
-/// This bypasses the tiered system for explicit shell command syntax.
+/// Parse the explicit edit syntax: `edit path/to/file: requested change`.
+/// Requiring the colon makes the file boundary unambiguous and prevents a
+/// conversational sentence from accidentally triggering a code edit.
+pub fn parse_edit_request(input: &str) -> Option<ToolArgs> {
+    let trimmed = input.trim();
+    let (verb, rest) = trimmed.split_once(char::is_whitespace)?;
+    if !verb.eq_ignore_ascii_case("edit") {
+        return None;
+    }
+    let (path, instruction) = rest.split_once(':')?;
+    let path = path.trim();
+    let instruction = instruction.trim();
+    if path.is_empty() || instruction.is_empty() {
+        return None;
+    }
+    Some(ToolArgs {
+        path: Some(path.to_string()),
+        query: Some(instruction.to_string()),
+        ..Default::default()
+    })
+}
+
+/// Quick match for explicit shell, edit, and rollback syntax.
+/// This bypasses tiered classification when the user has supplied structured
+/// input that should never be interpreted as ordinary chat.
 pub fn quick_match(input: &str) -> Option<ParsedIntent> {
     let trimmed = input.trim();
+
+    if let Some(args) = parse_edit_request(trimmed) {
+        return Some(ParsedIntent {
+            tool: "edit_file".to_string(),
+            args,
+            confidence: 1.0,
+        });
+    }
+
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "rollback last edit" | "undo last edit"
+    ) {
+        return Some(ParsedIntent::new("rollback_edit", 1.0));
+    }
 
     // Shell command prefix ($ or !) - needs special syntax parsing
     if trimmed.starts_with('$') || (trimmed.starts_with('!') && trimmed != "!!") {
@@ -229,5 +272,18 @@ mod tests {
     fn test_extract_args_stage() {
         let args = extract_args_from_input("stage src/lib.rs", "stage");
         assert_eq!(args.path, Some("src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn quick_match_parses_a_structured_edit_request() {
+        let intent = quick_match("edit src/main.rs: add a version flag").unwrap();
+        assert_eq!(intent.tool, "edit_file");
+        assert_eq!(intent.args.path.as_deref(), Some("src/main.rs"));
+        assert_eq!(intent.args.query.as_deref(), Some("add a version flag"));
+    }
+
+    #[test]
+    fn quick_match_recognizes_edit_rollback() {
+        assert_eq!(quick_match("rollback last edit").unwrap().tool, "rollback_edit");
     }
 }

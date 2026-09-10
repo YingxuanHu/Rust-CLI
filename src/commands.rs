@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    io::{self, Read},
+    io::{self, Read, Write},
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -30,11 +30,26 @@ pub fn run_command_with_timeout_with_env(
     environment: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<String> {
+    run_command_with_timeout_with_input(cwd, program, args, environment, None, timeout)
+}
+
+/// Run a non-interactive command with timeout, explicit environment overrides,
+/// and optional standard input. This is used for structured tools such as
+/// `git apply`, without routing untrusted patch text through a shell.
+pub fn run_command_with_timeout_with_input(
+    cwd: &std::path::Path,
+    program: &str,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    input: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<String> {
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd).envs(environment.iter().copied());
     let output = run_process_with_timeout(
         &mut command,
         &format!("{program} {args:?}"),
+        input,
         timeout,
     )?;
 
@@ -71,7 +86,7 @@ pub fn run_shell_command_with_timeout(
 
     let mut command = Command::new("sh");
     command.arg("-c").arg(cmd).current_dir(cwd);
-    let output = run_process_with_timeout(&mut command, &format!("sh -c {cmd}"), timeout)?;
+    let output = run_process_with_timeout(&mut command, &format!("sh -c {cmd}"), None, timeout)?;
 
     if !output.status.success() {
         if !output.stderr.trim().is_empty() {
@@ -99,9 +114,17 @@ struct TimedOutput {
 fn run_process_with_timeout(
     command: &mut Command,
     description: &str,
+    input: Option<&[u8]>,
     timeout: Duration,
 ) -> Result<TimedOutput> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             anyhow!("command not found in PATH")
@@ -110,6 +133,13 @@ fn run_process_with_timeout(
         }
     })
     .with_context(|| format!("spawning {description}"))?;
+
+    if let Some(input) = input {
+        let mut stdin = child.stdin.take().context("capturing command stdin")?;
+        stdin
+            .write_all(input)
+            .with_context(|| format!("writing stdin for {description}"))?;
+    }
 
     let stdout = child.stdout.take().context("capturing command stdout")?;
     let stderr = child.stderr.take().context("capturing command stderr")?;
@@ -236,5 +266,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn timed_command_can_receive_standard_input_without_a_shell() {
+        let output = run_command_with_timeout_with_input(
+            std::path::Path::new("."),
+            "sh",
+            &["-c", "read value; printf 'received:%s' \"$value\""],
+            &[],
+            Some(b"patch input\n"),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(output, "received:patch input");
     }
 }

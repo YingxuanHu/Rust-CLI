@@ -8,6 +8,7 @@ use crate::{
     config::Config,
     file_ops,
     learned::LearnedAliases,
+    patch::{self, AppliedPatch, PatchReview},
 };
 
 use tokio::process::Command as TokioCommand;
@@ -25,6 +26,7 @@ pub enum WorkflowKind {
     SaveWorkCommit { suggested: String },
     CommitMessagePending,
     CommitOnlyConfirm { suggested: String },
+    EditPatchPending { file: String },
     StagePlan { args: Vec<String> },
     DiffPreview { file: Option<String> },
     WriteFileConfirm {
@@ -42,19 +44,14 @@ pub enum WorkflowKind {
         commands: Vec<String>,
         combined_command: String,
     },
-    #[allow(dead_code)]
-    ApplyDiff {
-        file: String,
-        original: String,
-        proposed: String,
-        description: String,
-    },
+    ApplyDiff { review: PatchReview },
 }
 
 pub trait WorkflowResponder {
     fn reply(&mut self, content: impl Into<String>);
     fn execute_shell_command(&mut self, cmd: &str);
     fn command_timeout_secs(&self) -> u64;
+    fn set_last_applied_patch(&mut self, patch: AppliedPatch);
 }
 
 pub fn handle_workflow_response<R: WorkflowResponder>(
@@ -71,6 +68,9 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
         }
         WorkflowKind::CommitMessagePending => {
             responder.reply("Commit-message generation is still in progress. Please wait.");
+        }
+        WorkflowKind::EditPatchPending { file } => {
+            responder.reply(format!("Generating a patch for {file} is still in progress. Please wait."));
         }
         WorkflowKind::SaveWorkCommit { suggested } => {
             handle_save_work_commit(responder, &workflow.repo_root, prompt, suggested);
@@ -105,13 +105,8 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
         } => {
             handle_chat_commands_confirm(responder, &workflow.repo_root, prompt, original_query, commands, combined_command);
         }
-        WorkflowKind::ApplyDiff {
-            file,
-            original,
-            proposed,
-            description,
-        } => {
-            handle_apply_diff(responder, &workflow.repo_root, prompt, file, original, proposed, description);
+        WorkflowKind::ApplyDiff { review } => {
+            handle_apply_diff(responder, &workflow.repo_root, prompt, review);
         }
     }
 }
@@ -303,10 +298,7 @@ fn handle_apply_diff<R: WorkflowResponder>(
     responder: &mut R,
     repo_root: &std::path::Path,
     prompt: &str,
-    file: String,
-    _original: String,
-    proposed: String,
-    _description: String,
+    review: PatchReview,
 ) {
     let lower = prompt.trim().to_lowercase();
     
@@ -316,23 +308,27 @@ fn handle_apply_diff<R: WorkflowResponder>(
     }
     
     if matches!(lower.as_str(), "" | "yes" | "y") {
-        let target_path = PathBuf::from(&file);
-        match file_ops::write_file(&target_path, &proposed, repo_root) {
+        let timeout = Duration::from_secs(responder.command_timeout_secs());
+        let result = patch::validate_patch_for_file(&review.patch, std::path::Path::new(&review.file))
+            .and_then(|_| patch::check_patch(repo_root, &review.patch, timeout))
+            .and_then(|_| patch::apply_patch(repo_root, &review.patch, timeout));
+        match result {
             Ok(()) => {
-                responder.reply(format!("Applied changes to {}", file));
+                responder.set_last_applied_patch(AppliedPatch {
+                    repo_root: repo_root.to_path_buf(),
+                    review: review.clone(),
+                });
+                responder.reply(format!(
+                    "Applied reviewed patch to {}. Run tests to verify it, or type `rollback last edit` to reverse this patch while the file is unchanged.",
+                    review.file
+                ));
             }
-            Err(err) => {
-                responder.reply(format!("Failed to apply changes: {}", err));
-            }
+            Err(err) => responder.reply(format!("Patch was not applied: {err}")),
         }
         return;
     }
     
-    // For any other input, treat as "edit" - show the proposed content and ask again
-    responder.reply(format!(
-        "Edit mode not yet implemented. Press Enter (or type 'yes') to apply or 'no' to cancel.\n\nProposed content:\n{}",
-        truncate_for_display(&proposed, 500)
-    ));
+    responder.reply("Patch review is still open. Press Enter (or type 'yes') to apply, or 'no' to cancel.");
 }
 
 fn run_save_work_impl<R: WorkflowResponder>(
@@ -752,12 +748,16 @@ mod tests {
     use super::{
         handle_workflow_response, WorkflowKind, WorkflowResponder, WorkflowState,
     };
-    use crate::commands::run_command_with_timeout;
+    use crate::{
+        commands::run_command_with_timeout,
+        patch::{AppliedPatch, PatchReview},
+    };
 
     #[derive(Default)]
     struct TestResponder {
         replies: Vec<String>,
         executed_commands: Vec<String>,
+        last_applied_patch: Option<AppliedPatch>,
     }
 
     impl WorkflowResponder for TestResponder {
@@ -771,6 +771,10 @@ mod tests {
 
         fn command_timeout_secs(&self) -> u64 {
             10
+        }
+
+        fn set_last_applied_patch(&mut self, patch: AppliedPatch) {
+            self.last_applied_patch = Some(patch);
         }
     }
 
@@ -869,5 +873,34 @@ mod tests {
             .replies
             .iter()
             .any(|reply| reply.contains("Successfully created file")));
+    }
+
+    #[test]
+    fn diff_workflow_applies_a_checked_patch_and_keeps_a_rollback_record() {
+        let repo = initialized_repository();
+        let root = repo.path();
+        fs::write(root.join("notes.txt"), "before\n").expect("write source file");
+        git(root, &["add", "notes.txt"]);
+        git(root, &["commit", "-qm", "Add notes"]);
+        let mut responder = TestResponder::default();
+        let patch = "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-before\n+after\n";
+
+        handle_workflow_response(
+            &mut responder,
+            WorkflowState {
+                kind: WorkflowKind::ApplyDiff {
+                    review: PatchReview {
+                        file: "notes.txt".to_string(),
+                        patch: patch.to_string(),
+                        description: "Change the note".to_string(),
+                    },
+                },
+                repo_root: root.to_path_buf(),
+            },
+            "yes",
+        );
+
+        assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after\n");
+        assert!(responder.last_applied_patch.is_some());
     }
 }
