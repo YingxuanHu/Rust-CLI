@@ -104,7 +104,18 @@ pub fn read_file(path: &Path, base: &Path) -> Result<String> {
 }
 
 /// Write content to a file (creates or overwrites).
+///
+/// Relative paths are always resolved from `base`, rather than from the
+/// process working directory. This keeps confirmed workflows inside the
+/// repository they were created for even when the application was launched
+/// from somewhere else.
 pub fn write_file(path: &Path, content: &str, base: &Path) -> Result<()> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+
     // Check if path is safe (parent must exist and be within base)
     let parent = path.parent().context("file must have a parent directory")?;
     let canonical_parent = parent
@@ -206,5 +217,17 @@ mod tests {
         let error = write_file(&target, "secret", base.path()).unwrap_err();
         assert!(error.to_string().contains("outside allowed directory"));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn write_file_resolves_relative_paths_against_the_base_directory() {
+        let base = tempfile::tempdir().unwrap();
+
+        write_file(Path::new("generated.txt"), "inside the repository", base.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(base.path().join("generated.txt")).unwrap(),
+            "inside the repository"
+        );
     }
 }
