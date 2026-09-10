@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 const DEFAULT_MODEL: &str = "llama3";
+const DEFAULT_OLLAMA_HOST: &str = "127.0.0.1:11434";
 
 /// The starter configuration written by `llm_cli setup`.
 ///
@@ -16,6 +17,10 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Default configuration for llm-cli
 
 model = "llama3"
 system_prompt = "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct."
+# Ollama daemon address or HTTP(S) API base. This is passed to both the
+# `ollama` command and its HTTP APIs, so local, remote, and Cloud hosts use
+# the same setting.
+ollama_host = "127.0.0.1:11434"
 
 # Maximum duration for a chat or commit-message generation request.
 llm_timeout_secs = 45
@@ -42,6 +47,7 @@ classifier_model = "qwen2:1.5b"
 pub struct Config {
     pub model: String,
     pub system_prompt: String,
+    pub ollama_host: String,
     pub llm_timeout_secs: u64,
     pub cmd_timeout_secs: u64,
     pub max_context_tokens: u32,
@@ -59,6 +65,7 @@ pub struct Config {
 struct PartialConfig {
     model: Option<String>,
     system_prompt: Option<String>,
+    ollama_host: Option<String>,
     llm_timeout_secs: Option<u64>,
     cmd_timeout_secs: Option<u64>,
     max_context_tokens: Option<u32>,
@@ -86,6 +93,7 @@ impl Config {
         }
 
         cfg.apply_env_overrides();
+        cfg.ollama_host = normalize_ollama_host(&cfg.ollama_host)?;
         Ok(cfg)
     }
 
@@ -112,6 +120,9 @@ impl Config {
         }
         if let Some(system_prompt) = partial.system_prompt {
             self.system_prompt = system_prompt;
+        }
+        if let Some(ollama_host) = partial.ollama_host {
+            self.ollama_host = ollama_host;
         }
         if let Some(llm_timeout_secs) = partial.llm_timeout_secs {
             self.llm_timeout_secs = llm_timeout_secs;
@@ -157,6 +168,15 @@ impl Config {
         if let Ok(val) = env::var("LLM_CLI_SYSTEM_PROMPT") {
             if !val.is_empty() {
                 self.system_prompt = val;
+            }
+        }
+        if let Ok(val) = env::var("LLM_CLI_OLLAMA_HOST") {
+            if !val.is_empty() {
+                self.ollama_host = val;
+            }
+        } else if let Ok(val) = env::var("OLLAMA_HOST") {
+            if !val.is_empty() {
+                self.ollama_host = val;
             }
         }
         if let Ok(val) = env::var("LLM_CLI_LLM_TIMEOUT_SECS") {
@@ -215,6 +235,7 @@ impl Config {
             }
         }
     }
+
 }
 
 impl Default for Config {
@@ -222,6 +243,7 @@ impl Default for Config {
         Self {
             model: DEFAULT_MODEL.to_string(),
             system_prompt: "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct.".to_string(),
+            ollama_host: DEFAULT_OLLAMA_HOST.to_string(),
             llm_timeout_secs: 45,
             cmd_timeout_secs: 60,
             max_context_tokens: 4096,
@@ -261,6 +283,37 @@ fn parse_bool(input: &str) -> Result<bool, std::str::ParseBoolError> {
     input.parse::<bool>()
 }
 
+fn normalize_ollama_host(value: &str) -> Result<String> {
+    let host = value.trim().trim_end_matches('/');
+    let is_http_url = host.starts_with("http://") || host.starts_with("https://");
+    let invalid_url = host.contains("://") && !is_http_url;
+    let address = host
+        .strip_prefix("http://")
+        .or_else(|| host.strip_prefix("https://"))
+        .unwrap_or(host);
+    if host.is_empty()
+        || invalid_url
+        || address.is_empty()
+        || address.contains(['/', '?', '#', '@'])
+        || address.chars().any(char::is_whitespace)
+    {
+        anyhow::bail!(
+            "ollama_host must be a host and port such as `127.0.0.1:11434` or an http(s) API base"
+        );
+    }
+    Ok(host.to_string())
+}
+
+/// Build an Ollama HTTP endpoint from a validated `OLLAMA_HOST`-style value.
+pub fn ollama_api_url(ollama_host: &str, path: &str) -> String {
+    let base = if ollama_host.starts_with("http://") || ollama_host.starts_with("https://") {
+        ollama_host
+    } else {
+        return format!("http://{ollama_host}/{}", path.trim_start_matches('/'));
+    };
+    format!("{base}/{}", path.trim_start_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +347,30 @@ mod tests {
         assert!(fs::read_to_string(path)
             .unwrap()
             .contains("embedding_model = \"nomic-embed-text\""));
+    }
+
+    #[test]
+    fn ollama_host_is_normalized_and_validates_its_scheme() {
+        let directory = tempfile::tempdir().unwrap();
+        let valid = directory.path().join("valid.toml");
+        fs::write(&valid, "ollama_host = \" 127.0.0.1:18080/ \"\n").unwrap();
+        let config = Config::load(Some(valid)).unwrap();
+        assert_eq!(config.ollama_host, "127.0.0.1:18080");
+        assert_eq!(
+            ollama_api_url(&config.ollama_host, "/api/version"),
+            "http://127.0.0.1:18080/api/version"
+        );
+
+        let cloud = directory.path().join("cloud.toml");
+        fs::write(&cloud, "ollama_host = \"https://ollama.example.invalid/\"\n").unwrap();
+        let cloud_config = Config::load(Some(cloud)).unwrap();
+        assert_eq!(
+            ollama_api_url(&cloud_config.ollama_host, "api/generate"),
+            "https://ollama.example.invalid/api/generate"
+        );
+
+        let invalid = directory.path().join("invalid.toml");
+        fs::write(&invalid, "ollama_host = \"ftp://example.invalid\"\n").unwrap();
+        assert!(Config::load(Some(invalid)).is_err());
     }
 }

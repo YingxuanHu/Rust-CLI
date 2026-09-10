@@ -108,6 +108,9 @@ Create `.llm-cli/config.toml` in your project directory:
 # Main chat model
 model = "llama3"
 
+# Ollama daemon address (`host:port`) or an HTTPS API base such as https://ollama.com
+ollama_host = "127.0.0.1:11434"
+
 # Embedding model for Tier 2
 embedding_model = "nomic-embed-text"
 

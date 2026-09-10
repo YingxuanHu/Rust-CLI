@@ -9,9 +9,10 @@ pub struct OllamaStatus {
     pub raw_output: String,
 }
 
-pub fn check_status(model: &str) -> Result<OllamaStatus> {
+pub fn check_status(model: &str, ollama_host: &str) -> Result<OllamaStatus> {
     let output = Command::new("ollama")
         .arg("list")
+        .env("OLLAMA_HOST", ollama_host)
         .output()
         .context("invoking ollama list")?;
 
@@ -47,8 +48,8 @@ pub fn check_status(model: &str) -> Result<OllamaStatus> {
     })
 }
 
-pub fn ensure_available(model: &str) -> Result<()> {
-    let status = check_status(model)?;
+pub fn ensure_available(model: &str, ollama_host: &str) -> Result<()> {
+    let status = check_status(model, ollama_host)?;
     if !status.reachable {
         bail!(
             "Cannot reach Ollama daemon. Is it running? Raw output: {}",

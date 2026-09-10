@@ -40,6 +40,7 @@ pub async fn resolve_intent(
     learned: &LearnedAliases,
     llm_model: &str,
     request_timeout_secs: u64,
+    ollama_host: &str,
 ) -> Result<ParsedIntent> {
     tracing::debug!("[Intent Resolution] Input: '{}'", input);
     
@@ -66,6 +67,7 @@ pub async fn resolve_intent(
         input,
         llm_model,
         request_timeout_secs,
+        ollama_host,
     )
     .await?
     {

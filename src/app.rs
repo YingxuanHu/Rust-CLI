@@ -35,12 +35,13 @@ use crate::{
 };
 
 pub async fn run(config: Config) -> Result<()> {
-    ollama::ensure_available(&config.model)?;
+    ollama::ensure_available(&config.model, &config.ollama_host)?;
 
     // Initialize embedding cache for semantic intent matching
     let mut embedding_cache = EmbeddingCache::new(
         Some(&config.embedding_model),
         config.request_timeout_secs,
+        &config.ollama_host,
     );
     tracing::info!("Initializing embedding cache (this may take a moment)...");
     if let Err(e) = embedding_cache.initialize(Some(&config.embedding_cache_path)).await {
@@ -940,6 +941,7 @@ fn submit_input(app: &mut App) {
     let tx = app.assistant_tx.clone();
     let model = app.config.model.clone();
     let classifier_model = app.config.classifier_model.clone();
+    let ollama_host = app.config.ollama_host.clone();
     let system_prompt = app.config.system_prompt.clone();
     let request_timeout_secs = app.config.request_timeout_secs;
     let llm_timeout_secs = app.config.llm_timeout_secs;
@@ -992,6 +994,7 @@ fn submit_input(app: &mut App) {
             &learned,
             &classifier_model,
             request_timeout_secs,
+            &ollama_host,
         )
         .await
         {
@@ -1022,6 +1025,7 @@ fn submit_input(app: &mut App) {
             .arg("run")
             .arg(&model)
             .arg(&composed_prompt)
+            .env("OLLAMA_HOST", &ollama_host)
             .stdout(std::process::Stdio::piped())
             .spawn()
         {

@@ -34,6 +34,9 @@ embedding_cache_path = "/path/to/your/embeddings.toml"
 
 # Custom embedding model (must match what Ollama has)
 embedding_model = "nomic-embed-text"
+
+# Ollama daemon address or HTTPS API base (also used by chat and the classifier)
+ollama_host = "127.0.0.1:11434"
 ```
 
 Or via environment variables:
@@ -41,6 +44,7 @@ Or via environment variables:
 ```bash
 export LLM_CLI_EMBEDDING_CACHE_PATH="/path/to/embeddings.toml"
 export LLM_CLI_EMBEDDING_MODEL="nomic-embed-text"
+export LLM_CLI_OLLAMA_HOST="127.0.0.1:11434"
 ```
 
 ## Cache File Format

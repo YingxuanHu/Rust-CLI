@@ -1,7 +1,10 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::{
-    commands::{format_error, run_command_with_timeout, split_commit_message},
+    commands::{
+        format_error, run_command_with_timeout, run_command_with_timeout_with_env,
+        split_commit_message,
+    },
     config::Config,
     file_ops,
     learned::LearnedAliases,
@@ -423,10 +426,11 @@ pub fn generate_commit_message(config: &Config, repo_root: &std::path::Path) -> 
     let prompt = format!(
         "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
     );
-    let output = run_command_with_timeout(
+    let output = run_command_with_timeout_with_env(
         repo_root,
         "ollama",
         &["run", &config.model, &prompt],
+        &[("OLLAMA_HOST", config.ollama_host.as_str())],
         Duration::from_secs(config.llm_timeout_secs),
     )
     .ok()?;
@@ -472,6 +476,7 @@ pub async fn generate_commit_message_async(
         .arg("run")
         .arg(&config.model)
         .arg(prompt)
+        .env("OLLAMA_HOST", &config.ollama_host)
         .kill_on_drop(true);
     let result = tokio::time::timeout(
         Duration::from_secs(config.llm_timeout_secs),
@@ -736,4 +741,133 @@ fn is_shell_command(cmd: &str) -> bool {
         || cmd.starts_with("mkdir ")
         || cmd.starts_with("chmod ")
         || cmd.starts_with("chown ")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path, time::Duration};
+
+    use tempfile::TempDir;
+
+    use super::{
+        handle_workflow_response, WorkflowKind, WorkflowResponder, WorkflowState,
+    };
+    use crate::commands::run_command_with_timeout;
+
+    #[derive(Default)]
+    struct TestResponder {
+        replies: Vec<String>,
+        executed_commands: Vec<String>,
+    }
+
+    impl WorkflowResponder for TestResponder {
+        fn reply(&mut self, content: impl Into<String>) {
+            self.replies.push(content.into());
+        }
+
+        fn execute_shell_command(&mut self, cmd: &str) {
+            self.executed_commands.push(cmd.to_string());
+        }
+
+        fn command_timeout_secs(&self) -> u64 {
+            10
+        }
+    }
+
+    fn git(repo_root: &Path, args: &[&str]) -> String {
+        run_command_with_timeout(repo_root, "git", args, Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("git {} failed: {error}", args.join(" ")))
+    }
+
+    fn initialized_repository() -> TempDir {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        let root = repo.path();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.name", "Workflow Test"]);
+        git(root, &["config", "user.email", "workflow-test@example.invalid"]);
+        fs::write(root.join("README.md"), "# Test repository\n").expect("seed repository");
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-qm", "Initialize repository"]);
+        repo
+    }
+
+    #[test]
+    fn stage_workflow_stages_only_requested_file_in_a_real_repository() {
+        let repo = initialized_repository();
+        let root = repo.path();
+        fs::write(root.join("staged.txt"), "stage this\n").expect("write staged file");
+        fs::write(root.join("unstaged.txt"), "leave this alone\n").expect("write unstaged file");
+        let mut responder = TestResponder::default();
+
+        handle_workflow_response(
+            &mut responder,
+            WorkflowState {
+                kind: WorkflowKind::StagePlan {
+                    args: vec!["add".to_string(), "staged.txt".to_string()],
+                },
+                repo_root: root.to_path_buf(),
+            },
+            "yes",
+        );
+
+        assert_eq!(git(root, &["diff", "--cached", "--name-only"]).trim(), "staged.txt");
+        assert!(git(root, &["status", "--short"]).contains("?? unstaged.txt"));
+        assert!(responder.replies.iter().any(|reply| reply.contains("git add staged.txt ok")));
+    }
+
+    #[test]
+    fn commit_workflow_creates_a_local_commit_without_pushing() {
+        let repo = initialized_repository();
+        let root = repo.path();
+        fs::write(root.join("notes.txt"), "A useful note.\n").expect("write note");
+        git(root, &["add", "notes.txt"]);
+        let mut responder = TestResponder::default();
+
+        handle_workflow_response(
+            &mut responder,
+            WorkflowState {
+                kind: WorkflowKind::CommitOnlyConfirm {
+                    suggested: "Add project note\n- Record a useful note".to_string(),
+                },
+                repo_root: root.to_path_buf(),
+            },
+            "yes",
+        );
+
+        assert_eq!(git(root, &["log", "-1", "--format=%s"]).trim(), "Add project note");
+        assert!(git(root, &["diff", "--cached", "--name-only"]).trim().is_empty());
+        assert!(responder
+            .replies
+            .iter()
+            .any(|reply| reply.contains("Commit completed (no push).")));
+    }
+
+    #[test]
+    fn file_write_workflow_respects_confirmation() {
+        let repo = initialized_repository();
+        let root = repo.path();
+        let mut responder = TestResponder::default();
+
+        handle_workflow_response(
+            &mut responder,
+            WorkflowState {
+                kind: WorkflowKind::WriteFileConfirm {
+                    path: "generated.txt".to_string(),
+                    content: "created by the workflow\n".to_string(),
+                    overwrite: false,
+                },
+                repo_root: root.to_path_buf(),
+            },
+            "yes",
+        );
+
+        assert_eq!(
+            fs::read_to_string(root.join("generated.txt")).expect("workflow output"),
+            "created by the workflow\n"
+        );
+        assert!(responder
+            .replies
+            .iter()
+            .any(|reply| reply.contains("Successfully created file")));
+    }
 }

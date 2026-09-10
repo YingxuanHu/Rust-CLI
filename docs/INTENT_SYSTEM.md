@@ -159,6 +159,9 @@ source = "user_feedback"
 # Main chat model
 model = "llama3"
 
+# Daemon used for embeddings and the classifier as well as chat
+ollama_host = "127.0.0.1:11434"
+
 # Embedding model for Tier 2
 embedding_model = "nomic-embed-text"
 

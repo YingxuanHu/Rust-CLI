@@ -242,6 +242,7 @@ When the LLM suggests shell commands, type:
 - Run `llm_cli setup` to create `.llm-cli/config.toml` without overwriting an existing file, or copy `config.example.toml`. Pass an explicit file via `llm_cli --config /path/to/config.toml` if needed.
 - When the file is missing, the CLI falls back to built-in defaults so it still works out of the box. Those defaults are:
   - `model = "llama3"`
+  - `ollama_host = "127.0.0.1:11434"` (or an HTTPS API base)
   - `system_prompt = "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct."`
   - `llm_timeout_secs = 45`
   - `cmd_timeout_secs = 60`
@@ -259,6 +260,11 @@ You can also override any field temporarily with environment variables:
 ```bash
 export LLM_CLI_MODEL="llama3:8b"
 export LLM_CLI_STREAMING="true"
+# Use a daemon on another reachable host or port.
+export LLM_CLI_OLLAMA_HOST="192.0.2.10:11434"
+# For Ollama Cloud, use an HTTPS base plus your API key:
+# export LLM_CLI_OLLAMA_HOST="https://ollama.com"
+# export OLLAMA_API_KEY="..."
 ```
 
 All project-specific files are stored in `.llm-cli/` directory (history, learned commands, embeddings, frecency data).

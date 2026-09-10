@@ -15,6 +15,11 @@ elif [ "$#" -ne 0 ]; then
   exit 2
 fi
 
+# Keep optional model pulls pointed at the same daemon that llm_cli will use.
+if [ -n "${LLM_CLI_OLLAMA_HOST:-}" ]; then
+  export OLLAMA_HOST="$LLM_CLI_OLLAMA_HOST"
+fi
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "error: Rust/Cargo is required. Install it with rustup: https://rustup.rs" >&2
   exit 1

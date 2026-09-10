@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
-use crate::{intent::ParsedIntent, tools::TOOLS};
+use crate::{config::ollama_api_url, intent::ParsedIntent, tools::TOOLS};
 
 const LLM_CONFIDENCE_THRESHOLD: f32 = 0.5;
 
@@ -17,6 +17,7 @@ pub async fn classify_with_llm(
     input: &str,
     model: &str,
     request_timeout_secs: u64,
+    ollama_host: &str,
 ) -> Result<Option<ParsedIntent>> {
     tracing::debug!("[LLM Classifier] Starting classification for input: '{}' with model: '{}'", input, model);
     
@@ -54,12 +55,13 @@ pub async fn classify_with_llm(
     );
     
     // Call Ollama
-    tracing::debug!("[LLM Classifier] Calling Ollama API at http://localhost:11434/api/generate");
+    let endpoint = ollama_api_url(ollama_host, "api/generate");
+    tracing::debug!("[LLM Classifier] Calling Ollama API at {}", endpoint);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(request_timeout_secs))
         .build()?;
-    let response = match client
-        .post("http://localhost:11434/api/generate")
+    let mut request = client
+        .post(&endpoint)
         .json(&serde_json::json!({
             "model": model,
             "prompt": prompt,
@@ -68,14 +70,23 @@ pub async fn classify_with_llm(
                 "temperature": 0.1,
                 "num_predict": 20,
             }
-        }))
+        }));
+    if let Ok(api_key) = std::env::var("OLLAMA_API_KEY") {
+        if !api_key.trim().is_empty() {
+            request = request.bearer_auth(api_key);
+        }
+    }
+    let response = match request
         .send()
         .await
     {
         Ok(resp) => resp,
         Err(e) => {
             tracing::debug!("[LLM Classifier] ✗ ERROR: Failed to call Ollama API: {}", e);
-            tracing::debug!("[LLM Classifier] ✗ Is Ollama running? Try: curl http://localhost:11434/api/version");
+            tracing::debug!(
+                "[LLM Classifier] ✗ Is Ollama running? Try: curl {}",
+                ollama_api_url(ollama_host, "api/version")
+            );
             return Ok(None);
         }
     };
@@ -136,4 +147,28 @@ pub async fn classify_with_llm(
     // If LLM couldn't classify, return None (will fall through to ask_user)
     tracing::debug!("[LLM Classifier] ✗ Could not match response '{}' to any tool or 'chat'", llm_response);
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_with_llm;
+
+    #[tokio::test]
+    async fn classifier_uses_configured_host_and_parses_a_tool_response() {
+        let server = crate::test_support::MockHttpServer::respond_once(
+            200,
+            r#"{"response":"status"}"#,
+        );
+
+        let intent = classify_with_llm("show repository status", "test-classifier", 5, server.host())
+            .await
+            .unwrap()
+            .expect("a recognized intent");
+
+        assert_eq!(intent.tool, "status");
+        let request = server.finish();
+        assert!(request.starts_with("POST /api/generate HTTP/1.1"));
+        assert!(request.contains("\"model\":\"test-classifier\""));
+        assert!(request.contains("\"stream\":false"));
+    }
 }

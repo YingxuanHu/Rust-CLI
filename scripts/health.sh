@@ -4,6 +4,8 @@ set -euo pipefail
 MODEL="${1:-${MODEL:-llama3}}"
 EMBED_MODEL="${EMBED_MODEL:-${LLM_CLI_EMBEDDING_MODEL:-nomic-embed-text}}"
 CLASSIFIER_MODEL="${CLASSIFIER_MODEL:-${LLM_CLI_CLASSIFIER_MODEL:-qwen2:1.5b}}"
+OLLAMA_HOST="${LLM_CLI_OLLAMA_HOST:-${OLLAMA_HOST:-127.0.0.1:11434}}"
+export OLLAMA_HOST
 
 log() {
   printf '==> %s\n' "$*"
@@ -48,7 +50,7 @@ log "rustc $(rustc --version)"
 log "cargo $(cargo --version)"
 log "ollama $(ollama --version)"
 
-log "Checking Ollama daemon"
+log "Checking Ollama daemon at $OLLAMA_HOST"
 if ! ollama list >/dev/null 2>&1; then
   cat <<'EOF' >&2
 error: could not reach the Ollama daemon.

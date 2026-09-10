@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::tools::TOOLS;
+use crate::{config::ollama_api_url, tools::TOOLS};
 
 /// Default embedding model to use with Ollama.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
@@ -49,12 +49,14 @@ pub struct EmbeddingCache {
     client: reqwest::Client,
     /// Embedding model name
     model: String,
+    /// Ollama daemon address in `host:port` form.
+    ollama_host: String,
 }
 
 
 impl EmbeddingCache {
     /// Create a new embedding cache (embeddings not yet loaded).
-    pub fn new(model: Option<&str>, request_timeout_secs: u64) -> Self {
+    pub fn new(model: Option<&str>, request_timeout_secs: u64, ollama_host: &str) -> Self {
         Self {
             examples: HashMap::new(),
             client: reqwest::Client::builder()
@@ -62,6 +64,7 @@ impl EmbeddingCache {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             model: model.unwrap_or(DEFAULT_EMBEDDING_MODEL).to_string(),
+            ollama_host: ollama_host.to_string(),
         }
     }
 
@@ -162,10 +165,16 @@ impl EmbeddingCache {
             prompt: text,
         };
 
-        let response = self
+        let mut request_builder = self
             .client
-            .post("http://localhost:11434/api/embeddings")
-            .json(&request)
+            .post(ollama_api_url(&self.ollama_host, "api/embeddings"))
+            .json(&request);
+        if let Ok(api_key) = std::env::var("OLLAMA_API_KEY") {
+            if !api_key.trim().is_empty() {
+                request_builder = request_builder.bearer_auth(api_key);
+            }
+        }
+        let response = request_builder
             .send()
             .await
             .context("sending embedding request to Ollama")?;
@@ -183,7 +192,6 @@ impl EmbeddingCache {
 
         Ok(embedding_response.embedding)
     }
-
 }
 
 /// Compute cosine similarity between two vectors.
@@ -246,5 +254,21 @@ mod tests {
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&a, &b);
         assert_eq!(sim, 0.0);
+    }
+
+    #[tokio::test]
+    async fn embedding_requests_use_the_configured_ollama_host() {
+        let server = crate::test_support::MockHttpServer::respond_once(
+            200,
+            r#"{"embedding":[0.25,0.75]}"#,
+        );
+        let cache = EmbeddingCache::new(Some("test-embed"), 5, server.host());
+
+        assert_eq!(cache.get_embedding("find a file").await.unwrap(), vec![0.25, 0.75]);
+
+        let request = server.finish();
+        assert!(request.starts_with("POST /api/embeddings HTTP/1.1"));
+        assert!(request.contains("\"model\":\"test-embed\""));
+        assert!(request.contains("\"prompt\":\"find a file\""));
     }
 }

@@ -23,6 +23,8 @@ mod llm_classifier;
 mod ollama;
 mod repo;
 mod session;
+#[cfg(test)]
+mod test_support;
 mod tools;
 mod ui;
 mod workflow;
@@ -81,9 +83,9 @@ async fn main() -> Result<()> {
         Command::Health { model, full } => {
             let config = config::Config::load(config_path).context("loading config")?;
             let model = model.unwrap_or_else(|| config.model.clone());
-            let status = ollama::check_status(&model)?;
+            let status = ollama::check_status(&model, &config.ollama_host)?;
             if !status.reachable {
-                eprintln!("Ollama daemon unreachable. Start it with: ollama serve");
+                eprintln!("Ollama daemon at {} is unreachable. Start it with: ollama serve", config.ollama_host);
                 std::process::exit(2);
             }
             if !status.has_model {
@@ -99,7 +101,7 @@ async fn main() -> Result<()> {
                 ];
                 let mut missing = Vec::new();
                 for (label, required_model) in required {
-                    let status = ollama::check_status(required_model)?;
+                    let status = ollama::check_status(required_model, &config.ollama_host)?;
                     if status.has_model {
                         println!("{label} model '{required_model}' is available.");
                     } else {
@@ -113,7 +115,7 @@ async fn main() -> Result<()> {
                     std::process::exit(3);
                 }
             }
-            println!("Ollama is reachable and chat model '{model}' is available.");
+            println!("Ollama at {} is reachable and chat model '{model}' is available.", config.ollama_host);
         }
         Command::Run => {
             let config = config::Config::load(config_path).context("loading config")?;

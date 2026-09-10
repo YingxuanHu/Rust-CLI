@@ -17,8 +17,21 @@ pub fn run_command_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String> {
+    run_command_with_timeout_with_env(cwd, program, args, &[], timeout)
+}
+
+/// Run a non-interactive command with a timeout and a small, explicit set of
+/// environment overrides. Keeping overrides per-process avoids mutating the
+/// application's environment while background tasks are running.
+pub fn run_command_with_timeout_with_env(
+    cwd: &std::path::Path,
+    program: &str,
+    args: &[&str],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<String> {
     let mut command = Command::new(program);
-    command.args(args).current_dir(cwd);
+    command.args(args).current_dir(cwd).envs(environment.iter().copied());
     let output = run_process_with_timeout(
         &mut command,
         &format!("{program} {args:?}"),
