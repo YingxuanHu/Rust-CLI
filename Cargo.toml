@@ -2,6 +2,12 @@
 name = "llm_cli"
 version = "0.1.0"
 edition = "2024"
+description = "A local Ollama-powered terminal assistant with safe developer workflows"
+readme = "README.md"
+repository = "https://github.com/YingxuanHu/Rust-CLI"
+keywords = ["cli", "ollama", "tui", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"

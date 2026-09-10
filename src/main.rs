@@ -45,6 +45,15 @@ enum Command {
         /// Model name or tag, e.g. `llama3` or `llama3:8b`
         #[arg(long)]
         model: Option<String>,
+        /// Also verify the embedding and intent-classifier models
+        #[arg(long)]
+        full: bool,
+    },
+    /// Create a commented per-project configuration file
+    Setup {
+        /// Replace an existing configuration file
+        #[arg(long)]
+        force: bool,
     },
     /// Launch the TUI (default)
     Run,
@@ -54,10 +63,23 @@ enum Command {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    let config = config::Config::load(cli.config.clone()).context("loading config")?;
+    let config_path = cli.config.clone();
 
     match cli.command.unwrap_or(Command::Run) {
-        Command::Health { model } => {
+        Command::Setup { force } => {
+            let path = config_path.unwrap_or_else(config::default_config_path);
+            if config::Config::initialize_file(&path, force)? {
+                println!("Created starter configuration at {}", path.display());
+                println!("Next: pull the required Ollama models, then run `llm_cli health --full`.");
+            } else {
+                println!(
+                    "Configuration already exists at {}. Use `llm_cli setup --force` to replace it.",
+                    path.display()
+                );
+            }
+        }
+        Command::Health { model, full } => {
+            let config = config::Config::load(config_path).context("loading config")?;
             let model = model.unwrap_or_else(|| config.model.clone());
             let status = ollama::check_status(&model)?;
             if !status.reachable {
@@ -70,9 +92,31 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(3);
             }
-            println!("Ollama is reachable and model '{model}' is available.");
+            if full {
+                let required = [
+                    ("embedding", config.embedding_model.as_str()),
+                    ("classifier", config.classifier_model.as_str()),
+                ];
+                let mut missing = Vec::new();
+                for (label, required_model) in required {
+                    let status = ollama::check_status(required_model)?;
+                    if status.has_model {
+                        println!("{label} model '{required_model}' is available.");
+                    } else {
+                        eprintln!(
+                            "{label} model '{required_model}' not found. Pull it with: ollama pull \"{required_model}\""
+                        );
+                        missing.push(required_model);
+                    }
+                }
+                if !missing.is_empty() {
+                    std::process::exit(3);
+                }
+            }
+            println!("Ollama is reachable and chat model '{model}' is available.");
         }
         Command::Run => {
+            let config = config::Config::load(config_path).context("loading config")?;
             app::run(config).await?;
         }
     }

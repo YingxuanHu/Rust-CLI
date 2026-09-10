@@ -92,7 +92,6 @@ pub struct FileInfo {
 }
 
 /// Read a file's contents.
-#[allow(dead_code)] // Used by show_file via fs::read_to_string in app.rs
 pub fn read_file(path: &Path, base: &Path) -> Result<String> {
     let canonical = path.canonicalize().context("canonicalizing path")?;
     let canonical_base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
@@ -115,6 +114,16 @@ pub fn write_file(path: &Path, content: &str, base: &Path) -> Result<()> {
     
     if !canonical_parent.starts_with(&canonical_base) {
         bail!("Access denied: path outside allowed directory");
+    }
+
+    // `fs::write` follows a final symlink. Reject an existing symlink (or any
+    // existing target) that resolves outside the allowed directory; checking
+    // only its parent would otherwise permit writing through that symlink.
+    if path.exists() {
+        let canonical_target = path.canonicalize().context("canonicalizing existing file")?;
+        if !canonical_target.starts_with(&canonical_base) {
+            bail!("Access denied: file resolves outside allowed directory");
+        }
     }
 
     fs::write(path, content).context("writing file")?;
@@ -177,5 +186,25 @@ mod tests {
         let safe_path = temp_dir.join("test_file.txt");
         
         assert!(is_safe_path(&safe_path, &temp_dir));
+    }
+
+    #[test]
+    fn read_file_rejects_a_path_outside_the_base_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+
+        let error = read_file(outside.path(), base.path()).unwrap_err();
+        assert!(error.to_string().contains("outside allowed directory"));
+    }
+
+    #[test]
+    fn write_file_rejects_a_path_outside_the_base_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("not-allowed.txt");
+
+        let error = write_file(&target, "secret", base.path()).unwrap_err();
+        assert!(error.to_string().contains("outside allowed directory"));
+        assert!(!target.exists());
     }
 }

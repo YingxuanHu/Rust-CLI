@@ -19,7 +19,7 @@ Each tier tries to understand your intent. If successful, it executes immediatel
 
 ### Tier 1: Fuzzy Matching (< 1ms)
 **Method:** String similarity matching  
-**Technology:** 100% Rust, `strsim` crate  
+**Technology:** 100% Rust, `fuzzy-matcher` crate
 **Confidence:** High (exact or near-exact matches)
 
 Checks in order:

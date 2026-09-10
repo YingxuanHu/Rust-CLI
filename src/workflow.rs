@@ -1,7 +1,7 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use crate::{
-    commands::{format_error, run_command, split_commit_message},
+    commands::{format_error, run_command_with_timeout, split_commit_message},
     config::Config,
     file_ops,
     learned::LearnedAliases,
@@ -18,7 +18,9 @@ pub struct WorkflowState {
 #[derive(Debug, Clone)]
 pub enum WorkflowKind {
     SaveWorkPlan,
+    SaveWorkMessagePending,
     SaveWorkCommit { suggested: String },
+    CommitMessagePending,
     CommitOnlyConfirm { suggested: String },
     StagePlan { args: Vec<String> },
     DiffPreview { file: Option<String> },
@@ -49,6 +51,7 @@ pub enum WorkflowKind {
 pub trait WorkflowResponder {
     fn reply(&mut self, content: impl Into<String>);
     fn execute_shell_command(&mut self, cmd: &str);
+    fn command_timeout_secs(&self) -> u64;
 }
 
 pub fn handle_workflow_response<R: WorkflowResponder>(
@@ -59,6 +62,12 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
     match workflow.kind {
         WorkflowKind::SaveWorkPlan => {
             handle_save_work_plan(responder, &workflow.repo_root, prompt);
+        }
+        WorkflowKind::SaveWorkMessagePending => {
+            responder.reply("Commit-message generation is still in progress. Please wait.");
+        }
+        WorkflowKind::CommitMessagePending => {
+            responder.reply("Commit-message generation is still in progress. Please wait.");
         }
         WorkflowKind::SaveWorkCommit { suggested } => {
             handle_save_work_commit(responder, &workflow.repo_root, prompt, suggested);
@@ -115,7 +124,12 @@ fn handle_save_work_plan<R: WorkflowResponder>(
         return;
     }
 
-    match run_command(repo_root, "git", &["add", "-A"]) {
+    match run_command_with_timeout(
+        repo_root,
+        "git",
+        &["add", "-A"],
+        Duration::from_secs(responder.command_timeout_secs()),
+    ) {
         Ok(out) => {
             if !out.trim().is_empty() {
                 responder.reply(format!("git add -A output:\n{out}"));
@@ -158,7 +172,12 @@ fn handle_stage_plan<R: WorkflowResponder>(
 ) {
     if matches!(prompt.trim().to_lowercase().as_str(), "" | "yes" | "y") {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        match run_command(repo_root, "git", &arg_refs) {
+        match run_command_with_timeout(
+            repo_root,
+            "git",
+            &arg_refs,
+            Duration::from_secs(responder.command_timeout_secs()),
+        ) {
             Ok(out) => {
                 let detail = if out.trim().is_empty() {
                     "ok".to_string()
@@ -202,7 +221,12 @@ fn handle_diff_preview<R: WorkflowResponder>(
         responder.reply("No file specified.");
         return;
     }
-    let diff = run_command(repo_root, "git", &["diff", "--", &target])
+    let diff = run_command_with_timeout(
+        repo_root,
+        "git",
+        &["diff", "--", &target],
+        Duration::from_secs(responder.command_timeout_secs()),
+    )
         .unwrap_or_else(|e| format!("(git diff failed: {})", format_error(&e)));
     responder.reply(format!("Diff for {}:\n{}", target, diff));
 }
@@ -237,6 +261,7 @@ fn handle_commit_only_confirm<R: WorkflowResponder>(
         "git commit",
         "git",
         &commit_arg_refs,
+        Duration::from_secs(responder.command_timeout_secs()),
     ) {
         responder.reply(logs.join("\n"));
         return;
@@ -303,7 +328,7 @@ fn handle_apply_diff<R: WorkflowResponder>(
     // For any other input, treat as "edit" - show the proposed content and ask again
     responder.reply(format!(
         "Edit mode not yet implemented. Press Enter (or type 'yes') to apply or 'no' to cancel.\n\nProposed content:\n{}",
-        &proposed[..proposed.len().min(500)]
+        truncate_for_display(&proposed, 500)
     ));
 }
 
@@ -324,12 +349,26 @@ fn run_save_work_impl<R: WorkflowResponder>(
     }
     let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
 
-    if !run_workflow_step(&mut logs, repo_root, "git commit", "git", &commit_arg_refs) {
+    if !run_workflow_step(
+        &mut logs,
+        repo_root,
+        "git commit",
+        "git",
+        &commit_arg_refs,
+        Duration::from_secs(responder.command_timeout_secs()),
+    ) {
         responder.reply(logs.join("\n"));
         return;
     }
 
-    if !run_workflow_step(&mut logs, repo_root, "git push", "git", &["push"]) {
+    if !run_workflow_step(
+        &mut logs,
+        repo_root,
+        "git push",
+        "git",
+        &["push"],
+        Duration::from_secs(responder.command_timeout_secs()),
+    ) {
         responder.reply(logs.join("\n"));
         return;
     }
@@ -344,8 +383,9 @@ fn run_workflow_step(
     label: &str,
     program: &str,
     args: &[&str],
+    timeout: Duration,
 ) -> bool {
-    match run_command(repo_root, program, args) {
+    match run_command_with_timeout(repo_root, program, args, timeout) {
         Ok(out) => {
             logs.push(format!("{label} OK\n{out}"));
             true
@@ -361,36 +401,36 @@ pub fn generate_commit_message(config: &Config, repo_root: &std::path::Path) -> 
     if !config.generate_commit_message {
         return None;
     }
-    let stat = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    let command_timeout = Duration::from_secs(config.cmd_timeout_secs);
+    let stat = run_command_with_timeout(
+        repo_root,
+        "git",
+        &["diff", "--cached", "--stat"],
+        command_timeout,
+    )
+    .ok()?;
     if stat.trim().is_empty() {
         return None;
     }
-    let patch = run_command(
+    let patch = run_command_with_timeout(
         repo_root,
         "git",
         &["diff", "--cached", "--unified=3", "--max-count=1"],
+        command_timeout,
     )
     .unwrap_or_default();
-    let patch_snippet = if patch.len() > 4000 {
-        format!("{}...\n[truncated]", &patch[..4000])
-    } else {
-        patch
-    };
+    let patch_snippet = truncate_for_display(&patch, 4000);
     let prompt = format!(
         "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
     );
-    let result = std::process::Command::new("ollama")
-        .arg("run")
-        .arg(&config.model)
-        .arg(prompt)
-        .output()
-        .ok()?;
-
-    if !result.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-    let trimmed = stdout.trim();
+    let output = run_command_with_timeout(
+        repo_root,
+        "ollama",
+        &["run", &config.model, &prompt],
+        Duration::from_secs(config.llm_timeout_secs),
+    )
+    .ok()?;
+    let trimmed = output.trim();
     if trimmed.is_empty() {
         None
     } else {
@@ -405,31 +445,41 @@ pub async fn generate_commit_message_async(
     if !config.generate_commit_message {
         return None;
     }
-    let stat = run_command(repo_root, "git", &["diff", "--cached", "--stat"]).ok()?;
+    let command_timeout = Duration::from_secs(config.cmd_timeout_secs);
+    let stat = run_command_with_timeout(
+        repo_root,
+        "git",
+        &["diff", "--cached", "--stat"],
+        command_timeout,
+    )
+    .ok()?;
     if stat.trim().is_empty() {
         return None;
     }
-    let patch = run_command(
+    let patch = run_command_with_timeout(
         repo_root,
         "git",
         &["diff", "--cached", "--unified=3", "--max-count=1"],
+        command_timeout,
     )
     .unwrap_or_default();
-    let patch_snippet = if patch.len() > 4000 {
-        format!("{}...\n[truncated]", &patch[..4000])
-    } else {
-        patch
-    };
+    let patch_snippet = truncate_for_display(&patch, 4000);
     let prompt = format!(
         "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
     );
-    let result = TokioCommand::new("ollama")
+    let mut command = TokioCommand::new("ollama");
+    command
         .arg("run")
         .arg(&config.model)
         .arg(prompt)
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true);
+    let result = tokio::time::timeout(
+        Duration::from_secs(config.llm_timeout_secs),
+        command.output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !result.status.success() {
         return None;
@@ -441,6 +491,14 @@ pub async fn generate_commit_message_async(
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn truncate_for_display(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let prefix: String = text.chars().take(max_chars).collect();
+    format!("{prefix}...\n[truncated]")
 }
 
 

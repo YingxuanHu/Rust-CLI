@@ -1,4 +1,7 @@
-# Quick Start Guide: Tiered Intent System
+# Quick Start Guide
+
+For the shortest install path, see [INSTALL.md](INSTALL.md). This page focuses
+on intent routing after the CLI is installed.
 
 ## Prerequisites
 
@@ -20,12 +23,8 @@ Download the required models for the intent system:
 # For embeddings (Tier 2)
 ollama pull nomic-embed-text
 
-# For LLM classification (Tier 3) - choose one:
-ollama pull qwen2:0.5b      # Recommended: Fastest
-# OR
-ollama pull qwen2:1.5b      # Better accuracy
-# OR
-ollama pull phi3:mini       # Best accuracy
+# For LLM classification (Tier 3)
+ollama pull qwen2:1.5b      # Default: balanced speed and accuracy
 ```
 
 ## Build and Run
@@ -49,10 +48,10 @@ On first run, you'll see:
 Initializing embedding cache (this may take a moment)...
 Embedding cache ready!
 LLM CLI ready. Model: llama3 (embeddings: ready). 
-Modes: Chat/Shell (Ctrl+S). History: ↑/↓. Enter to submit; Esc/q to exit.
+Modes: Chat/Shell (Ctrl+S). History: ↑/↓. Enter to submit; Esc or empty-input q to exit.
 ```
 
-This will create the embedding cache in `.cache/embeddings.toml` (takes a few seconds, only happens once per project).
+This creates `.llm-cli/embeddings.toml` (takes a few seconds, only happens once per project).
 
 ## Try It Out
 
@@ -92,43 +91,12 @@ This will create the embedding cache in `.cache/embeddings.toml` (takes a few se
 → LLM classifies as "find_todos"
 ```
 
-### Tier 4: Learning
+### Saving a command suggested by chat
 
-**Option 1: Map to existing tool**
-```
-> yeet
-→ "I'm not sure what you want to do with: 'yeet'"
-→ "Did you mean:"
-→ "  [1] save_work - Stage all changes, commit, and push"
-→ "  [2] status - Show git status"
-→ "  ..."
-
-> 1
-→ "✓ Learned: 'yeet' → save_work"
-→ Executes save_work
-
-Next time:
-> yeet
-→ Instantly matches (< 1ms via Tier 1)
-```
-
-**Option 2: Define custom macro**
-```
-> deploy staging
-→ "I'm not sure what you want to do with: 'deploy staging'"
-→ "Options:"
-→ "  • Type a number to select a tool"
-→ "  • Type 'macro: <commands>' to define a shell command sequence"
-→ "  • Type 'none' to skip"
-
-> macro: ssh staging 'cd /app && git pull && systemctl restart app'
-→ "✓ Learned macro: 'deploy staging' → ssh staging 'cd /app && git pull && systemctl restart app'"
-→ Executes the macro
-
-Next time:
-> deploy staging
-→ Instantly executes your custom workflow (< 1ms via Tier 1)
-```
+When a normal chat response includes recognizable shell commands, the CLI
+shows a confirmation prompt. Type `y` to execute them, `s` to save the command
+sequence as a reusable workflow for the same original phrase, or `n` to skip.
+Saved workflows are matched before the normal intent tiers on later use.
 
 ## Configuration
 
@@ -226,14 +194,14 @@ All data is stored per-project in the `.llm-cli/` directory:
 - **learned.toml**: Tool aliases (e.g., "yeet" → save_work)
 - **custom_workflows.toml**: Custom shell workflows
 - **embeddings.toml**: Cached embeddings for faster intent matching
-- **history.jsonl**: Conversation history
+- **history.jsonl**: Submitted-input history for recall and completion
 - **config.toml**: Project-specific configuration (optional)
 
 This means each project can have its own learned commands and history!
 
 ## Tips
 
-1. **Let it learn** - When uncertain, select the right tool. Next time it'll be instant.
+1. **Save useful suggestions** - Use `s` at a chat command confirmation to make a reusable workflow.
 
 2. **Use natural language** - The system understands:
    - "push my code"
@@ -252,7 +220,7 @@ This means each project can have its own learned commands and history!
 
 ## Troubleshooting
 
-### "I'm not sure what you want to do" appears often
+### A request falls back to chat instead of a tool
 
 **Option 1:** Lower the confidence threshold in `src/keyword_classifier.rs`:
 ```rust
@@ -276,7 +244,7 @@ classifier_model = "qwen2:0.5b"
 Check and edit learned aliases:
 ```bash
 cat .llm-cli/learned.toml
-# Remove incorrect entries and re-learn
+# Remove incorrect entries, then save a corrected workflow from a chat suggestion.
 ```
 
 ### Embeddings initialization is slow
@@ -292,54 +260,17 @@ This only happens once per project. The cache is stored in `.llm-cli/embeddings.
 | Typo | 1 | < 1ms | "stauts" |
 | Natural language | 2 | ~50ms | "push my changes" |
 | Novel phrasing | 3 | ~500ms | "ship it to prod" |
-| Unknown | 4 | Manual | User selects |
+| Unknown | Chat | Model response | Conceptual question or unsupported task |
 
-Over time, more queries move to Tier 1 through learning!
-
-## Macros (Custom Commands)
-
-Define your own shell command sequences:
-
-```
-> backup database
-→ "I'm not sure what you want to do..."
-
-> macro: pg_dump mydb > backup_$(date +%Y%m%d).sql && echo "Done"
-→ "✓ Learned macro"
-→ Executes backup
-
-Next time:
-> backup database
-→ Runs your backup workflow instantly
-```
-
-See [MACROS.md](MACROS.md) for detailed macro documentation.
+Saved custom workflows move to Tier 1 on later use.
 
 ## Next Steps
 
 - Read [INTENT_SYSTEM.md](INTENT_SYSTEM.md) for detailed architecture
-- Read [MACROS.md](MACROS.md) for custom workflows
-- Read [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md) for technical details
+- Read [AUTOCOMPLETION.md](AUTOCOMPLETION.md) for ghost-text behavior
+- Read [SEMANTIC_CONTEXT.md](SEMANTIC_CONTEXT.md) for reference handling
 - Customize your config in `.llm-cli/config.toml` (optional)
-- Start using and let it learn your preferences!
+- Run `llm_cli health --full` before troubleshooting a model issue.
 
-## Example Session
-
-```
-> status
-[Tier 1] → git status output
-
-> push my work
-[Tier 2] → Planned git workflow: ...
-
-> yeet this code
-[Tier 4] → I'm not sure what you want to do...
-→ Did you mean: [1] save_work ...
-> 1
-→ ✓ Learned: "yeet this code" → save_work
-
-> yeet this code
-[Tier 1] → Planned git workflow: ...
-```
-
-The system gets smarter the more you use it. Enjoy!
+The system stays local, with deterministic routing for supported actions and
+chat as the fallback for everything else.

@@ -1,0 +1,59 @@
+# Install and First Run
+
+`llm_cli` is a local terminal application. It needs a Rust toolchain to build
+and Ollama to run its models; it does not require an API key or cloud account.
+
+## Fast path
+
+From a checked-out copy of this repository:
+
+```bash
+bash scripts/install.sh --with-models
+```
+
+That installs the binary with Cargo and pulls the default chat, embedding, and
+intent-classifier models. Omit `--with-models` if the models already exist or
+you want to choose different ones.
+
+Then, in the repository where you want to use the assistant:
+
+```bash
+llm_cli setup
+llm_cli health --full
+llm_cli
+```
+
+`setup` creates `.llm-cli/config.toml` without replacing an existing file.
+Use `llm_cli setup --force` only when you intentionally want a fresh starter
+configuration. `health --full` checks all three configured local models.
+
+## Manual path
+
+1. Install Rust through [rustup](https://rustup.rs).
+2. Install and start [Ollama](https://ollama.com).
+3. Pull the default models:
+
+   ```bash
+   ollama pull llama3
+   ollama pull nomic-embed-text
+   ollama pull qwen2:1.5b
+   ```
+
+4. Install the checked-out source:
+
+   ```bash
+   cargo install --path . --locked
+   ```
+
+5. Run the three commands in the Fast path above from the project directory.
+
+## Verification and troubleshooting
+
+Use `llm_cli --help` for CLI help and `llm_cli health --full` for dependency
+checks. The repository also provides `bash scripts/health.sh`, which checks
+the toolchain and the default models before a source-tree run.
+
+If `llm_cli` is not found after installing, ensure Cargo's binary directory is
+on your `PATH` (rustup prints the required setup command during installation).
+If the embedding or classifier model is missing, chat still starts, but intent
+matching falls back to the remaining tiers.

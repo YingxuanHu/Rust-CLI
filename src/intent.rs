@@ -39,6 +39,7 @@ pub async fn resolve_intent(
     cache: &EmbeddingCache,
     learned: &LearnedAliases,
     llm_model: &str,
+    request_timeout_secs: u64,
 ) -> Result<ParsedIntent> {
     tracing::debug!("[Intent Resolution] Input: '{}'", input);
     
@@ -61,7 +62,13 @@ pub async fn resolve_intent(
     // Tier 3: Small LLM classifier (~500ms)
     // This can return "chat" if user is just chatting, or a tool name if they're trying to do something
     tracing::debug!("[Intent Resolution] Attempting Tier 3 (LLM) with model: '{}'", llm_model);
-    if let Some(mut intent) = llm_classifier::classify_with_llm(input, llm_model).await? {
+    if let Some(mut intent) = llm_classifier::classify_with_llm(
+        input,
+        llm_model,
+        request_timeout_secs,
+    )
+    .await?
+    {
         let extracted = extract_args_from_input(input, &intent.tool);
         intent.args.merge_missing(extracted);
         

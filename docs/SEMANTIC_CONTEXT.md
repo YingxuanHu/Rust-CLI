@@ -28,9 +28,9 @@ LLM understands reference and responds appropriately
 
 ### 1. Context Tracking (`src/context.rs`)
 
-- **`RecentOutput`**: Stores output type ("diff", "file", "command", etc.), summary, and content
+- **`RecentOutput`**: Stores output type ("diff", "file", "command", etc.), summary, and a truncated content copy for future expansion
 - **`contains_reference()`**: Detects reference words ("it", "that", "the diff", etc.)
-- **`format_context_for_prompt()`**: Formats recent outputs for LLM injection
+- **`format_context_for_prompt()`**: Formats recent-output summaries for LLM injection
 
 ### 2. Session State (`src/session.rs`)
 
@@ -102,7 +102,7 @@ LLM can suggest: cargo test
 
 - **Session-only**: Context cleared on exit (not persisted)
 - **Max 5 outputs**: Oldest automatically removed
-- **Max 2000 chars**: Long outputs truncated with "[truncated]"
+- **Max 2000 bytes**: Long stored outputs are truncated with "[truncated]"; prompts currently receive summaries rather than full output text
 - **No extra LLM calls**: Main LLM handles disambiguation
 - **Fast**: Simple string matching + concatenation
 
@@ -112,4 +112,3 @@ LLM can suggest: cargo test
 - Context formatting: O(n) where n ≤ 5 recent outputs
 - No blocking operations - all synchronous
 - Minimal memory overhead (~10KB for 5 outputs)
-

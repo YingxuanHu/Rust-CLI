@@ -19,7 +19,7 @@ The CLI automatically detects the following project types:
 
 Detection happens:
 - On startup
-- When changing directories with `cd`
+- When using the CLI's `cd <directory>` command
 
 ### 2. Context-Aware Commands
 
@@ -74,7 +74,7 @@ Contains:
 
 1. **`src/session.rs`**
    - Added `repo_info: Option<RepoInfo>` field
-   - Auto-detects on session creation and `cd` commands
+   - Refreshes project metadata after the in-app `cd` command
 
 2. **`src/handlers.rs`**
    - Added `get_session_repo_info()` to `IntentDispatcher` trait
@@ -137,4 +137,3 @@ The infrastructure is in place for:
 - More sophisticated project structure analysis
 - Integration with language servers for deeper code understanding
 - Support for additional project types (Java, Ruby, etc.)
-

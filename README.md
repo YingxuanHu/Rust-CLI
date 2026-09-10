@@ -10,6 +10,21 @@ alvin.hu@mail.utoronto.ca
 
 ---
 
+## Install in Three Commands
+
+From this repository, run `bash scripts/install.sh --with-models`. Then, from
+the project you want to work in, run:
+
+```bash
+llm_cli setup
+llm_cli health --full
+llm_cli
+```
+
+The full manual and troubleshooting guide is in [docs/INSTALL.md](docs/INSTALL.md).
+
+---
+
 # Video Slide Presentation
 
 https://drive.google.com/file/d/1k9EWQem0jMkhU5A1f3u6RnVxP2bLZsGG/view?usp=sharing
@@ -166,7 +181,9 @@ After starting, the full-screen interface opens with a conversation panel at top
 
 A `help` page is available inside the app with 'help' or '?' in `Chat` mode, showing all available commands and key bindings.
 
-NOTE: Changing the CLI’s working directory from inside the TUI is not yet available, because we lock it to the repo root to keep git workflows and session context consistent.
+Use `cd <directory>` inside the TUI to change its session directory. The CLI
+then re-detects the project and Git root; `$ cd` and `! cd` use the same
+persistent session change rather than a disposable shell child process.
 
 **Essential keyboard shortcuts:**
 - Type naturally and press Enter to chat
@@ -174,7 +191,7 @@ NOTE: Changing the CLI’s working directory from inside the TUI is not yet avai
 - Ctrl+S: Toggle between Chat and Shell modes
 - Tab: Accept ghost text completion
 - PgUp/PgDn: Scroll conversation
-- Esc/q/Ctrl+C: Quit
+- Esc/Ctrl+C: Quit; `q` quits only when the input is empty
 
 **Git workflows:**
 Pre-configured git workflows are available when running inside a git repository.
@@ -203,6 +220,7 @@ find todos               # Search TODO/FIXME (requires ripgrep)
 
 **Shell mode:**
 - Toggle with Ctrl+S to run shell commands directly
+- `cd <directory>` changes the TUI session directory in either mode
 
 **Bang shortcuts in Chat mode:**
 ```
@@ -221,7 +239,7 @@ When the LLM suggests shell commands, type:
 
 **Configuration (`.llm-cli/config.toml`):**
 
-- Copy `config.example.toml` to `.llm-cli/config.toml` to configure models, prompts, timeouts, and storage paths. Pass an explicit file via `cargo run -- --config /path/to/config.toml` if needed.
+- Run `llm_cli setup` to create `.llm-cli/config.toml` without overwriting an existing file, or copy `config.example.toml`. Pass an explicit file via `llm_cli --config /path/to/config.toml` if needed.
 - When the file is missing, the CLI falls back to built-in defaults so it still works out of the box. Those defaults are:
   - `model = "llama3"`
   - `system_prompt = "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct."`

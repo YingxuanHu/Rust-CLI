@@ -20,7 +20,7 @@ The LLM CLI now supports **persistent embedding caching** to significantly speed
 ### Default Cache Location
 
 The cache is automatically stored locally in your project directory:
-- **All platforms**: `.cache/embeddings.toml` (relative to where you run the CLI)
+- **All platforms**: `.llm-cli/embeddings.toml` (relative to where you run the CLI)
 
 This keeps your system clean and makes the cache portable with your project.
 
@@ -61,22 +61,22 @@ version = 1
 ### Viewing Cache Size
 
 ```bash
-ls -lh .cache/embeddings.toml
+ls -lh .llm-cli/embeddings.toml
 ```
 
-The cache file is typically around 1-2 MB and is stored in the `.cache/` directory within your project.
+The cache file is typically around 1-2 MB and is stored in the `.llm-cli/` directory within your project.
 
 ### Clearing the Cache
 
 To force recomputation of embeddings:
 
 ```bash
-rm .cache/embeddings.toml
-# Or remove the entire cache directory
-rm -rf .cache/
+rm .llm-cli/embeddings.toml
 ```
 
-The next startup will automatically regenerate the cache.
+The next startup will automatically regenerate the cache. Do not remove the
+whole `.llm-cli/` directory just to clear embeddings: it also holds your
+configuration, input history, learned workflows, and frecency data.
 
 ### Changing Models
 
@@ -113,4 +113,3 @@ Tip: Run 'ollama pull nomic-embed-text' to enable semantic matching.
 ```
 
 Run the suggested command to download the model.
-

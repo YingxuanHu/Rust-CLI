@@ -1,9 +1,42 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::{Path, PathBuf}};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
 const DEFAULT_MODEL: &str = "llama3";
+
+/// The starter configuration written by `llm_cli setup`.
+///
+/// Keep this as a plain TOML template instead of serializing `Config`: it is
+/// deliberately commented and is useful to people editing it for the first
+/// time.
+pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# Default configuration for llm-cli.
+# Created by `llm_cli setup`. Environment variables prefixed with LLM_CLI_
+# override these values for one invocation.
+
+model = "llama3"
+system_prompt = "Reply in concise bullets. Use short sentences. Break lines for each bullet. Be direct."
+
+# Maximum duration for a chat or commit-message generation request.
+llm_timeout_secs = 45
+# Maximum duration for a tool or shell command.
+cmd_timeout_secs = 60
+# Approximate prompt budget. The application reserves space for the system
+# prompt and current input before adding recent-context summaries.
+max_context_tokens = 4096
+streaming = true
+# HTTP timeout used by Ollama's embedding and intent-classifier APIs.
+request_timeout_secs = 60
+generate_commit_message = true
+
+embedding_model = "nomic-embed-text"
+classifier_model = "qwen2:1.5b"
+
+# Optional custom paths (defaults are shown for reference):
+# history_path = ".llm-cli/history.jsonl"
+# embedding_cache_path = ".llm-cli/embeddings.toml"
+# learned_path = ".llm-cli/learned.toml"
+"#;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -43,18 +76,34 @@ impl Config {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self> {
         let mut cfg = Config::default();
 
-        if let Some(path) = config_path.or_else(default_config_path) {
-            if path.exists() {
-                let contents = fs::read_to_string(&path)
-                    .with_context(|| format!("reading config at {path:?}"))?;
-                let partial: PartialConfig =
-                    toml::from_str(&contents).context("parsing config file as TOML")?;
-                cfg.apply_partial(partial);
-            }
+        let path = config_path.unwrap_or_else(default_config_path);
+        if path.exists() {
+            let contents = fs::read_to_string(&path)
+                .with_context(|| format!("reading config at {path:?}"))?;
+            let partial: PartialConfig =
+                toml::from_str(&contents).context("parsing config file as TOML")?;
+            cfg.apply_partial(partial);
         }
 
         cfg.apply_env_overrides();
         Ok(cfg)
+    }
+
+    /// Write the documented starter configuration without silently replacing a
+    /// user's existing settings. Returns `true` when a file was created or
+    /// replaced.
+    pub fn initialize_file(path: &Path, overwrite: bool) -> Result<bool> {
+        if path.exists() && !overwrite {
+            return Ok(false);
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating config directory at {parent:?}"))?;
+        }
+        fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+            .with_context(|| format!("writing starter config at {path:?}"))?;
+        Ok(true)
     }
 
     fn apply_partial(&mut self, partial: PartialConfig) {
@@ -188,9 +237,9 @@ impl Default for Config {
     }
 }
 
-fn default_config_path() -> Option<PathBuf> {
+pub fn default_config_path() -> PathBuf {
     // Look for config in .llm-cli directory in current project
-    Some(PathBuf::from(".llm-cli/config.toml"))
+    PathBuf::from(".llm-cli/config.toml")
 }
 
 fn default_history_path() -> PathBuf {
@@ -210,4 +259,40 @@ fn default_learned_path() -> PathBuf {
 
 fn parse_bool(input: &str) -> Result<bool, std::str::ParseBoolError> {
     input.parse::<bool>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_config_overrides_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "model = \"llama3.2:3b\"\nstreaming = false\ncmd_timeout_secs = 12\n",
+        )
+        .unwrap();
+
+        let config = Config::load(Some(path)).unwrap();
+        assert_eq!(config.model, "llama3.2:3b");
+        assert!(!config.streaming);
+        assert_eq!(config.cmd_timeout_secs, 12);
+        assert_eq!(config.embedding_model, "nomic-embed-text");
+    }
+
+    #[test]
+    fn initialization_does_not_replace_existing_config_without_force() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/config.toml");
+
+        assert!(Config::initialize_file(&path, false).unwrap());
+        assert!(path.exists());
+        assert!(!Config::initialize_file(&path, false).unwrap());
+        assert!(Config::initialize_file(&path, true).unwrap());
+        assert!(fs::read_to_string(path)
+            .unwrap()
+            .contains("embedding_model = \"nomic-embed-text\""));
+    }
 }

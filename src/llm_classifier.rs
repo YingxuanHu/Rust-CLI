@@ -4,6 +4,7 @@
 //! deterministic methods fail. This provides flexibility for novel phrasing.
 
 use anyhow::Result;
+use std::time::Duration;
 
 use crate::{intent::ParsedIntent, tools::TOOLS};
 
@@ -12,7 +13,11 @@ const LLM_CONFIDENCE_THRESHOLD: f32 = 0.5;
 /// Use a small LLM to classify intent when other methods fail.
 /// Returns Some(intent) if LLM provides a valid tool match, None otherwise.
 /// Returns "chat" intent if user is just having a conversation.
-pub async fn classify_with_llm(input: &str, model: &str) -> Result<Option<ParsedIntent>> {
+pub async fn classify_with_llm(
+    input: &str,
+    model: &str,
+    request_timeout_secs: u64,
+) -> Result<Option<ParsedIntent>> {
     tracing::debug!("[LLM Classifier] Starting classification for input: '{}' with model: '{}'", input, model);
     
     // Build tool list for prompt
@@ -50,7 +55,9 @@ pub async fn classify_with_llm(input: &str, model: &str) -> Result<Option<Parsed
     
     // Call Ollama
     tracing::debug!("[LLM Classifier] Calling Ollama API at http://localhost:11434/api/generate");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(request_timeout_secs))
+        .build()?;
     let response = match client
         .post("http://localhost:11434/api/generate")
         .json(&serde_json::json!({
@@ -130,4 +137,3 @@ pub async fn classify_with_llm(input: &str, model: &str) -> Result<Option<Parsed
     tracing::debug!("[LLM Classifier] ✗ Could not match response '{}' to any tool or 'chat'", llm_response);
     Ok(None)
 }
-

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
 
 use crate::repo::RepoInfo;
@@ -44,16 +44,19 @@ impl SessionState {
         self.history.push(message);
     }
 
+    /// Update all location-dependent session metadata after an in-app `cd`.
+    pub fn set_cwd(&mut self, cwd: PathBuf) {
+        self.repo_root = find_git_root(&cwd);
+        self.repo_info = RepoInfo::detect(&cwd);
+        self.cwd = cwd;
+    }
+
     /// Record a command output for semantic reference resolution
     pub fn record_output(&mut self, kind: &'static str, summary: &str, content: &str) {
         const MAX_OUTPUTS: usize = 5;
         const MAX_CONTENT: usize = 2000;
 
-        let truncated = if content.len() > MAX_CONTENT {
-            format!("{}...[truncated]", &content[..MAX_CONTENT])
-        } else {
-            content.to_string()
-        };
+        let truncated = truncate_to_bytes(content, MAX_CONTENT);
 
         self.recent_outputs.push_front(RecentOutput {
             kind,
@@ -67,8 +70,33 @@ impl SessionState {
     }
 }
 
-fn find_git_root(start: &PathBuf) -> Option<PathBuf> {
-    let mut current = start.as_path();
+fn truncate_to_bytes(content: &str, max_bytes: usize) -> String {
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let mut end = max_bytes;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &content[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_truncation_preserves_utf8_boundaries() {
+        let content = "🦀".repeat(1_000);
+        let truncated = truncate_to_bytes(&content, 2_000);
+        assert!(truncated.ends_with("...[truncated]"));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+}
+
+fn find_git_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start;
     while let Some(parent) = current.parent() {
         if current.join(".git").exists() {
             return Some(current.to_path_buf());

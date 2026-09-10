@@ -1,9 +1,9 @@
-use std::{fs, path::PathBuf};
+use std::{path::PathBuf, time::Duration};
 
 use tokio::sync::mpsc;
 
 use crate::{
-    commands::{format_error, run_command, run_shell_command},
+    commands::{format_error, run_command_with_timeout, run_shell_command_with_timeout},
     config::Config,
     custom_command_generator::expand_command_handlers,
     file_ops,
@@ -12,7 +12,7 @@ use crate::{
     repo::{ProjectType, RepoInfo},
     session::Role,
     tools::ToolArgs,
-    workflow::{generate_commit_message, generate_commit_message_async, WorkflowKind, WorkflowState},
+    workflow::{generate_commit_message_async, WorkflowKind, WorkflowState},
 };
 
 pub enum AssistantEvent {
@@ -36,6 +36,20 @@ pub trait IntentDispatcher {
     fn record_output(&mut self, kind: &'static str, summary: &str, content: &str);
     fn record_file_access(&mut self, file_path: &str);
     fn record_command_usage(&mut self, command: &str);
+}
+
+fn run_tool_command<D: IntentDispatcher>(
+    dispatcher: &D,
+    cwd: &std::path::Path,
+    program: &str,
+    args: &[&str],
+) -> anyhow::Result<String> {
+    run_command_with_timeout(
+        cwd,
+        program,
+        args,
+        Duration::from_secs(dispatcher.get_config().cmd_timeout_secs),
+    )
 }
 
 /// Dispatch a parsed intent to the appropriate handler.
@@ -151,7 +165,8 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
 
     // Execute the command in the session's cwd
     let cwd = dispatcher.get_session_cwd();
-    match run_shell_command(&cwd, &expanded_cmd) {
+    let timeout = Duration::from_secs(dispatcher.get_config().cmd_timeout_secs);
+    match run_shell_command_with_timeout(&cwd, &expanded_cmd, timeout) {
         Ok(output) => {
             // Record output for semantic reference resolution
             let summary = if output.trim().is_empty() {
@@ -197,7 +212,7 @@ fn handle_shell_repeat<D: IntentDispatcher>(dispatcher: &mut D) {
 
 fn handle_save_work_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_root) = dispatcher.get_session_repo_root() {
-        let status_preview = match run_command(&repo_root, "git", &["status", "--short"]) {
+        let status_preview = match run_tool_command(dispatcher, &repo_root, "git", &["status", "--short"]) {
             Ok(out) => out,
             Err(err) => format!("(git status failed: {err})"),
         };
@@ -248,18 +263,22 @@ fn handle_stage_intent<D: IntentDispatcher>(dispatcher: &mut D, args: &ToolArgs)
 
 fn handle_commit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_root) = dispatcher.get_session_repo_root() {
-        let suggested = generate_commit_message(dispatcher.get_config(), &repo_root)
-            .unwrap_or_else(|| "chore: update".to_string());
+        let idx = dispatcher.pending_placeholder();
+        let tx = dispatcher.get_assistant_tx();
+        let config = dispatcher.get_config().clone();
         dispatcher.set_pending_workflow(WorkflowState {
-            kind: WorkflowKind::CommitOnlyConfirm {
-                suggested: suggested.clone(),
-            },
-            repo_root,
+            kind: WorkflowKind::CommitMessagePending,
+            repo_root: repo_root.clone(),
         });
-        dispatcher.reply(format!(
-            "Staged commit plan:\n- git commit with message:\n{}\n- (push not included)\nPress Enter (or type 'yes') to accept, or type a custom message. 'cancel' to abort.",
-            suggested
-        ));
+        tokio::spawn(async move {
+            let suggested = generate_commit_message_async(&config, &repo_root)
+                .await
+                .unwrap_or_else(|| "chore: update".to_string());
+            let _ = tx.send(AssistantEvent::Completed {
+                idx,
+                content: Some(format!("__COMMIT_PLAN__:{suggested}")),
+            });
+        });
     } else {
         dispatcher.reply("No git repository detected; cannot commit.");
     }
@@ -269,9 +288,9 @@ fn handle_status_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     let root = dispatcher
         .get_session_repo_root()
         .unwrap_or_else(|| dispatcher.get_session_cwd());
-    let status = run_command(&root, "git", &["status", "--short"])
+    let status = run_tool_command(dispatcher, &root, "git", &["status", "--short"])
         .unwrap_or_else(|e| format!("(git status failed: {})", format_error(&e)));
-    let diffstat = run_command(&root, "git", &["diff", "--stat"])
+    let diffstat = run_tool_command(dispatcher, &root, "git", &["diff", "--stat"])
         .unwrap_or_else(|e| format!("(git diff --stat failed: {})", format_error(&e)));
     
     // Record output for semantic reference resolution
@@ -299,7 +318,8 @@ fn handle_find_todos_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         .get_session_repo_root()
         .unwrap_or_else(|| dispatcher.get_session_cwd());
     let pattern = r"(?i)^\s*(?://|#|;|<!--|/\*+)\s*(TODO|FIXME)|^\s*(TODO|FIXME)";
-    match run_command(
+    match run_tool_command(
+        dispatcher,
         &root,
         "rg",
         &["--no-heading", "--line-number", "--pcre2", pattern],
@@ -322,7 +342,7 @@ fn handle_run_tests_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         let (program, args) = repo_info.test_command();
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
         
-        match run_command(&repo_info.root, program, &args_refs) {
+        match run_tool_command(dispatcher, &repo_info.root, program, &args_refs) {
             Ok(out) => dispatcher.reply(format!("{} {} output:\n{}", program, args.join(" "), out)),
             Err(err) => dispatcher.reply(format!("{} {} failed: {}", program, args.join(" "), format_error(&err))),
         }
@@ -344,15 +364,16 @@ fn handle_show_file_intent<D: IntentDispatcher>(
         .or_else(|| parse_show_file(original_input));
 
     if let Some(path) = path {
+        let base = dispatcher
+            .get_session_repo_root()
+            .unwrap_or_else(|| dispatcher.get_session_cwd());
         let resolved = if path.is_absolute() {
             path.clone()
-        } else if let Some(repo) = dispatcher.get_session_repo_root() {
-            repo.join(&path)
         } else {
-            dispatcher.get_session_cwd().join(&path)
+            base.join(&path)
         };
 
-        match fs::read_to_string(&resolved) {
+        match file_ops::read_file(&resolved, &base) {
             Ok(contents) => {
                 // Record output for semantic reference resolution
                 let line_count = contents.lines().count();
@@ -503,8 +524,8 @@ fn handle_write_file_intent<D: IntentDispatcher>(
     let overwrite = file_ops::file_exists(&target_path);
 
     // Show preview and ask for confirmation
-    let preview = if content.len() > 200 {
-        format!("{}...\n[{} bytes total]", &content[..200], content.len())
+    let preview = if content.chars().count() > 200 {
+        format!("{}...\n[{} bytes total]", truncate_for_preview(&content, 200), content.len())
     } else {
         content.clone()
     };
@@ -542,6 +563,10 @@ fn parse_show_file(prompt: &str) -> Option<PathBuf> {
     None
 }
 
+fn truncate_for_preview(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 fn extract_path_from_list_command(input: &str) -> Option<String> {
     let lower = input.to_lowercase();
     
@@ -573,7 +598,7 @@ fn handle_build_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         let (program, args) = repo_info.build_command();
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
         
-        match run_command(&repo_info.root, program, &args_refs) {
+        match run_tool_command(dispatcher, &repo_info.root, program, &args_refs) {
             Ok(out) => dispatcher.reply(format!("{} {} output:\n{}", program, args.join(" "), out)),
             Err(err) => dispatcher.reply(format!("{} {} failed: {}", program, args.join(" "), format_error(&err))),
         }
@@ -638,7 +663,7 @@ MODES
         • Macro expansion for composable workflows
 
 KEY BINDINGS
-    Esc / q             Exit the application
+    Esc / q             Exit the application (`q` when input is empty)
     Ctrl+S              Toggle between Chat and Shell mode
     Tab                 Autocomplete (context-aware)
     Enter               Submit current input
@@ -662,6 +687,7 @@ COMMON COMMANDS
     find todos          Search for TODO/FIXME comments
 
   Project Commands
+    cd <directory>      Change the session directory and re-detect the project
     build               Build the project (cargo/npm/etc.)
     run tests           Run project test suite
     explain project     Show project type and structure

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -53,10 +54,13 @@ pub struct EmbeddingCache {
 
 impl EmbeddingCache {
     /// Create a new embedding cache (embeddings not yet loaded).
-    pub fn new(model: Option<&str>) -> Self {
+    pub fn new(model: Option<&str>, request_timeout_secs: u64) -> Self {
         Self {
             examples: HashMap::new(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(request_timeout_secs))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             model: model.unwrap_or(DEFAULT_EMBEDDING_MODEL).to_string(),
         }
     }
@@ -244,4 +248,3 @@ mod tests {
         assert_eq!(sim, 0.0);
     }
 }
-
