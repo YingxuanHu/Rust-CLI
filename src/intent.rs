@@ -205,6 +205,13 @@ pub fn parse_edit_request(input: &str) -> Option<ToolArgs> {
 pub fn quick_match(input: &str) -> Option<ParsedIntent> {
     let trimmed = input.trim();
 
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "start" | "getting started" | "show me around" | "what should i do first"
+    ) {
+        return Some(ParsedIntent::new("getting_started", 1.0));
+    }
+
     if let Some(args) = parse_edit_request(trimmed) {
         return Some(ParsedIntent {
             tool: "edit_file".to_string(),
@@ -254,6 +261,11 @@ mod tests {
         let intent = quick_match("$ ls -la").unwrap();
         assert_eq!(intent.tool, "shell");
         assert_eq!(intent.args.command, Some("ls -la".to_string()));
+    }
+
+    #[test]
+    fn quick_match_recognizes_getting_started_phrases() {
+        assert_eq!(quick_match("show me around").unwrap().tool, "getting_started");
     }
 
     #[test]

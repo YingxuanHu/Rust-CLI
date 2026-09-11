@@ -10,16 +10,19 @@ alvin.hu@mail.utoronto.ca
 
 ---
 
-## Install in Three Commands
+## Start in One Command
 
 From this repository, run `bash scripts/install.sh --with-models`. Then, from
 the project you want to work in, run:
 
 ```bash
-llm_cli setup
-llm_cli doctor --full
 llm_cli
 ```
+
+The CLI opens with context-aware suggestions such as `explain this project`,
+`run tests`, and `what changed`; you can also type `show me around` at any
+time. `llm_cli doctor --full` is only needed if startup reports a setup issue,
+and `llm_cli setup` is optional when you want to customize configuration.
 
 The full manual and troubleshooting guide is in [docs/INSTALL.md](docs/INSTALL.md).
 After the first versioned release is published, the same installer supports a
@@ -200,11 +203,11 @@ After starting, the full-screen interface opens with a conversation panel at top
 
 A `help` page is available inside the app with 'help' or '?' in `Chat` mode, showing all available commands and key bindings.
 
-Before launching the TUI, `llm_cli doctor` provides a read-only readiness
-report for Ollama, the configured models, optional developer tools, project
-tooling, and the shell audit-log path. Use `llm_cli doctor --full` to include
-the embedding and intent-classifier models. `llm_cli health --full` remains a
-focused compatibility check for the model runtime.
+If the CLI cannot start, `llm_cli doctor` provides a read-only readiness report
+for Ollama, configured models, optional developer tools, project tooling, and
+the shell audit-log path. Use `llm_cli doctor --full` to include the embedding
+and intent-classifier models. `llm_cli health --full` remains a focused
+compatibility check for the model runtime.
 
 Use `cd <directory>` inside the TUI to change its session directory. The CLI
 then re-detects the project and Git root; `$ cd` and `! cd` use the same

@@ -126,6 +126,10 @@ pub fn dispatch_intent<D: IntentDispatcher>(
             handle_rollback_edit_intent(dispatcher);
             true
         }
+        "getting_started" => {
+            handle_getting_started_intent(dispatcher);
+            true
+        }
         "build" => {
             handle_build_intent(dispatcher);
             true
@@ -148,6 +152,45 @@ pub fn dispatch_intent<D: IntentDispatcher>(
     }
     
     handled
+}
+
+/// A short, contextual first-use guide. It deliberately uses the same natural
+/// language people can type, instead of requiring a command vocabulary.
+pub fn getting_started_message(repo_info: Option<&RepoInfo>, has_git_repo: bool) -> String {
+    let project = repo_info
+        .map(|info| {
+            let name = info.name.as_deref().unwrap_or("this project");
+            let kind = match &info.project_type {
+                ProjectType::Rust => "Rust",
+                ProjectType::Node => "Node.js",
+                ProjectType::Python => "Python",
+                ProjectType::Go => "Go",
+                ProjectType::Unknown => "project",
+            };
+            format!("You're in {name} ({kind}).")
+        })
+        .unwrap_or_else(|| "You're not in a recognized project yet.".to_string());
+
+    let mut suggestions = vec![project, String::new(), "Try one of these:".to_string()];
+    if repo_info.is_some() {
+        suggestions.push("• `explain this project` — get a quick overview".to_string());
+        suggestions.push("• `run tests` — check that it works".to_string());
+    } else {
+        suggestions.push("• `cd /path/to/project` — switch to your codebase".to_string());
+        suggestions.push("• Ask a question in plain English".to_string());
+    }
+    if has_git_repo {
+        suggestions.push("• `what changed` — see Git status and the diff summary".to_string());
+    }
+    suggestions.push("• `help` — see every available action".to_string());
+    suggestions.push("\nYou can type naturally; I will ask before applying edits or high-impact commands.".to_string());
+    suggestions.join("\n")
+}
+
+fn handle_getting_started_intent<D: IntentDispatcher>(dispatcher: &mut D) {
+    let repo_info = dispatcher.get_session_repo_info();
+    let guide = getting_started_message(repo_info.as_ref(), dispatcher.get_session_repo_root().is_some());
+    dispatcher.reply_scroll_to_top(guide);
 }
 
 pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str) {
@@ -881,6 +924,7 @@ COMMON COMMANDS
     Direct shell executions are recorded in .llm-cli/audit.jsonl by default.
 
   Other
+    show me around      Show contextual starter actions
     help                Show this help message
     ?                   Show this help message (alias)
 
@@ -934,10 +978,32 @@ mod tests {
     use crate::{
         config::Config,
         patch::AppliedPatch,
-        repo::RepoInfo,
+        repo::{ProjectType, RepoInfo},
         session::Role,
         workflow::{WorkflowKind, WorkflowState},
     };
+
+    #[test]
+    fn getting_started_guide_is_contextual_and_uses_plain_language() {
+        let guide = super::getting_started_message(None, false);
+        assert!(guide.contains("cd /path/to/project"));
+        assert!(guide.contains("Ask a question in plain English"));
+        assert!(guide.contains("help"));
+    }
+
+    #[test]
+    fn getting_started_guide_uses_project_specific_next_steps() {
+        let repo = RepoInfo {
+            project_type: ProjectType::Rust,
+            root: PathBuf::from("/project"),
+            name: Some("demo".to_string()),
+            source_dirs: Vec::new(),
+        };
+        let guide = super::getting_started_message(Some(&repo), true);
+        assert!(guide.contains("demo (Rust)"));
+        assert!(guide.contains("run tests"));
+        assert!(guide.contains("what changed"));
+    }
 
     struct TestDispatcher {
         config: Config,

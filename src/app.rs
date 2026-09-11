@@ -36,7 +36,9 @@ use crate::{
 };
 
 pub async fn run(config: Config) -> Result<()> {
-    ollama::ensure_available(&config.model, &config.ollama_host)?;
+    ollama::ensure_available(&config.model, &config.ollama_host).with_context(|| {
+        "run `llm_cli doctor --full` for an actionable setup check"
+    })?;
 
     // Initialize embedding cache for semantic intent matching
     let mut embedding_cache = EmbeddingCache::new(
@@ -177,10 +179,15 @@ impl App {
             "embeddings: disabled"
         };
         let system_msg = format!(
-            "LLM CLI ready. Model: {} ({}). Modes: Chat/Shell (Ctrl+S). History: ↑/↓. Scroll: mouse/PgUp/PgDn. Enter to submit; Esc/q to exit.",
+            "Ready. Local model: {} ({}). Type naturally; `help` lists commands. Press Esc to exit.",
             app.config.model, status
         );
         app.push_recorded(Role::System, system_msg);
+        let welcome = crate::handlers::getting_started_message(
+            app.session.repo_info.as_ref(),
+            app.session.repo_root.is_some(),
+        );
+        app.reply(welcome);
         app
     }
 
@@ -683,14 +690,14 @@ impl App {
 
         self.session.set_cwd(canonical.clone());
         self.update_ghost_text();
-        let project = self
-            .session
-            .repo_info
-            .as_ref()
-            .and_then(|info| info.name.as_deref())
-            .map(|name| format!("; project: {name}"))
-            .unwrap_or_default();
-        self.reply(format!("Working directory changed to {}{}", canonical.display(), project));
+        let guide = crate::handlers::getting_started_message(
+            self.session.repo_info.as_ref(),
+            self.session.repo_root.is_some(),
+        );
+        self.reply(format!(
+            "Working directory changed to {}.\n\n{}",
+            canonical.display(), guide
+        ));
     }
 
     fn record_input_history(&mut self, entry: String) {

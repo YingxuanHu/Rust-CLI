@@ -181,9 +181,12 @@ fi
 cat <<'EOF'
 
 Next steps, from the repository you want to work in:
-  llm_cli setup
-  llm_cli doctor --full
+  cd /path/to/project
   llm_cli
+
+Optional:
+  llm_cli doctor --full  # Diagnose setup problems
+  llm_cli setup          # Create a commented configuration file
 
 Pass --with-models to this installer to pull the default local models now.
 EOF

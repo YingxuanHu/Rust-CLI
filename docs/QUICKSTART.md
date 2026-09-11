@@ -42,16 +42,22 @@ cargo run --release
 
 ## First Run
 
-On first run, you'll see:
+On first run, the CLI gives a short, contextual guide instead of requiring a
+command vocabulary:
 
 ```
-Initializing embedding cache (this may take a moment)...
-Embedding cache ready!
-LLM CLI ready. Model: llama3 (embeddings: ready). 
-Modes: Chat/Shell (Ctrl+S). History: ↑/↓. Enter to submit; Esc or empty-input q to exit.
+Ready. Local model: llama3 (embeddings: ready).
+
+You're in my-project (Rust).
+Try one of these:
+• explain this project — get a quick overview
+• run tests — check that it works
+• what changed — see Git status and the diff summary
 ```
 
-This creates `.llm-cli/embeddings.toml` (takes a few seconds, only happens once per project).
+Type naturally, or type `show me around` at any time to reopen this guide.
+This creates `.llm-cli/embeddings.toml` when embeddings are available (takes a
+few seconds, then is reused in later sessions).
 
 ## Try It Out
 

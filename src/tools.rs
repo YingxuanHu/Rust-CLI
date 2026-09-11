@@ -53,6 +53,17 @@ impl ToolArgs {
 /// All available tools in the system.
 pub static TOOLS: &[Tool] = &[
     Tool {
+        name: "getting_started",
+        description: "Show a short, contextual guide to the easiest first actions",
+        examples: &[
+            "getting started",
+            "show me around",
+            "what should I do first",
+            "start",
+        ],
+        requires_repo: false,
+    },
+    Tool {
         name: "save_work",
         description: "Stage all changes, generate a commit message, commit, and push to remote",
         examples: &[

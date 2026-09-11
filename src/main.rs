@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
             let path = config_path.unwrap_or_else(config::default_config_path);
             if config::Config::initialize_file(&path, force)? {
                 println!("Created starter configuration at {}", path.display());
-                println!("Next: pull the required Ollama models, then run `llm_cli doctor --full`.");
+                println!("Next: run `llm_cli`. If setup is incomplete, run `llm_cli doctor --full`.");
             } else {
                 println!(
                     "Configuration already exists at {}. Use `llm_cli setup --force` to replace it.",

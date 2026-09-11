@@ -18,17 +18,17 @@ you want to choose different ones.
 Then, in the repository where you want to use the assistant:
 
 ```bash
-llm_cli setup
-llm_cli doctor --full
 llm_cli
 ```
 
-`setup` creates `.llm-cli/config.toml` without replacing an existing file.
-Use `llm_cli setup --force` only when you intentionally want a fresh starter
-configuration. `doctor --full` gives a read-only readiness report for the
-configured models, Ollama, project tooling, Git, ripgrep, and the audit-log
-location. `health --full` remains available when you only want to check all
-three configured local models.
+The CLI opens with a short set of context-aware starter actions, so no command
+syntax is required before asking your first question. `setup` is optional: it
+creates `.llm-cli/config.toml` without replacing an existing file. Use `llm_cli
+setup --force` only when you intentionally want a fresh starter configuration.
+Run `llm_cli doctor --full` only if startup reports a problem or you want a
+read-only readiness report for the configured models, Ollama, project tooling,
+Git, ripgrep, and the audit-log location. `health --full` remains available
+when you only want to check all three configured local models.
 
 ## Binary release install (no Cargo required)
 
