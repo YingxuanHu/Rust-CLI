@@ -164,10 +164,8 @@ if ! command -v ollama >/dev/null 2>&1; then
   cat <<'EOF'
 
 llm_cli is installed, but Ollama is not available yet.
-Install Ollama from https://ollama.com, then pull the required models:
-  ollama pull llama3
-  ollama pull nomic-embed-text
-  ollama pull qwen2:1.5b
+Install Ollama from https://ollama.com, then run:
+  llm_cli
 EOF
   exit 0
 fi
@@ -184,9 +182,13 @@ Next steps, from the repository you want to work in:
   cd /path/to/project
   llm_cli
 
+On first run, llm_cli checks its local setup and asks before downloading a
+missing chat model.
+
 Optional:
-  llm_cli doctor --full  # Diagnose setup problems
+  llm_cli init --full    # Also download routing models
+  llm_cli doctor --full  # Inspect setup problems without changing anything
   llm_cli setup          # Create a commented configuration file
 
-Pass --with-models to this installer to pull the default local models now.
+Pass --with-models to this installer to pull all default local models now.
 EOF

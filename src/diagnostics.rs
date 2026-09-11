@@ -283,7 +283,11 @@ fn report_model(
         },
         label,
         format!("'{model}' is not installed"),
-        Some(format!("run `ollama pull \"{model}\"`")),
+        Some(if required {
+            "run `llm_cli init` to download it".to_string()
+        } else {
+            "run `llm_cli init --full` to download it".to_string()
+        }),
     );
 }
 
@@ -453,7 +457,7 @@ mod tests {
 
         let report = run_doctor_with_probe(&Config::default(), false, &probe);
         assert!(report.has_blockers());
-        assert!(report.render().contains("ollama pull \"llama3\""));
+        assert!(report.render().contains("llm_cli init"));
     }
 
     #[test]

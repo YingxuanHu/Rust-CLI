@@ -36,10 +36,6 @@ use crate::{
 };
 
 pub async fn run(config: Config) -> Result<()> {
-    ollama::ensure_available(&config.model, &config.ollama_host).with_context(|| {
-        "run `llm_cli doctor --full` for an actionable setup check"
-    })?;
-
     // Initialize embedding cache for semantic intent matching
     let mut embedding_cache = EmbeddingCache::new(
         Some(&config.embedding_model),

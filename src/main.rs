@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 mod app;
 mod audit;
+mod bootstrap;
 mod command_policy;
 mod commands;
 mod completion;
@@ -61,6 +62,15 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Check local AI setup and offer to download missing models
+    Init {
+        /// Also download the optional embedding and intent-classifier models
+        #[arg(long)]
+        full: bool,
+        /// Download missing models without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Inspect local prerequisites and project tooling without changing anything
     Doctor {
         /// Also check the embedding and intent-classifier models
@@ -88,7 +98,7 @@ async fn main() -> Result<()> {
             let path = config_path.unwrap_or_else(config::default_config_path);
             if config::Config::initialize_file(&path, force)? {
                 println!("Created starter configuration at {}", path.display());
-                println!("Next: run `llm_cli`. If setup is incomplete, run `llm_cli doctor --full`.");
+                println!("Next: run `llm_cli`. It will guide you through missing local setup.");
             } else {
                 println!(
                     "Configuration already exists at {}. Use `llm_cli setup --force` to replace it.",
@@ -141,6 +151,13 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Command::Init { full, yes } => {
+            let config = config::Config::load(config_path).context("loading config")?;
+            let outcome = bootstrap::initialize(&config, full, yes)?;
+            if outcome.needs_user_action() {
+                std::process::exit(2);
+            }
+        }
         Command::Audit { tail } => {
             let config = config::Config::load(config_path).context("loading config")?;
             let cwd = std::env::current_dir().context("reading current directory")?;
@@ -149,6 +166,13 @@ async fn main() -> Result<()> {
         }
         Command::Run => {
             let config = config::Config::load(config_path).context("loading config")?;
+            let outcome = bootstrap::prepare_for_launch(&config)?;
+            if outcome.needs_user_action() {
+                std::process::exit(2);
+            }
+            if matches!(outcome, bootstrap::BootstrapOutcome::Cancelled) {
+                return Ok(());
+            }
             app::run(config).await?;
         }
     }

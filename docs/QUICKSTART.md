@@ -15,16 +15,13 @@ ollama list
 ollama serve
 ```
 
-## Required Models
+## Optional Routing Models
 
-Download the required models for the intent system:
+The first launch offers to download the required chat model. For local semantic
+matching and intent classification, use the guided command:
 
 ```bash
-# For embeddings (Tier 2)
-ollama pull nomic-embed-text
-
-# For LLM classification (Tier 3)
-ollama pull qwen2:1.5b      # Default: balanced speed and accuracy
+llm_cli init --full
 ```
 
 ## Build and Run
@@ -33,7 +30,7 @@ ollama pull qwen2:1.5b      # Default: balanced speed and accuracy
 # Build the project
 cargo build --release
 
-# Run the TUI
+# Run the TUI (the first launch guides missing local setup)
 ./target/release/llm_cli
 
 # Or just:

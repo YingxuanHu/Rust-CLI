@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -7,6 +7,18 @@ pub struct OllamaStatus {
     pub reachable: bool,
     pub has_model: bool,
     pub raw_output: String,
+}
+
+/// Whether the Ollama executable can be launched from the current PATH.
+/// This deliberately does not require the daemon to be running.
+pub fn command_available() -> bool {
+    Command::new("ollama")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 pub fn check_status(model: &str, ollama_host: &str) -> Result<OllamaStatus> {
@@ -48,16 +60,18 @@ pub fn check_status(model: &str, ollama_host: &str) -> Result<OllamaStatus> {
     })
 }
 
-pub fn ensure_available(model: &str, ollama_host: &str) -> Result<()> {
-    let status = check_status(model, ollama_host)?;
-    if !status.reachable {
-        bail!(
-            "Cannot reach Ollama daemon. Is it running? Raw output: {}",
-            status.raw_output
-        );
-    }
-    if !status.has_model {
-        bail!("Model '{model}' not found locally. Pull it with: ollama pull \"{model}\"");
+/// Download a model through Ollama while preserving its progress output for
+/// the person running the bootstrap command. Model names are command
+/// arguments, never shell input.
+pub fn pull_model(model: &str, ollama_host: &str) -> Result<()> {
+    let status = Command::new("ollama")
+        .arg("pull")
+        .arg(model)
+        .env("OLLAMA_HOST", ollama_host)
+        .status()
+        .with_context(|| format!("starting download for model '{model}'"))?;
+    if !status.success() {
+        bail!("Ollama could not download model '{model}' (exit status {status})");
     }
     Ok(())
 }
