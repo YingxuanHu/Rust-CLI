@@ -30,6 +30,23 @@ configured models, Ollama, project tooling, Git, ripgrep, and the audit-log
 location. `health --full` remains available when you only want to check all
 three configured local models.
 
+## Binary release install (no Cargo required)
+
+Once this repository has a versioned GitHub release, download the installer and
+run it locally (rather than piping it to a shell):
+
+```bash
+curl -fLO https://raw.githubusercontent.com/YingxuanHu/Rust-CLI/main/scripts/install.sh
+bash install.sh --binary --with-models
+```
+
+The installer selects the matching macOS (Apple Silicon or Intel) or Linux
+x86_64 archive, downloads the release's `SHA256SUMS`, verifies the archive
+before installing it, and places `llm_cli` in `~/.local/bin` by default. Use
+`--version vX.Y.Z` for a specific release and `--install-dir DIRECTORY` to
+choose a different location. Windows releases are published as `.zip` files;
+extract the matching archive and add its folder to `PATH`.
+
 Direct shell activity is recorded locally after commands run. Inspect it with
 `llm_cli audit` (the latest 20 records) or `llm_cli audit --tail 0` (all
 records); neither command modifies the audit log.

@@ -22,6 +22,8 @@ llm_cli
 ```
 
 The full manual and troubleshooting guide is in [docs/INSTALL.md](docs/INSTALL.md).
+After the first versioned release is published, the same installer supports a
+verified no-Cargo path: `bash install.sh --binary --with-models`.
 
 ---
 

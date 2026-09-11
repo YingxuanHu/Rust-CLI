@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require a tag matching the package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          expected_tag="v${version}"
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "$expected_tag"
+
+  build:
+    needs: verify-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Unix binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          directory="llm_cli-${TARGET}"
+          mkdir -p "$directory"
+          cp "target/${TARGET}/release/llm_cli" "$directory/llm_cli"
+          tar -czf "${directory}.tar.gz" "$directory"
+      - name: Package Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $directory = "llm_cli-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          Copy-Item "target/$env:TARGET/release/llm_cli.exe" "$directory/llm_cli.exe"
+          Compress-Archive -Path $directory -DestinationPath "$directory.zip"
+      - name: Stage release asset
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-${{ matrix.target }}
+          path: llm_cli-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v7
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create and verify SHA-256 checksums
+        shell: bash
+        working-directory: release-assets
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(find . -maxdepth 1 -type f -printf '%f\n' | sort)
+          test "${#files[@]}" -eq 4
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create or update GitHub release
+        shell: bash
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ./* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" ./* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "llm_cli $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
