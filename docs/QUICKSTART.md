@@ -273,7 +273,7 @@ Saved custom workflows move to Tier 1 on later use.
 - Read [AUTOCOMPLETION.md](AUTOCOMPLETION.md) for ghost-text behavior
 - Read [SEMANTIC_CONTEXT.md](SEMANTIC_CONTEXT.md) for reference handling
 - Customize your config in `.llm-cli/config.toml` (optional)
-- Run `llm_cli health --full` before troubleshooting a model issue.
+- Run `llm_cli doctor --full` before troubleshooting a setup or model issue.
 
 The system stays local, with deterministic routing for supported actions and
 chat as the fallback for everything else.

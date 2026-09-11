@@ -19,13 +19,16 @@ Then, in the repository where you want to use the assistant:
 
 ```bash
 llm_cli setup
-llm_cli health --full
+llm_cli doctor --full
 llm_cli
 ```
 
 `setup` creates `.llm-cli/config.toml` without replacing an existing file.
 Use `llm_cli setup --force` only when you intentionally want a fresh starter
-configuration. `health --full` checks all three configured local models.
+configuration. `doctor --full` gives a read-only readiness report for the
+configured models, Ollama, project tooling, Git, ripgrep, and the audit-log
+location. `health --full` remains available when you only want to check all
+three configured local models.
 
 ## Manual path
 
@@ -49,9 +52,9 @@ configuration. `health --full` checks all three configured local models.
 
 ## Verification and troubleshooting
 
-Use `llm_cli --help` for CLI help and `llm_cli health --full` for dependency
-checks. The repository also provides `bash scripts/health.sh`, which checks
-the toolchain and the default models before a source-tree run.
+Use `llm_cli --help` for CLI help and `llm_cli doctor --full` for the complete
+read-only dependency check. The repository also provides
+`bash scripts/health.sh`, which checks the source-tree toolchain and default models.
 
 If `llm_cli` is not found after installing, ensure Cargo's binary directory is
 on your `PATH` (rustup prints the required setup command during installation).

@@ -17,7 +17,7 @@ the project you want to work in, run:
 
 ```bash
 llm_cli setup
-llm_cli health --full
+llm_cli doctor --full
 llm_cli
 ```
 
@@ -193,6 +193,12 @@ This section is a “from zero to running” setup. For OS-specific install deta
 After starting, the full-screen interface opens with a conversation panel at top and an input area at bottom.
 
 A `help` page is available inside the app with 'help' or '?' in `Chat` mode, showing all available commands and key bindings.
+
+Before launching the TUI, `llm_cli doctor` provides a read-only readiness
+report for Ollama, the configured models, optional developer tools, project
+tooling, and the shell audit-log path. Use `llm_cli doctor --full` to include
+the embedding and intent-classifier models. `llm_cli health --full` remains a
+focused compatibility check for the model runtime.
 
 Use `cd <directory>` inside the TUI to change its session directory. The CLI
 then re-detects the project and Git root; `$ cd` and `! cd` use the same

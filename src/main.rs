@@ -12,6 +12,7 @@ mod completion;
 mod config;
 mod context;
 mod custom_command_generator;
+mod diagnostics;
 mod embedding;
 mod file_ops;
 mod frecency;
@@ -60,6 +61,12 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Inspect local prerequisites and project tooling without changing anything
+    Doctor {
+        /// Also check the embedding and intent-classifier models
+        #[arg(long)]
+        full: bool,
+    },
     /// Launch the TUI (default)
     Run,
 }
@@ -75,7 +82,7 @@ async fn main() -> Result<()> {
             let path = config_path.unwrap_or_else(config::default_config_path);
             if config::Config::initialize_file(&path, force)? {
                 println!("Created starter configuration at {}", path.display());
-                println!("Next: pull the required Ollama models, then run `llm_cli health --full`.");
+                println!("Next: pull the required Ollama models, then run `llm_cli doctor --full`.");
             } else {
                 println!(
                     "Configuration already exists at {}. Use `llm_cli setup --force` to replace it.",
@@ -119,6 +126,14 @@ async fn main() -> Result<()> {
                 }
             }
             println!("Ollama at {} is reachable and chat model '{model}' is available.", config.ollama_host);
+        }
+        Command::Doctor { full } => {
+            let config = config::Config::load(config_path).context("loading config")?;
+            let report = diagnostics::run_doctor(&config, full);
+            println!("{}", report.render());
+            if report.has_blockers() {
+                std::process::exit(2);
+            }
         }
         Command::Run => {
             let config = config::Config::load(config_path).context("loading config")?;

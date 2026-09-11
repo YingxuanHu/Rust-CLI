@@ -51,7 +51,7 @@ cat <<'EOF'
 
 Next steps, from the repository you want to work in:
   llm_cli setup
-  llm_cli health --full
+  llm_cli doctor --full
   llm_cli
 
 Pass --with-models to this installer to pull the default local models now.
