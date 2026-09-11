@@ -1,6 +1,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use crate::{
+    command_policy::CommandAssessment,
     commands::{
         format_error, run_command_with_timeout, run_command_with_timeout_with_env,
         split_commit_message,
@@ -44,12 +45,23 @@ pub enum WorkflowKind {
         commands: Vec<String>,
         combined_command: String,
     },
+    /// A direct shell command matched the high-impact policy. The command is
+    /// already expanded, so confirmation applies to exactly what will run.
+    ShellCommandConfirm {
+        command: String,
+        assessment: CommandAssessment,
+    },
     ApplyDiff { review: PatchReview },
 }
 
 pub trait WorkflowResponder {
     fn reply(&mut self, content: impl Into<String>);
+    /// Execute a command through the normal policy path. Existing workflows
+    /// use this so generated commands still receive a risk review.
     fn execute_shell_command(&mut self, cmd: &str);
+    /// Execute the exact command a user just approved after an elevated-risk
+    /// prompt. This avoids asking the same confirmation twice.
+    fn execute_approved_shell_command(&mut self, cmd: &str);
     fn command_timeout_secs(&self) -> u64;
     fn set_last_applied_patch(&mut self, patch: AppliedPatch);
 }
@@ -105,9 +117,32 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
         } => {
             handle_chat_commands_confirm(responder, &workflow.repo_root, prompt, original_query, commands, combined_command);
         }
+        WorkflowKind::ShellCommandConfirm {
+            command,
+            assessment,
+        } => {
+            handle_shell_command_confirm(responder, prompt, command, assessment);
+        }
         WorkflowKind::ApplyDiff { review } => {
             handle_apply_diff(responder, &workflow.repo_root, prompt, review);
         }
+    }
+}
+
+fn handle_shell_command_confirm<R: WorkflowResponder>(
+    responder: &mut R,
+    prompt: &str,
+    command: String,
+    assessment: CommandAssessment,
+) {
+    if matches!(prompt.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+        responder.reply(format!(
+            "Executing approved {} command.",
+            assessment.risk
+        ));
+        responder.execute_approved_shell_command(&command);
+    } else {
+        responder.reply("High-impact command cancelled.");
     }
 }
 
@@ -741,7 +776,7 @@ fn is_shell_command(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::{fs, path::{Path, PathBuf}, time::Duration};
 
     use tempfile::TempDir;
 
@@ -766,6 +801,10 @@ mod tests {
         }
 
         fn execute_shell_command(&mut self, cmd: &str) {
+            self.executed_commands.push(cmd.to_string());
+        }
+
+        fn execute_approved_shell_command(&mut self, cmd: &str) {
             self.executed_commands.push(cmd.to_string());
         }
 
@@ -902,5 +941,27 @@ mod tests {
 
         assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after\n");
         assert!(responder.last_applied_patch.is_some());
+    }
+
+    #[test]
+    fn elevated_shell_workflow_executes_only_after_confirmation() {
+        let mut responder = TestResponder::default();
+        let workflow = WorkflowState {
+            kind: WorkflowKind::ShellCommandConfirm {
+                command: "rm -rf generated".to_string(),
+                assessment: crate::command_policy::assess_shell_command("rm -rf generated"),
+            },
+            repo_root: PathBuf::from("."),
+        };
+
+        handle_workflow_response(&mut responder, workflow.clone(), "no");
+        assert!(responder.executed_commands.is_empty());
+        assert!(responder.replies.iter().any(|reply| reply.contains("cancelled")));
+
+        handle_workflow_response(&mut responder, workflow, "yes");
+        assert_eq!(
+            responder.executed_commands,
+            vec!["rm -rf generated".to_string()]
+        );
     }
 }

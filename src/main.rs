@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod audit;
+mod command_policy;
 mod commands;
 mod completion;
 mod config;

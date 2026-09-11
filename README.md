@@ -115,6 +115,14 @@ Supports two modes toggled with Ctrl+S:
 
 In Chat mode, prefix commands with `$` or `!` for shell execution. Bang shortcuts (`!!` for last command, `!prefix` for last command starting with prefix) provide bash-style convenience. When the LLM suggests shell commands, users must confirm before execution.
 
+The direct shell path classifies commands before running them. Read-only commands
+run normally; high-impact commands—such as deletion, permission changes,
+redirection, command interpreters, pushes/publishes, and network tools—show the
+exact expanded command and require a second explicit confirmation. Every direct
+shell execution is appended to a project-local JSON Lines audit log (default:
+`.llm-cli/audit.jsonl`). The log redacts common credential flags and headers;
+it is an execution record, not a security sandbox.
+
 #### Git Workflows (multi-step)
 
 **Save work**: Shows plan with status preview, asks confirmation, stages changes, generates commit message based on staged diff, lets user accept/override message, commits, and pushes. Execution report shows results.
@@ -258,6 +266,7 @@ When the LLM suggests shell commands, type:
   - `request_timeout_secs = 60`
   - `generate_commit_message = true`
   - `history_path = ".llm-cli/history.jsonl"`
+  - `audit_path = ".llm-cli/audit.jsonl"` (or `LLM_CLI_AUDIT_PATH`)
   - `embedding_cache_path = ".llm-cli/embeddings.toml"`
   - `embedding_model = "nomic-embed-text"`
   - `classifier_model = "qwen2:1.5b"`

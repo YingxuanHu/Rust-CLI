@@ -3,6 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::{
+    audit,
+    command_policy::{self, CommandRisk},
     commands::{format_error, run_command_with_timeout, run_shell_command_with_timeout},
     config::Config,
     custom_command_generator::expand_command_handlers,
@@ -175,16 +177,56 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
         cmd.to_string()
     };
 
-    // Execute the command in the session's cwd
+    let assessment = command_policy::assess_shell_command(&expanded_cmd);
+    if assessment.requires_confirmation() {
+        let reasons = assessment
+            .reasons
+            .iter()
+            .map(|reason| format!("• {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        dispatcher.reply(format!(
+            "Approval required before running this {} shell command.\n\n{}\n\n$ {}\n\nPress Enter (or type 'yes') to run it, or type 'no' to cancel.",
+            assessment.risk, reasons, expanded_cmd
+        ));
+        dispatcher.set_pending_workflow(WorkflowState {
+            kind: WorkflowKind::ShellCommandConfirm {
+                command: expanded_cmd,
+                assessment,
+            },
+            repo_root: dispatcher
+                .get_session_repo_root()
+                .unwrap_or_else(|| dispatcher.get_session_cwd()),
+        });
+        return;
+    }
+
+    execute_shell_command(dispatcher, &expanded_cmd, assessment.risk);
+}
+
+/// Run a command that has already passed an explicit high-impact confirmation.
+/// This is called only by the matching workflow response, and deliberately
+/// skips reclassification so a single confirmation cannot loop forever.
+pub fn handle_approved_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str) {
+    let assessment = command_policy::assess_shell_command(cmd);
+    execute_shell_command(dispatcher, cmd, assessment.risk);
+}
+
+fn execute_shell_command<D: IntentDispatcher>(
+    dispatcher: &mut D,
+    command: &str,
+    risk: CommandRisk,
+) {
     let cwd = dispatcher.get_session_cwd();
     let timeout = Duration::from_secs(dispatcher.get_config().cmd_timeout_secs);
-    match run_shell_command_with_timeout(&cwd, &expanded_cmd, timeout) {
+    match run_shell_command_with_timeout(&cwd, command, timeout) {
         Ok(output) => {
+            record_shell_audit(dispatcher, &cwd, command, risk, "completed", output.len());
             // Record output for semantic reference resolution
             let summary = if output.trim().is_empty() {
-                format!("Ran: {} (no output)", expanded_cmd)
+                format!("Ran: {} (no output)", command)
             } else {
-                format!("Ran: {} (success)", expanded_cmd)
+                format!("Ran: {} (success)", command)
             };
             dispatcher.record_output("command", &summary, &output);
             
@@ -195,8 +237,29 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
             }
         }
         Err(err) => {
+            record_shell_audit(dispatcher, &cwd, command, risk, "failed", 0);
             dispatcher.reply(format!("Error: {}", format_error(&err)));
         }
+    }
+}
+
+fn record_shell_audit<D: IntentDispatcher>(
+    dispatcher: &D,
+    cwd: &std::path::Path,
+    command: &str,
+    risk: CommandRisk,
+    outcome: &'static str,
+    output_bytes: usize,
+) {
+    if let Err(error) = audit::append_shell_execution(
+        &dispatcher.get_config().audit_path,
+        cwd,
+        command,
+        risk,
+        outcome,
+        output_bytes,
+    ) {
+        tracing::warn!(%error, "could not append shell audit record");
     }
 }
 
@@ -814,6 +877,8 @@ COMMON COMMANDS
     $ <command>         Execute a shell command
     ! <command>         Execute a shell command (alias)
     !!                  Repeat last shell command
+    High-impact commands are shown and require explicit confirmation.
+    Direct shell executions are recorded in .llm-cli/audit.jsonl by default.
 
   Other
     help                Show this help message
@@ -857,4 +922,124 @@ For specific questions, just ask naturally: "How do I stage specific files?"
 "#;
 
     dispatcher.reply_scroll_to_top(help_text.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use tokio::sync::mpsc;
+
+    use super::{handle_shell_dispatch, AssistantEvent, IntentDispatcher};
+    use crate::{
+        config::Config,
+        patch::AppliedPatch,
+        repo::RepoInfo,
+        session::Role,
+        workflow::{WorkflowKind, WorkflowState},
+    };
+
+    struct TestDispatcher {
+        config: Config,
+        cwd: PathBuf,
+        replies: Vec<String>,
+        pending: Option<WorkflowState>,
+        tx: mpsc::UnboundedSender<AssistantEvent>,
+        history: Vec<String>,
+    }
+
+    impl TestDispatcher {
+        fn new(cwd: PathBuf) -> Self {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            Self {
+                config: Config::default(),
+                cwd,
+                replies: Vec::new(),
+                pending: None,
+                tx,
+                history: Vec::new(),
+            }
+        }
+    }
+
+    impl IntentDispatcher for TestDispatcher {
+        fn reply(&mut self, content: impl Into<String>) {
+            self.replies.push(content.into());
+        }
+
+        fn reply_scroll_to_top(&mut self, content: impl Into<String>) {
+            self.reply(content);
+        }
+
+        fn push_recorded(&mut self, _role: Role, _content: impl Into<String>) -> usize {
+            0
+        }
+
+        fn set_pending_workflow(&mut self, workflow: WorkflowState) {
+            self.pending = Some(workflow);
+        }
+
+        fn get_session_cwd(&self) -> PathBuf {
+            self.cwd.clone()
+        }
+
+        fn get_session_repo_root(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn get_session_repo_info(&self) -> Option<RepoInfo> {
+            None
+        }
+
+        fn get_input_history(&self) -> &[String] {
+            &self.history
+        }
+
+        fn get_config(&self) -> &Config {
+            &self.config
+        }
+
+        fn get_assistant_tx(&self) -> mpsc::UnboundedSender<AssistantEvent> {
+            self.tx.clone()
+        }
+
+        fn pending_placeholder(&mut self) -> usize {
+            0
+        }
+
+        fn record_output(&mut self, _kind: &'static str, _summary: &str, _content: &str) {}
+
+        fn record_file_access(&mut self, _file_path: &str) {}
+
+        fn record_command_usage(&mut self, _command: &str) {}
+
+        fn get_last_applied_patch(&self) -> Option<AppliedPatch> {
+            None
+        }
+
+        fn clear_last_applied_patch(&mut self) {}
+    }
+
+    #[test]
+    fn high_impact_shell_command_stops_for_a_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+
+        handle_shell_dispatch(&mut dispatcher, "git push origin main");
+
+        assert!(dispatcher
+            .replies
+            .iter()
+            .any(|reply| reply.contains("Approval required")));
+        match dispatcher.pending.expect("confirmation workflow").kind {
+            WorkflowKind::ShellCommandConfirm {
+                command,
+                assessment,
+            } => {
+                assert_eq!(command, "git push origin main");
+                assert!(assessment.requires_confirmation());
+            }
+            kind => panic!("unexpected workflow: {kind:?}"),
+        }
+    }
 }

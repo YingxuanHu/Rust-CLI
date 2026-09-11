@@ -39,6 +39,7 @@ classifier_model = "qwen2:1.5b"
 
 # Optional custom paths (defaults are shown for reference):
 # history_path = ".llm-cli/history.jsonl"
+# audit_path = ".llm-cli/audit.jsonl"
 # embedding_cache_path = ".llm-cli/embeddings.toml"
 # learned_path = ".llm-cli/learned.toml"
 "#;
@@ -53,6 +54,7 @@ pub struct Config {
     pub max_context_tokens: u32,
     pub streaming: bool,
     pub history_path: PathBuf,
+    pub audit_path: PathBuf,
     pub request_timeout_secs: u64,
     pub generate_commit_message: bool,
     pub embedding_cache_path: PathBuf,
@@ -71,6 +73,7 @@ struct PartialConfig {
     max_context_tokens: Option<u32>,
     streaming: Option<bool>,
     history_path: Option<PathBuf>,
+    audit_path: Option<PathBuf>,
     request_timeout_secs: Option<u64>,
     generate_commit_message: Option<bool>,
     embedding_cache_path: Option<PathBuf>,
@@ -139,6 +142,9 @@ impl Config {
         if let Some(history_path) = partial.history_path {
             self.history_path = history_path;
         }
+        if let Some(audit_path) = partial.audit_path {
+            self.audit_path = audit_path;
+        }
         if let Some(request_timeout_secs) = partial.request_timeout_secs {
             self.request_timeout_secs = request_timeout_secs;
         }
@@ -204,6 +210,11 @@ impl Config {
                 self.history_path = PathBuf::from(val);
             }
         }
+        if let Ok(val) = env::var("LLM_CLI_AUDIT_PATH") {
+            if !val.is_empty() {
+                self.audit_path = PathBuf::from(val);
+            }
+        }
         if let Ok(val) = env::var("LLM_CLI_REQUEST_TIMEOUT_SECS") {
             if let Ok(parsed) = val.parse() {
                 self.request_timeout_secs = parsed;
@@ -249,6 +260,7 @@ impl Default for Config {
             max_context_tokens: 4096,
             streaming: true,
             history_path: default_history_path(),
+            audit_path: default_audit_path(),
             request_timeout_secs: 60,
             generate_commit_message: true,
             embedding_cache_path: default_embedding_cache_path(),
@@ -267,6 +279,11 @@ pub fn default_config_path() -> PathBuf {
 fn default_history_path() -> PathBuf {
     // Store history in project's .llm-cli directory
     PathBuf::from(".llm-cli/history.jsonl")
+}
+
+fn default_audit_path() -> PathBuf {
+    // Store direct-shell audit records in the project's .llm-cli directory.
+    PathBuf::from(".llm-cli/audit.jsonl")
 }
 
 fn default_embedding_cache_path() -> PathBuf {
@@ -333,6 +350,7 @@ mod tests {
         assert!(!config.streaming);
         assert_eq!(config.cmd_timeout_secs, 12);
         assert_eq!(config.embedding_model, "nomic-embed-text");
+        assert_eq!(config.audit_path, PathBuf::from(".llm-cli/audit.jsonl"));
     }
 
     #[test]

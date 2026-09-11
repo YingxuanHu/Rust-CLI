@@ -19,5 +19,6 @@ classifier_model = "qwen2:1.5b"
 
 # Optional: set custom file paths (all default to .llm-cli/ directory)
 # history_path = ".llm-cli/history.jsonl"
+# audit_path = ".llm-cli/audit.jsonl"
 # embedding_cache_path = ".llm-cli/embeddings.toml"
 # learned_path = ".llm-cli/learned.toml"

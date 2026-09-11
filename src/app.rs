@@ -859,6 +859,10 @@ impl WorkflowResponder for App {
         crate::handlers::handle_shell_dispatch(self, cmd);
     }
 
+    fn execute_approved_shell_command(&mut self, cmd: &str) {
+        crate::handlers::handle_approved_shell_dispatch(self, cmd);
+    }
+
     fn command_timeout_secs(&self) -> u64 {
         self.config.cmd_timeout_secs
     }
