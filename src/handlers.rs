@@ -186,7 +186,7 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
             .collect::<Vec<_>>()
             .join("\n");
         dispatcher.reply(format!(
-            "Approval required before running this {} shell command.\n\n{}\n\n$ {}\n\nPress Enter (or type 'yes') to run it, or type 'no' to cancel.",
+            "Approval required before running this {} shell command.\n\n{}\n\n$ {}\n\nType 'yes' to run it, or anything else to cancel.",
             assessment.risk, reasons, expanded_cmd
         ));
         dispatcher.set_pending_workflow(WorkflowState {

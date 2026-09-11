@@ -135,7 +135,7 @@ fn handle_shell_command_confirm<R: WorkflowResponder>(
     command: String,
     assessment: CommandAssessment,
 ) {
-    if matches!(prompt.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes") {
+    if matches!(prompt.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         responder.reply(format!(
             "Executing approved {} command.",
             assessment.risk
@@ -957,6 +957,9 @@ mod tests {
         handle_workflow_response(&mut responder, workflow.clone(), "no");
         assert!(responder.executed_commands.is_empty());
         assert!(responder.replies.iter().any(|reply| reply.contains("cancelled")));
+
+        handle_workflow_response(&mut responder, workflow.clone(), "");
+        assert!(responder.executed_commands.is_empty());
 
         handle_workflow_response(&mut responder, workflow, "yes");
         assert_eq!(
