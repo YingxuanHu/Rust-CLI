@@ -67,6 +67,12 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Show recent direct shell executions from the project audit log
+    Audit {
+        /// Number of recent entries to display; use 0 for the entire log
+        #[arg(long, default_value_t = 20)]
+        tail: usize,
+    },
     /// Launch the TUI (default)
     Run,
 }
@@ -134,6 +140,12 @@ async fn main() -> Result<()> {
             if report.has_blockers() {
                 std::process::exit(2);
             }
+        }
+        Command::Audit { tail } => {
+            let config = config::Config::load(config_path).context("loading config")?;
+            let cwd = std::env::current_dir().context("reading current directory")?;
+            let records = audit::read_shell_executions(&config.audit_path, &cwd, tail)?;
+            println!("{}", audit::render_shell_executions(&records));
         }
         Command::Run => {
             let config = config::Config::load(config_path).context("loading config")?;

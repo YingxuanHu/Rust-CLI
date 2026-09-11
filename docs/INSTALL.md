@@ -30,6 +30,10 @@ configured models, Ollama, project tooling, Git, ripgrep, and the audit-log
 location. `health --full` remains available when you only want to check all
 three configured local models.
 
+Direct shell activity is recorded locally after commands run. Inspect it with
+`llm_cli audit` (the latest 20 records) or `llm_cli audit --tail 0` (all
+records); neither command modifies the audit log.
+
 ## Manual path
 
 1. Install Rust through [rustup](https://rustup.rs).

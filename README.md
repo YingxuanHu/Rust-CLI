@@ -123,6 +123,10 @@ shell execution is appended to a project-local JSON Lines audit log (default:
 `.llm-cli/audit.jsonl`). The log redacts common credential flags and headers;
 it is an execution record, not a security sandbox.
 
+Use `llm_cli audit` to inspect the 20 most recent direct shell executions in
+the active project's log, or `llm_cli audit --tail 0` to show the complete
+local history. Reading the log never changes it.
+
 #### Git Workflows (multi-step)
 
 **Save work**: Shows plan with status preview, asks confirmation, stages changes, generates commit message based on staged diff, lets user accept/override message, commits, and pushes. Execution report shows results.
