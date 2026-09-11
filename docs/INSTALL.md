@@ -32,6 +32,18 @@ models, Ollama, project tooling, Git, ripgrep, and the audit-log location.
 `health --full` remains available when you only want to check all three
 configured local models.
 
+For a single answer without opening the full-screen interface, use:
+
+```bash
+llm_cli ask "explain Rust ownership"
+llm_cli ask "give me a concise testing checklist" --json
+```
+
+Normal output streams directly to the terminal. `--json` prints one JSON object
+for scripts (and returns a JSON error with status 2 if setup is incomplete).
+`ask` is read-only and does not execute natural-language requests as commands
+or workflows.
+
 ## Binary release install (no Cargo required)
 
 Download the installer and run it locally (rather than piping it to a shell):

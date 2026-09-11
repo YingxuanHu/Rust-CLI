@@ -5,8 +5,10 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 mod app;
+mod ask;
 mod audit;
 mod bootstrap;
+mod chat;
 mod command_policy;
 mod commands;
 mod completion;
@@ -70,6 +72,15 @@ enum Command {
         /// Download missing models without asking for confirmation
         #[arg(long)]
         yes: bool,
+    },
+    /// Ask one read-only question without opening the terminal UI
+    Ask {
+        /// Question for the configured model
+        #[arg(required = true, num_args = 1..)]
+        prompt: Vec<String>,
+        /// Emit one JSON object instead of streaming plain text
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect local prerequisites and project tooling without changing anything
     Doctor {
@@ -158,6 +169,27 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Command::Ask { prompt, json } => {
+            let config = config::Config::load(config_path).context("loading config")?;
+            let outcome = if json {
+                bootstrap::prepare_for_machine_use(&config)?
+            } else {
+                bootstrap::prepare_for_launch(&config)?
+            };
+            if outcome.needs_user_action() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "error": outcome.machine_error() })
+                    );
+                }
+                std::process::exit(2);
+            }
+            if matches!(outcome, bootstrap::BootstrapOutcome::Cancelled) {
+                return Ok(());
+            }
+            ask::run(&config, &ask::join_prompt(&prompt)?, json).await?;
+        }
         Command::Audit { tail } => {
             let config = config::Config::load(config_path).context("loading config")?;
             let cwd = std::env::current_dir().context("reading current directory")?;
@@ -183,4 +215,34 @@ async fn main() -> Result<()> {
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn parses_a_one_shot_question_and_json_flag() {
+        let cli = Cli::try_parse_from([
+            "llm_cli",
+            "ask",
+            "explain",
+            "this project",
+            "--json",
+        ])
+        .expect("ask command should parse");
+
+        match cli.command.expect("subcommand") {
+            Command::Ask { prompt, json } => {
+                assert_eq!(
+                    prompt,
+                    vec!["explain".to_string(), "this project".to_string()]
+                );
+                assert!(json);
+            }
+            command => panic!("unexpected command: {command:?}"),
+        }
+    }
 }

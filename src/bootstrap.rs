@@ -15,6 +15,7 @@ pub enum BootstrapOutcome {
     Ready,
     NeedsOllamaInstallation,
     NeedsOllamaDaemon,
+    NeedsChatModel,
     Cancelled,
 }
 
@@ -22,21 +23,38 @@ impl BootstrapOutcome {
     pub const fn needs_user_action(self) -> bool {
         matches!(
             self,
-            Self::NeedsOllamaInstallation | Self::NeedsOllamaDaemon
+            Self::NeedsOllamaInstallation | Self::NeedsOllamaDaemon | Self::NeedsChatModel
         )
+    }
+
+    pub const fn machine_error(self) -> &'static str {
+        match self {
+            Self::NeedsOllamaInstallation => {
+                "Ollama is not installed; install it from https://ollama.com"
+            }
+            Self::NeedsOllamaDaemon => "Ollama is not responding; start or open Ollama and retry",
+            Self::NeedsChatModel => "the configured chat model is missing; run `llm_cli init`",
+            Self::Ready | Self::Cancelled => "local setup is not ready",
+        }
     }
 }
 
 /// Prepare the minimum local runtime necessary to launch the TUI. When a
 /// model is absent, this interactively asks before downloading it.
 pub fn prepare_for_launch(config: &Config) -> Result<BootstrapOutcome> {
-    prepare(config, false, false, false)
+    prepare(config, false, false, false, true)
+}
+
+/// Check whether a non-interactive caller can safely emit machine-readable
+/// output. This never prints a setup prompt or initiates a download.
+pub fn prepare_for_machine_use(config: &Config) -> Result<BootstrapOutcome> {
+    prepare(config, false, false, false, false)
 }
 
 /// Run the explicit `llm_cli init` flow. `full` includes the optional embedding
 /// and intent-classifier models; `assume_yes` is for scripts.
 pub fn initialize(config: &Config, full: bool, assume_yes: bool) -> Result<BootstrapOutcome> {
-    prepare(config, full, assume_yes, true)
+    prepare(config, full, assume_yes, true, true)
 }
 
 fn prepare(
@@ -44,13 +62,16 @@ fn prepare(
     full: bool,
     assume_yes: bool,
     announce_when_ready: bool,
+    show_messages: bool,
 ) -> Result<BootstrapOutcome> {
     if !ollama::command_available() {
-        println!(
-            "Ollama is not installed yet.\n\
-             \n1. Install it from https://ollama.com\n\
-             2. Open Ollama, then rerun `llm_cli`."
-        );
+        if show_messages {
+            println!(
+                "Ollama is not installed yet.\n\
+                 \n1. Install it from https://ollama.com\n\
+                 2. Open Ollama, then rerun `llm_cli`."
+            );
+        }
         return Ok(BootstrapOutcome::NeedsOllamaInstallation);
     }
 
@@ -59,28 +80,32 @@ fn prepare(
         let status = match ollama::check_status(model, &config.ollama_host) {
             Ok(status) if status.reachable => status,
             Ok(status) => {
-                let detail = status.raw_output.trim();
-                if detail.is_empty() {
-                    println!(
-                        "Ollama is installed but is not responding at {}.\n\
-                         Start or open Ollama, then rerun `llm_cli`.",
-                        config.ollama_host
-                    );
-                } else {
-                    println!(
-                        "Ollama is installed but is not responding at {} ({detail}).\n\
-                         Start or open Ollama, then rerun `llm_cli`.",
-                        config.ollama_host
-                    );
+                if show_messages {
+                    let detail = status.raw_output.trim();
+                    if detail.is_empty() {
+                        println!(
+                            "Ollama is installed but is not responding at {}.\n\
+                             Start or open Ollama, then rerun `llm_cli`.",
+                            config.ollama_host
+                        );
+                    } else {
+                        println!(
+                            "Ollama is installed but is not responding at {} ({detail}).\n\
+                             Start or open Ollama, then rerun `llm_cli`.",
+                            config.ollama_host
+                        );
+                    }
                 }
                 return Ok(BootstrapOutcome::NeedsOllamaDaemon);
             }
             Err(error) => {
-                println!(
-                    "Could not check Ollama at {}: {error}\n\
-                     Start or open Ollama, then rerun `llm_cli`.",
-                    config.ollama_host
-                );
+                if show_messages {
+                    println!(
+                        "Could not check Ollama at {}: {error}\n\
+                         Start or open Ollama, then rerun `llm_cli`.",
+                        config.ollama_host
+                    );
+                }
                 return Ok(BootstrapOutcome::NeedsOllamaDaemon);
             }
         };
@@ -90,10 +115,14 @@ fn prepare(
     }
 
     if missing.is_empty() {
-        if announce_when_ready {
+        if announce_when_ready && show_messages {
             println!("AI setup is ready. Start the assistant with `llm_cli`.");
         }
         return Ok(BootstrapOutcome::Ready);
+    }
+
+    if !show_messages {
+        return Ok(BootstrapOutcome::NeedsChatModel);
     }
 
     println!(
@@ -182,5 +211,15 @@ mod tests {
     fn plural_suffix_is_human_readable() {
         assert_eq!(super::plural_suffix(1), "");
         assert_eq!(super::plural_suffix(2), "s");
+    }
+
+    #[test]
+    fn machine_errors_are_actionable() {
+        assert!(super::BootstrapOutcome::NeedsChatModel
+            .machine_error()
+            .contains("llm_cli init"));
+        assert!(super::BootstrapOutcome::NeedsOllamaInstallation
+            .machine_error()
+            .contains("ollama.com"));
     }
 }

@@ -185,6 +185,9 @@ Next steps, from the repository you want to work in:
 On first run, llm_cli checks its local setup and asks before downloading a
 missing chat model.
 
+For one quick answer without opening the full-screen interface:
+  llm_cli ask "explain Rust ownership"
+
 Optional:
   llm_cli init --full    # Also download routing models
   llm_cli doctor --full  # Inspect setup problems without changing anything

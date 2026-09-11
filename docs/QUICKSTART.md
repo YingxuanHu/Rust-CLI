@@ -37,6 +37,19 @@ cargo build --release
 cargo run --release
 ```
 
+## One-Off Questions
+
+Use `ask` when you want an answer in the current terminal instead of an
+interactive session:
+
+```bash
+llm_cli ask "explain Rust ownership"
+llm_cli ask "give me a concise testing checklist" --json
+```
+
+The normal form streams text. `--json` prints one response object for scripts;
+both forms are read-only and do not run tools or workflows.
+
 ## First Run
 
 On first run, the CLI gives a short, contextual guide instead of requiring a

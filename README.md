@@ -26,6 +26,16 @@ at any time to reopen them. Use `llm_cli init --full` to add the optional
 routing models, `llm_cli doctor --full` to inspect setup without changing
 anything, or `llm_cli setup` to customize configuration.
 
+For one quick, read-only answer without opening the full-screen interface:
+
+```bash
+llm_cli ask "explain Rust ownership"
+llm_cli ask "give me a concise testing checklist" --json
+```
+
+`ask` streams normal output for people and emits one JSON object with `--json`
+for scripts. It does not run shell commands, edit files, or start Git workflows.
+
 The full manual and troubleshooting guide is in [docs/INSTALL.md](docs/INSTALL.md).
 The same installer supports a verified no-Cargo path after downloading it:
 `bash install.sh --binary`.
@@ -204,6 +214,11 @@ This section is a “from zero to running” setup. For OS-specific install deta
 After starting, the full-screen interface opens with a conversation panel at top and an input area at bottom.
 
 A `help` page is available inside the app with 'help' or '?' in `Chat` mode, showing all available commands and key bindings.
+
+For a one-off explanation in a shell or script, use `llm_cli ask "your
+question"`. It uses the configured model and lightweight project identity, but
+does not execute tools or make changes. Pass `--json` for a single structured
+response instead of streamed text.
 
 If the CLI cannot start, it explains whether Ollama must be installed or
 started. Run `llm_cli init` again to retry setup, or `llm_cli doctor` for a
