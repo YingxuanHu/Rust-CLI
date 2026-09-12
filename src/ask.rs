@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::process::Command;
 
 use crate::{chat, config::Config, repo::RepoInfo};
 
@@ -22,7 +22,7 @@ struct AskResponse<'a> {
 pub fn join_prompt(parts: &[String]) -> Result<String> {
     let prompt = parts.join(" ");
     if prompt.trim().is_empty() {
-        bail!("provide a question, for example: `llm_cli ask \"explain this project\"`");
+        bail!("provide a question, for example: `llm_cli ask \"explain Rust ownership\"`");
     }
     Ok(prompt)
 }
@@ -40,25 +40,15 @@ pub async fn run(config: &Config, prompt: &str, json: bool) -> Result<()> {
         config.max_context_tokens,
     );
 
-    let mut child = Command::new("ollama")
-        .arg("run")
+    let mut command = Command::new("ollama");
+    command.arg("run")
         .arg(&config.model)
         .arg(composed_prompt)
-        .env("OLLAMA_HOST", &config.ollama_host)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .context("starting Ollama chat")?;
-    let mut stdout = child.stdout.take().context("capturing Ollama response")?;
-    let mut response = String::new();
-
-    let read_response = async {
-        let mut buffer = [0_u8; 1024];
-        loop {
-            let count = stdout.read(&mut buffer).await.context("reading Ollama response")?;
-            if count == 0 {
-                break;
-            }
-            let chunk = String::from_utf8_lossy(&buffer[..count]);
+        .env("OLLAMA_HOST", &config.ollama_host);
+    let response = crate::model_stream::run(
+        command,
+        Duration::from_secs(config.llm_timeout_secs),
+        |chunk| {
             if !json {
                 let mut output = io::stdout().lock();
                 output
@@ -66,29 +56,9 @@ pub async fn run(config: &Config, prompt: &str, json: bool) -> Result<()> {
                     .context("writing streamed response")?;
                 output.flush().context("flushing streamed response")?;
             }
-            response.push_str(&chunk);
+            Ok(())
         }
-        Ok::<(), anyhow::Error>(())
-    };
-
-    match timeout(Duration::from_secs(config.llm_timeout_secs), read_response).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(error);
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            bail!("Ollama chat timed out after {} seconds", config.llm_timeout_secs);
-        }
-    }
-
-    let status = child.wait().await.context("waiting for Ollama chat")?;
-    if !status.success() {
-        bail!("Ollama chat exited with {status}");
-    }
+    ).await?;
 
     if json {
         println!("{}", render_json(&config.model, &response)?);

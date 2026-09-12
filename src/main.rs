@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -26,6 +26,7 @@ mod intent;
 mod keyword_classifier;
 mod learned;
 mod llm_classifier;
+mod model_stream;
 mod ollama;
 mod patch;
 mod repo;
@@ -176,25 +177,14 @@ async fn main() -> Result<()> {
             }
         }
         Command::Ask { prompt, json } => {
-            let config = config::Config::load(config_path).context("loading config")?;
-            let outcome = if json {
-                bootstrap::prepare_for_machine_use(&config)?
-            } else {
-                bootstrap::prepare_for_launch(&config)?
-            };
-            if outcome.needs_user_action() {
+            if let Err(error) = run_question(config_path, &prompt, json).await {
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({ "error": outcome.machine_error() })
-                    );
+                    println!("{}", serde_json::json!({ "error": format!("{error:#}") }));
+                } else {
+                    eprintln!("Error: {error:#}");
                 }
                 std::process::exit(2);
             }
-            if matches!(outcome, bootstrap::BootstrapOutcome::Cancelled) {
-                return Ok(());
-            }
-            ask::run(&config, &ask::join_prompt(&prompt)?, json).await?;
         }
         Command::Audit { tail } => {
             let config = config::Config::load(config_path).context("loading config")?;
@@ -221,9 +211,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_question(config_path: Option<PathBuf>, parts: &[String], json: bool) -> Result<()> {
+    let prompt = ask::join_prompt(parts)?;
+    let config = config::Config::load(config_path).context("loading config")?;
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let outcome = if interactive {
+        bootstrap::prepare_for_launch(&config)?
+    } else {
+        bootstrap::prepare_for_machine_use(&config)?
+    };
+    if outcome.needs_user_action() {
+        anyhow::bail!("{}", outcome.machine_error());
+    }
+    if matches!(outcome, bootstrap::BootstrapOutcome::Cancelled) {
+        return Ok(());
+    }
+    ask::run(&config, &prompt, json).await
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt().with_writer(std::io::stderr).with_env_filter(filter).init();
 }
 
 #[cfg(test)]

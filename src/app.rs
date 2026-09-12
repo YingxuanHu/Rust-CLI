@@ -6,7 +6,6 @@ use std::{
 };
 
 use tokio::{
-    io::AsyncReadExt,
     process::Command as TokioCommand,
     sync::mpsc,
 };
@@ -27,10 +26,8 @@ use crate::{
     input::{expand_bang_shortcut, HistoryNavigation},
     intent::{self, ParsedIntent},
     learned::LearnedAliases,
-    ollama,
     patch::{self, AppliedPatch, PatchReview},
     session::{Message, Role, SessionState},
-    tools::ToolArgs,
     ui::{render_ui, AppView, InputMode, TerminalGuard},
     workflow::{generate_commit_message_async, handle_workflow_response, WorkflowResponder, WorkflowState},
 };
@@ -215,9 +212,31 @@ impl App {
         while let Ok(event) = self.assistant_rx.try_recv() {
             match event {
                 AssistantEvent::Token { idx, chunk } => self.append_assistant_chunk(idx, chunk),
-                AssistantEvent::Completed { idx, content } => self.finish_assistant(idx, content),
+                AssistantEvent::Completed { idx, content, original_input, cwd } => {
+                    self.finish_assistant(idx, content, original_input, cwd);
+                }
                 AssistantEvent::Failed { idx, error} => self.fail_assistant(idx, error),
+                AssistantEvent::PatchFailed { idx, error } => {
+                    if matches!(self.pending_workflow.as_ref().map(|workflow| &workflow.kind),
+                        Some(crate::workflow::WorkflowKind::EditPatchPending { .. })) {
+                        self.pending_workflow = None;
+                    }
+                    self.fail_assistant(idx, error);
+                }
                 AssistantEvent::PatchReady { idx, review } => self.finish_patch_review(idx, review),
+                AssistantEvent::IntentResolved { idx, intent, original_input, cwd } => {
+                    self.finish_intent(idx, intent, original_input, cwd);
+                }
+                AssistantEvent::CommitPlanReady { idx, suggested, repo_root, save_work } => {
+                    self.finish_commit_plan(idx, suggested, repo_root, save_work);
+                }
+                AssistantEvent::CommitMessageReady { idx, message } => {
+                    self.session.record_output("commit_msg", "Generated commit message", &message);
+                    let content = format!("Suggested commit message:\n{message}");
+                    self.upsert_message(idx, Role::Assistant, content.clone());
+                    self.session.record(Message { role: Role::Assistant, content });
+                    self.pending_idxs.retain(|&i| i != idx);
+                }
             }
             // Only reset scroll if not locked
             if !self.scroll_locked {
@@ -284,166 +303,13 @@ impl App {
         }
     }
 
-    fn finish_assistant(&mut self, idx: usize, content: Option<String>) {
+    fn finish_assistant(&mut self, idx: usize, content: Option<String>, original_query: String, cwd: PathBuf) {
         let fallback = self
             .messages
             .get(idx)
             .map(|m| m.content.clone())
             .unwrap_or_default();
         let final_content = content.unwrap_or(fallback);
-
-        // A save-work request generates its suggestion after staging, while
-        // preserving the selected repository until confirmation.
-        if let Some(suggested) = final_content.strip_prefix("__SAVE_WORK_PLAN__:") {
-            let suggested = suggested.to_string();
-            let display_content = format!(
-                "Suggested commit message:\n{}\nPress Enter (or type 'yes') to accept, or type a custom message. (Type 'cancel' to abort.)",
-                suggested
-            );
-            self.upsert_message(idx, Role::Assistant, display_content.clone());
-            self.session.record(Message {
-                role: Role::Assistant,
-                content: display_content,
-            });
-            self.pending_idxs.retain(|&i| i != idx);
-            let repo_root = match self.pending_workflow.take() {
-                Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::SaveWorkMessagePending,
-                    repo_root,
-                }) => Some(repo_root),
-                workflow => {
-                    self.pending_workflow = workflow;
-                    self.session.repo_root.clone()
-                }
-            };
-            if let Some(repo_root) = repo_root {
-                self.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::SaveWorkCommit { suggested },
-                    repo_root,
-                });
-            } else {
-                self.reply("No git repository detected; cannot complete save work.");
-            }
-            return;
-        }
-
-        // A normal `commit` request generates its suggestion off the UI thread
-        // and then transitions into the usual confirmation workflow.
-        if let Some(suggested) = final_content.strip_prefix("__COMMIT_PLAN__:") {
-            let suggested = suggested.to_string();
-            let display_content = format!(
-                "Staged commit plan:\n- git commit with message:\n{}\n- (push not included)\nPress Enter (or type 'yes') to accept, or type a custom message. 'cancel' to abort.",
-                suggested
-            );
-            self.upsert_message(idx, Role::Assistant, display_content.clone());
-            self.session.record(Message {
-                role: Role::Assistant,
-                content: display_content,
-            });
-            self.pending_idxs.retain(|&i| i != idx);
-            let repo_root = match self.pending_workflow.take() {
-                Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::CommitMessagePending,
-                    repo_root,
-                }) => Some(repo_root),
-                workflow => {
-                    self.pending_workflow = workflow;
-                    self.session.repo_root.clone()
-                }
-            };
-            if let Some(repo_root) = repo_root {
-                self.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::CommitOnlyConfirm { suggested },
-                    repo_root,
-                });
-            } else {
-                self.reply("No git repository detected; cannot commit.");
-            }
-            return;
-        }
-
-        // Check for commit message generation signal
-        if final_content.starts_with("__COMMIT_MSG__:") {
-            let generated = final_content
-                .strip_prefix("__COMMIT_MSG__:")
-                .unwrap_or_default();
-            let message = generated.split_once('\n').map_or(generated, |(message, _)| message);
-            self.session
-                .record_output("commit_msg", "Generated commit message", message);
-            // Remove the signal prefix and continue with normal display
-            let display_content = final_content.split_once('\n')
-                .map(|(_, rest)| rest)
-                .unwrap_or(&final_content);
-            self.upsert_message(idx, Role::Assistant, display_content.to_string());
-            self.session.record(Message {
-                role: Role::Assistant,
-                content: display_content.to_string(),
-            });
-            self.pending_idxs.retain(|&i| i != idx);
-            return;
-        }
-        
-        // Check for custom workflow generation signal
-        if final_content.starts_with("__CUSTOM_COMMAND_GENERATED__:") {
-            self.pending_idxs.retain(|&i| i != idx);
-            // Parse the signal: __CUSTOM_COMMAND_GENERATED__:original_input:generated_cmd:save_path
-            let parts: Vec<&str> = final_content.splitn(4, ':').collect();
-            if parts.len() >= 4 {
-                let original_input = parts[1];
-                let generated_cmd = parts[2];
-                let save_path_str = parts[3];
-                let save_path = std::path::PathBuf::from(save_path_str);
-                
-                // Show the generated command and ask for confirmation
-                self.reply(format!(
-                    "💡 Generated workflow:\n  {}\n\n\
-                     This will be saved as: \"{}\" → custom workflow\n\n\
-                     Options:\n\
-                     • Press Enter (or type 'yes') to confirm and execute\n\
-                     • Type 'edit: <new command>' to modify\n\
-                     • Type 'no' to cancel",
-                    generated_cmd,
-                    original_input
-                ));
-                
-                // Store for confirmation
-                self.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::CustomWorkflowConfirm {
-                        original_input: original_input.to_string(),
-                        generated_cmd: generated_cmd.to_string(),
-                        save_path,
-                    },
-                    repo_root: self.session.repo_root.clone().unwrap_or_else(|| std::path::PathBuf::from(".")),
-                });
-                
-            }
-            return;
-        }
-
-        // Check for intent signal from background task
-        if final_content.starts_with("__INTENT__:") {
-            self.pending_idxs.retain(|&i| i != idx);
-            // Remove the placeholder message
-            if idx < self.messages.len() {
-                self.messages.remove(idx);
-            }
-            // Parse and dispatch the intent
-            let parts: Vec<&str> = final_content.splitn(3, ':').collect();
-            if parts.len() >= 2 {
-                let tool = parts[1];
-                let args_json = parts.get(2).unwrap_or(&"{}");
-                let args: ToolArgs = serde_json::from_str(args_json).unwrap_or_default();
-                let intent = ParsedIntent {
-                    tool: tool.to_string(),
-                    args,
-                    confidence: 0.8,
-                };
-                // We need to get the original input from history
-                let original_input = self.input_history.last().cloned().unwrap_or_default();
-                dispatch_intent(self, &intent, &original_input);
-            }
-            return;
-        }
 
         self.upsert_message(idx, Role::Assistant, final_content.clone());
         self.session.record(Message {
@@ -454,9 +320,8 @@ impl App {
         
         // Check if the response contains shell commands
         let commands = crate::workflow::extract_commands_from_text(&final_content);
-        if !commands.is_empty() {
+        if !commands.is_empty() && self.pending_workflow.is_none() && self.session.cwd == cwd {
             let combined = commands.join(" && ");
-            let original_query = self.input_history.last().cloned().unwrap_or_default();
             
             let msg = if commands.len() == 1 {
                 format!(
@@ -496,19 +361,57 @@ impl App {
     }
 
     fn fail_assistant(&mut self, idx: usize, error: String) {
-        let content = format!("Ollama error: {error}");
+        let content = format!("Request failed: {error}");
         self.upsert_message(idx, Role::System, content.clone());
         self.session.record(Message {
             role: Role::System,
             content,
         });
         self.pending_idxs.retain(|&i| i != idx);
-        if matches!(
-            self.pending_workflow.as_ref().map(|workflow| &workflow.kind),
-            Some(crate::workflow::WorkflowKind::EditPatchPending { .. })
-        ) {
-            self.pending_workflow = None;
+    }
+
+    fn finish_intent(&mut self, idx: usize, intent: ParsedIntent, original_input: String, cwd: PathBuf) {
+        if self.session.cwd != cwd {
+            self.fail_assistant(idx, "the working directory changed while resolving this request; submit it again in the intended directory".to_string());
+            return;
         }
+        if self.pending_workflow.is_some() {
+            self.fail_assistant(idx, "another workflow is awaiting your response; finish it before retrying this request".to_string());
+            return;
+        }
+        // Outstanding events retain their message indices. Removing this entry
+        // would redirect chunks for later requests to the wrong message.
+        self.upsert_message(idx, Role::System, format!("Running workflow: {}", intent.tool));
+        self.pending_idxs.retain(|&i| i != idx);
+        dispatch_intent(self, &intent, &original_input);
+    }
+
+    fn finish_commit_plan(&mut self, idx: usize, suggested: String, repo_root: PathBuf, save_work: bool) {
+        use crate::workflow::WorkflowKind;
+        let expected = self.pending_workflow.as_ref().is_some_and(|workflow| {
+            workflow.repo_root == repo_root && matches!(
+                (&workflow.kind, save_work),
+                (WorkflowKind::SaveWorkMessagePending, true) | (WorkflowKind::CommitMessagePending, false)
+            )
+        });
+        if !expected {
+            self.fail_assistant(idx, "this commit request was superseded before its suggestion arrived".to_string());
+            return;
+        }
+        let content = format!(
+            "Suggested commit message:\n{suggested}\nPress Enter (or type 'yes') to accept, or type a custom message. Type 'cancel' to abort."
+        );
+        self.upsert_message(idx, Role::Assistant, content.clone());
+        self.session.record(Message { role: Role::Assistant, content });
+        self.pending_idxs.retain(|&i| i != idx);
+        self.pending_workflow = Some(WorkflowState {
+            kind: if save_work {
+                WorkflowKind::SaveWorkCommit { suggested }
+            } else {
+                WorkflowKind::CommitOnlyConfirm { suggested }
+            },
+            repo_root,
+        });
     }
 
     fn finish_patch_review(&mut self, idx: usize, review: PatchReview) {
@@ -887,9 +790,6 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 InputMode::Shell => InputMode::Chat,
             };
         }
-        // Preserve the familiar quick-exit shortcut without making normal
-        // prompts containing the letter "q" impossible to type.
-        KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Enter => submit_input(app),
         KeyCode::Tab => {
@@ -1031,6 +931,7 @@ fn submit_input(app: &mut App) {
     
     // Capture lightweight repository context before spawning.
     let repo_context = crate::chat::project_context(app.session.repo_info.as_ref());
+    let request_cwd = app.session.cwd.clone();
     
     // Inject recent context if user input contains references
     let context_injection = if context::contains_reference(&prompt_for_task) {
@@ -1063,13 +964,11 @@ fn submit_input(app: &mut App) {
         {
             // Non-chat intents get dispatched via signal to main thread
             if parsed.tool != "chat" && parsed.confidence >= 0.3 {
-                let _ = tx.send(AssistantEvent::Completed {
+                let _ = tx.send(AssistantEvent::IntentResolved {
                     idx: placeholder_idx,
-                    content: Some(format!(
-                        "__INTENT__:{}:{}",
-                        parsed.tool,
-                        serde_json::to_string(&parsed.args).unwrap_or_default()
-                    )),
+                    intent: parsed,
+                    original_input: prompt_for_task,
+                    cwd: request_cwd,
                 });
                 return;
             }
@@ -1084,76 +983,31 @@ fn submit_input(app: &mut App) {
             max_context_tokens,
         );
 
-        let mut child = match TokioCommand::new("ollama")
-            .arg("run")
+        let mut command = TokioCommand::new("ollama");
+        command.arg("run")
             .arg(&model)
             .arg(&composed_prompt)
-            .env("OLLAMA_HOST", &ollama_host)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(err) => {
-                let _ = tx.send(AssistantEvent::Failed {
-                    idx: placeholder_idx,
-                    error: format!("{err}"),
-                });
-                return;
-            }
-        };
-
-        let timeout = Duration::from_secs(llm_timeout_secs);
-        let start = Instant::now();
-        let mut buffered_output = String::new();
-
-        if let Some(mut stdout) = child.stdout.take() {
-            let mut buf = [0u8; 1024];
-            loop {
-                if start.elapsed() > timeout {
-                    let _ = tx.send(AssistantEvent::Failed {
+            .env("OLLAMA_HOST", &ollama_host);
+        let response = crate::model_stream::run(
+            command,
+            Duration::from_secs(llm_timeout_secs),
+            |chunk| {
+                if streaming {
+                    tx.send(AssistantEvent::Token {
                         idx: placeholder_idx,
-                        error: format!("ollama run timed out after {llm_timeout_secs}s"),
-                    });
-                    let _ = child.kill().await;
-                    return;
+                        chunk: chunk.to_string(),
+                    }).map_err(|_| anyhow::anyhow!("the session was closed"))?;
                 }
-
-                match stdout.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if streaming {
-                            let _ = tx.send(AssistantEvent::Token {
-                                idx: placeholder_idx,
-                                chunk,
-                            });
-                        } else {
-                            buffered_output.push_str(&chunk);
-                        }
-                    }
-                    Err(err) => {
-                        let _ = tx.send(AssistantEvent::Failed {
-                            idx: placeholder_idx,
-                            error: format!("{err}"),
-                        });
-                        let _ = child.kill().await;
-                        return;
-                    }
-                }
-            }
-        }
-
-        match child.wait().await {
-            Ok(status) if status.success() => {
+                Ok(())
+            },
+        ).await;
+        match response {
+            Ok(content) => {
                 let _ = tx.send(AssistantEvent::Completed {
                     idx: placeholder_idx,
-                    content: (!streaming).then_some(buffered_output),
-                });
-            }
-            Ok(status) => {
-                let _ = tx.send(AssistantEvent::Failed {
-                    idx: placeholder_idx,
-                    error: format!("ollama exited with status {status}"),
+                    content: Some(content),
+                    original_input: prompt_for_task,
+                    cwd: request_cwd,
                 });
             }
             Err(err) => {
@@ -1223,9 +1077,11 @@ fn handle_pending_workflow(app: &mut App, prompt: &str) {
                     let suggested = generate_commit_message_async(&config, &repo_root)
                         .await
                         .unwrap_or_else(|| "chore: save work".to_string());
-                    let _ = tx.send(AssistantEvent::Completed {
+                    let _ = tx.send(AssistantEvent::CommitPlanReady {
                         idx,
-                        content: Some(format!("__SAVE_WORK_PLAN__:{suggested}")),
+                        suggested,
+                        repo_root,
+                        save_work: true,
                     });
                 });
             } else {
@@ -1235,9 +1091,14 @@ fn handle_pending_workflow(app: &mut App, prompt: &str) {
             workflow.kind,
             crate::workflow::WorkflowKind::SaveWorkMessagePending
                 | crate::workflow::WorkflowKind::CommitMessagePending
+                | crate::workflow::WorkflowKind::EditPatchPending { .. }
         ) {
             app.pending_workflow = Some(workflow);
-            app.reply("Commit-message generation is still in progress. Please wait.");
+            app.reply("Generation is still in progress. Please wait.");
+        } else if matches!(workflow.kind, crate::workflow::WorkflowKind::ApplyDiff { .. })
+            && !matches!(prompt.trim().to_lowercase().as_str(), "" | "yes" | "y" | "no" | "n" | "cancel") {
+            app.pending_workflow = Some(workflow);
+            app.reply("Patch review is still open. Press Enter (or type 'yes') to apply, or 'no' to cancel.");
         } else {
             handle_workflow_response(app, workflow, prompt);
         }
@@ -1293,6 +1154,97 @@ fn scroll_session_history_down(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn isolated_app() -> (tempfile::TempDir, App) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            history_path: directory.path().join("history.jsonl"),
+            learned_path: directory.path().join("learned.toml"),
+            ..Config::default()
+        };
+        let cache = Arc::new(EmbeddingCache::new(Some(&config.embedding_model), 1, &config.ollama_host));
+        let mut app = App::new(config, cache);
+        app.session.set_cwd(directory.path().to_path_buf());
+        (directory, app)
+    }
+
+    #[test]
+    fn model_control_prefixes_are_plain_text() {
+        let (_directory, mut app) = isolated_app();
+        for content in [
+            "__INTENT__:status:{}",
+            "__COMMIT_PLAN__:Pretend commit",
+            "__SAVE_WORK_PLAN__:Pretend save",
+            "__COMMIT_MSG__:Pretend message",
+            "__CUSTOM_COMMAND_GENERATED__:phrase:command:/path",
+        ] {
+            let idx = app.pending_placeholder();
+            app.finish_assistant(idx, Some(content.to_string()), "question".to_string(), app.session.cwd.clone());
+            assert_eq!(app.messages[idx].content, content);
+            assert!(app.pending_workflow.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_intent_does_not_shift_another_responses_message_index() {
+        let (_directory, mut app) = isolated_app();
+        let first = app.pending_placeholder();
+        let second = app.pending_placeholder();
+        let original = app.messages[second].content.clone();
+        app.finish_intent(first, ParsedIntent::new("help", 1.0), "help".to_string(), app.session.cwd.clone());
+        app.append_assistant_chunk(second, "Still belongs to the second request".to_string());
+        assert_eq!(app.messages[second].content, format!("{original}Still belongs to the second request"));
+        assert!(app.pending_idxs.contains(&second));
+    }
+
+    #[test]
+    fn resolved_intent_does_not_run_after_changing_directory() {
+        let (directory, mut app) = isolated_app();
+        let idx = app.pending_placeholder();
+        app.finish_intent(idx, ParsedIntent::new("status", 1.0), "status".to_string(), directory.path().join("old"));
+        assert!(app.messages[idx].content.contains("working directory changed"));
+        assert!(app.pending_workflow.is_none());
+    }
+
+    #[test]
+    fn pending_patch_survives_extra_input_and_unrelated_request_failure() {
+        let (_directory, mut app) = isolated_app();
+        app.pending_workflow = Some(WorkflowState {
+            kind: crate::workflow::WorkflowKind::EditPatchPending { file: "src/main.rs".to_string() },
+            repo_root: app.session.cwd.clone(),
+        });
+        handle_pending_workflow(&mut app, "is it ready?");
+        let idx = app.pending_placeholder();
+        app.fail_assistant(idx, "unrelated question failed".to_string());
+        assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind),
+            Some(crate::workflow::WorkflowKind::EditPatchPending { .. })));
+    }
+
+    #[test]
+    fn q_is_an_input_character_at_the_start_of_a_question() {
+        let (_directory, mut app) = isolated_app();
+        handle_key_event(&mut app, crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.input, "q");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn unrecognized_patch_confirmation_keeps_the_review_available() {
+        let (_directory, mut app) = isolated_app();
+        app.pending_workflow = Some(WorkflowState {
+            kind: crate::workflow::WorkflowKind::ApplyDiff { review: PatchReview {
+                file: "src/main.rs".to_string(),
+                patch: "reviewed patch".to_string(),
+                description: "requested change".to_string(),
+            } },
+            repo_root: app.session.cwd.clone(),
+        });
+        handle_pending_workflow(&mut app, "what does this change?");
+        assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind),
+            Some(crate::workflow::WorkflowKind::ApplyDiff { .. })));
+        handle_pending_workflow(&mut app, "no");
+        assert!(app.pending_workflow.is_none());
+    }
 
     #[test]
     fn input_history_round_trips_as_json_lines() {

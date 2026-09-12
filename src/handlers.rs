@@ -20,9 +20,13 @@ use crate::{
 
 pub enum AssistantEvent {
     Token { idx: usize, chunk: String },
-    Completed { idx: usize, content: Option<String> },
+    Completed { idx: usize, content: Option<String>, original_input: String, cwd: PathBuf },
     Failed { idx: usize, error: String },
+    PatchFailed { idx: usize, error: String },
     PatchReady { idx: usize, review: patch::PatchReview },
+    IntentResolved { idx: usize, intent: ParsedIntent, original_input: String, cwd: PathBuf },
+    CommitPlanReady { idx: usize, suggested: String, repo_root: PathBuf, save_work: bool },
+    CommitMessageReady { idx: usize, message: String },
 }
 
 pub trait IntentDispatcher {
@@ -363,7 +367,7 @@ fn handle_stage_intent<D: IntentDispatcher>(dispatcher: &mut D, args: &ToolArgs)
         .unwrap_or_else(|| dispatcher.get_session_cwd());
 
     let stage_args = if let Some(path) = &args.path {
-        vec!["add".into(), path.clone()]
+        vec!["add".into(), "--".into(), path.clone()]
     } else {
         vec!["add".into(), "-A".into()]
     };
@@ -392,9 +396,11 @@ fn handle_commit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
             let suggested = generate_commit_message_async(&config, &repo_root)
                 .await
                 .unwrap_or_else(|| "chore: update".to_string());
-            let _ = tx.send(AssistantEvent::Completed {
+            let _ = tx.send(AssistantEvent::CommitPlanReady {
                 idx,
-                content: Some(format!("__COMMIT_PLAN__:{suggested}")),
+                suggested,
+                repo_root,
+                save_work: false,
             });
         });
     } else {
@@ -525,10 +531,9 @@ fn handle_draft_commit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
         tokio::spawn(async move {
             let event = match generate_commit_message_async(&config, &repo_root).await {
                 Some(msg) => {
-                    // Signal contains __COMMIT_MSG__ prefix so app.rs can record it
-                    AssistantEvent::Completed {
+                    AssistantEvent::CommitMessageReady {
                         idx,
-                        content: Some(format!("__COMMIT_MSG__:{}\n\nSuggested commit message:\n{}", msg, msg)),
+                        message: msg,
                     }
                 }
                 None => AssistantEvent::Failed {
@@ -741,7 +746,7 @@ fn handle_edit_file_intent<D: IntentDispatcher>(
         .await
         {
             Ok(review) => AssistantEvent::PatchReady { idx, review },
-            Err(error) => AssistantEvent::Failed {
+            Err(error) => AssistantEvent::PatchFailed {
                 idx,
                 error: format!("could not prepare an edit: {error}"),
             },
@@ -885,7 +890,7 @@ MODES
         • Macro expansion for composable workflows
 
 KEY BINDINGS
-    Esc / q             Exit the application (`q` when input is empty)
+    Esc / Ctrl+C        Exit the application
     Ctrl+S              Toggle between Chat and Shell mode
     Tab                 Autocomplete (context-aware)
     Enter               Submit current input
@@ -980,6 +985,7 @@ mod tests {
         patch::AppliedPatch,
         repo::{ProjectType, RepoInfo},
         session::Role,
+        tools::ToolArgs,
         workflow::{WorkflowKind, WorkflowState},
     };
 
@@ -1084,6 +1090,20 @@ mod tests {
         }
 
         fn clear_last_applied_patch(&mut self) {}
+    }
+
+    #[test]
+    fn stage_path_is_not_interpreted_as_a_git_option() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        super::handle_stage_intent(&mut dispatcher, &ToolArgs {
+            path: Some("-A".to_string()),
+            ..ToolArgs::default()
+        });
+        match dispatcher.pending.unwrap().kind {
+            WorkflowKind::StagePlan { args } => assert_eq!(args, vec!["add", "--", "-A"]),
+            kind => panic!("unexpected workflow: {kind:?}"),
+        }
     }
 
     #[test]
