@@ -192,6 +192,7 @@ Optional:
   llm_cli init --full    # Also download routing models
   llm_cli doctor --full  # Inspect setup problems without changing anything
   llm_cli setup          # Create a commented configuration file
+  source <(llm_cli completions bash)  # Enable Bash Tab completion for this shell
 
 Pass --with-models to this installer to pull all default local models now.
 EOF

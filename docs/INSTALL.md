@@ -64,6 +64,36 @@ Direct shell activity is recorded locally after commands run. Inspect it with
 `llm_cli audit` (the latest 20 records) or `llm_cli audit --tail 0` (all
 records); neither command modifies the audit log.
 
+## Shell completion
+
+The command can complete its subcommands, flags, and shell names with Tab. It
+does not alter shell startup files automatically. Choose the command for your
+shell:
+
+```bash
+# Bash: enable for this terminal; add the same line to ~/.bashrc to persist it.
+source <(llm_cli completions bash)
+
+# Zsh: persist it in a directory already in $fpath, then start a new shell.
+llm_cli completions zsh > "${fpath[1]}/_llm_cli"
+
+# Fish: persist it using Fish's normal completion directory.
+llm_cli completions fish > ~/.config/fish/completions/llm_cli.fish
+```
+
+For PowerShell, add the following line to your PowerShell profile to enable it
+in future sessions:
+
+```powershell
+llm_cli completions powershell | Out-String | Invoke-Expression
+```
+
+`--config` is global, so it works before or after a subcommand. For example:
+
+```bash
+llm_cli ask "summarize this project" --config /path/to/config.toml
+```
+
 ## Manual path
 
 1. Install Rust through [rustup](https://rustup.rs).

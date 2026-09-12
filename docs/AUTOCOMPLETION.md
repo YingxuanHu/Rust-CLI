@@ -1,6 +1,9 @@
 # Autocompletion
 
-Ghost-text completion with smart path detection and frecency-based ranking.
+Ghost-text completion inside the TUI with smart path detection and
+frecency-based ranking. For Tab completion in Bash, Zsh, Fish, or PowerShell,
+run `llm_cli completions <shell>`; the install instructions are in
+[INSTALL.md](INSTALL.md#shell-completion).
 
 ## Core Structure
 
@@ -115,4 +118,3 @@ last_accessed = 1733875300
 ## Implementation
 
 `CompletionProvider::get_ghost_completion()` returns only the **suffix** to append. Fuzzy matching uses `SkimMatcherV2`, path completion uses `std::fs::read_dir()` sorted by frecency score.
-

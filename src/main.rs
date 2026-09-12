@@ -30,6 +30,7 @@ mod ollama;
 mod patch;
 mod repo;
 mod session;
+mod shell_completion;
 #[cfg(test)]
 mod test_support;
 mod tools;
@@ -40,7 +41,7 @@ mod workflow;
 #[command(author, version, about = "LLM-powered CLI (Rust + Ollama)")]
 struct Cli {
     /// Optional config file path (TOML)
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -93,6 +94,11 @@ enum Command {
         /// Number of recent entries to display; use 0 for the entire log
         #[arg(long, default_value_t = 20)]
         tail: usize,
+    },
+    /// Generate a shell completion script
+    Completions {
+        /// Shell to generate completion for
+        shell: shell_completion::CompletionShell,
     },
     /// Launch the TUI (default)
     Run,
@@ -196,6 +202,9 @@ async fn main() -> Result<()> {
             let records = audit::read_shell_executions(&config.audit_path, &cwd, tail)?;
             println!("{}", audit::render_shell_executions(&records));
         }
+        Command::Completions { shell } => {
+            print!("{}", shell_completion::script(shell));
+        }
         Command::Run => {
             let config = config::Config::load(config_path).context("loading config")?;
             let outcome = bootstrap::prepare_for_launch(&config)?;
@@ -219,6 +228,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
 
     use super::{Cli, Command};
@@ -244,5 +255,33 @@ mod tests {
             }
             command => panic!("unexpected command: {command:?}"),
         }
+    }
+
+    #[test]
+    fn accepts_config_after_a_subcommand() {
+        let cli = Cli::try_parse_from([
+            "llm_cli",
+            "ask",
+            "explain",
+            "this",
+            "--config",
+            "project.toml",
+        ])
+        .expect("global config should parse after a subcommand");
+
+        assert_eq!(cli.config, Some(PathBuf::from("project.toml")));
+        assert!(matches!(cli.command, Some(Command::Ask { .. })));
+    }
+
+    #[test]
+    fn parses_a_shell_completion_command() {
+        let cli = Cli::try_parse_from(["llm_cli", "completions", "fish"])
+            .expect("completion command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Completions {
+                shell: crate::shell_completion::CompletionShell::Fish
+            })
+        ));
     }
 }

@@ -36,6 +36,10 @@ llm_cli ask "give me a concise testing checklist" --json
 `ask` streams normal output for people and emits one JSON object with `--json`
 for scripts. It does not run shell commands, edit files, or start Git workflows.
 
+The installed command can also complete its subcommands and flags with Tab in
+your shell. See [shell completion setup](docs/INSTALL.md#shell-completion) for
+one copy-and-paste command per shell.
+
 The full manual and troubleshooting guide is in [docs/INSTALL.md](docs/INSTALL.md).
 The same installer supports a verified no-Cargo path after downloading it:
 `bash install.sh --binary`.
@@ -288,7 +292,7 @@ When the LLM suggests shell commands, type:
 
 **Configuration (`.llm-cli/config.toml`):**
 
-- Run `llm_cli setup` to create `.llm-cli/config.toml` without overwriting an existing file, or copy `config.example.toml`. Pass an explicit file via `llm_cli --config /path/to/config.toml` if needed.
+- Run `llm_cli setup` to create `.llm-cli/config.toml` without overwriting an existing file, or copy `config.example.toml`. Pass an explicit file with `--config /path/to/config.toml` before or after a subcommand, such as `llm_cli ask "explain this project" --config /path/to/config.toml`.
 - When the file is missing, the CLI falls back to built-in defaults so it still works out of the box. Those defaults are:
   - `model = "llama3"`
   - `ollama_host = "127.0.0.1:11434"` (or an HTTPS API base)
