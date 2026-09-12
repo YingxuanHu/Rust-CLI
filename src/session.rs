@@ -46,6 +46,9 @@ impl SessionState {
 
     /// Update all location-dependent session metadata after an in-app `cd`.
     pub fn set_cwd(&mut self, cwd: PathBuf) {
+        if self.cwd != cwd {
+            self.recent_outputs.clear();
+        }
         self.repo_root = find_git_root(&cwd);
         self.repo_info = RepoInfo::detect(&cwd);
         self.cwd = cwd;
@@ -85,6 +88,18 @@ fn truncate_to_bytes(content: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_directory_clears_output_context_from_the_previous_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = SessionState::new();
+        session.record_output("tests", "old suite failed", "old project diagnostic");
+        session.set_cwd(directory.path().to_path_buf());
+        assert!(session.recent_outputs.is_empty());
+        session.record_output("tests", "current suite passed", "current diagnostic");
+        session.set_cwd(directory.path().to_path_buf());
+        assert_eq!(session.recent_outputs.len(), 1);
+    }
 
     #[test]
     fn output_truncation_preserves_utf8_boundaries() {

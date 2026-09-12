@@ -230,6 +230,12 @@ pub fn parse_edit_request(input: &str) -> Option<ToolArgs> {
 pub fn quick_match(input: &str) -> Option<ParsedIntent> {
     let trimmed = input.trim();
 
+    match trimmed.to_ascii_lowercase().as_str() {
+        "run tests" => return Some(ParsedIntent::new("run_tests", 1.0)),
+        "help" | "?" => return Some(ParsedIntent::new("help", 1.0)),
+        _ => {}
+    }
+
     if matches!(
         trimmed.to_ascii_lowercase().as_str(),
         "start" | "getting started" | "show me around" | "what should i do first"
@@ -280,6 +286,14 @@ pub fn quick_match(input: &str) -> Option<ParsedIntent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_test_and_help_commands_do_not_need_a_model() {
+        assert_eq!(quick_match("  RUN TESTS ").unwrap().tool, "run_tests");
+        assert_eq!(quick_match("help").unwrap().tool, "help");
+        assert_eq!(quick_match("?").unwrap().tool, "help");
+        assert!(quick_match("how do I run tests?").is_none());
+    }
 
     #[test]
     fn test_quick_match_shell() {

@@ -46,7 +46,11 @@ pub trait IntentDispatcher {
     fn record_command_usage(&mut self, command: &str);
     fn get_last_applied_patch(&self) -> Option<AppliedPatch>;
     fn clear_last_applied_patch(&mut self);
+    fn has_active_task(&self) -> bool;
+    fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]);
 }
+
+const TASK_BUSY: &str = "Tests are still running. Press Ctrl+C or type `cancel task` to stop them before starting another command. You can still ask questions, use help, or change directories.";
 
 fn run_tool_command<D: IntentDispatcher>(
     dispatcher: &D,
@@ -69,6 +73,14 @@ pub fn dispatch_intent<D: IntentDispatcher>(
     intent: &ParsedIntent,
     original_input: &str,
 ) -> bool {
+    // Shell, Git, build, and file workflows still use the synchronous runner.
+    // Do not block the UI or modify files underneath an active test suite.
+    if dispatcher.has_active_task()
+        && !matches!(intent.tool.as_str(), "chat" | "help" | "getting_started" | "explain_project" | "run_tests")
+    {
+        dispatcher.reply(TASK_BUSY);
+        return true;
+    }
     let handled = match intent.tool.as_str() {
         "shell" => {
             if let Some(cmd) = &intent.args.command {
@@ -198,6 +210,10 @@ fn handle_getting_started_intent<D: IntentDispatcher>(dispatcher: &mut D) {
 }
 
 pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str) {
+    if dispatcher.has_active_task() {
+        dispatcher.reply(TASK_BUSY);
+        return;
+    }
     if cmd.is_empty() {
         dispatcher.reply("Usage: $ <command> or ! <command>");
         return;
@@ -255,6 +271,10 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
 /// This is called only by the matching workflow response, and deliberately
 /// skips reclassification so a single confirmation cannot loop forever.
 pub fn handle_approved_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str) {
+    if dispatcher.has_active_task() {
+        dispatcher.reply(TASK_BUSY);
+        return;
+    }
     let assessment = command_policy::assess_shell_command(cmd);
     execute_shell_command(dispatcher, cmd, assessment.risk);
 }
@@ -463,13 +483,12 @@ fn handle_find_todos_intent<D: IntentDispatcher>(dispatcher: &mut D) {
 
 fn handle_run_tests_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_info) = dispatcher.get_session_repo_info() {
-        let (program, args) = repo_info.test_command();
-        let args_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
-        
-        match run_tool_command(dispatcher, &repo_info.root, program, &args_refs) {
-            Ok(out) => dispatcher.reply(format!("{} {} output:\n{}", program, args.join(" "), out)),
-            Err(err) => dispatcher.reply(format!("{} {} failed: {}", program, args.join(" "), format_error(&err))),
+        if repo_info.project_type == ProjectType::Unknown {
+            dispatcher.reply("No test command is known for this project.");
+            return;
         }
+        let (program, args) = repo_info.test_command();
+        dispatcher.start_command_task("Tests", repo_info.root.clone(), program, &args);
     } else {
         dispatcher.reply("No project detected; cannot run tests.");
     }
@@ -890,7 +909,8 @@ MODES
         • Macro expansion for composable workflows
 
 KEY BINDINGS
-    Esc / Ctrl+C        Exit the application
+    Esc                 Exit (stops the active test task first)
+    Ctrl+C              Cancel active tests; exit when no test task is active
     Ctrl+S              Toggle between Chat and Shell mode
     Tab                 Autocomplete (context-aware)
     Enter               Submit current input
@@ -918,7 +938,8 @@ COMMON COMMANDS
   Project Commands
     cd <directory>      Change the session directory and re-detect the project
     build               Build the project (cargo/npm/etc.)
-    run tests           Run project test suite
+    run tests           Stream project tests with elapsed time and exit status
+    cancel task         Stop the active test task (also Ctrl+C while running)
     explain project     Show project type and structure
 
   Shell Commands
@@ -979,9 +1000,10 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    use super::{handle_shell_dispatch, AssistantEvent, IntentDispatcher};
+    use super::{dispatch_intent, handle_approved_shell_dispatch, handle_run_tests_intent, handle_shell_dispatch, AssistantEvent, IntentDispatcher};
     use crate::{
         config::Config,
+        intent::ParsedIntent,
         patch::AppliedPatch,
         repo::{ProjectType, RepoInfo},
         session::Role,
@@ -1018,6 +1040,9 @@ mod tests {
         pending: Option<WorkflowState>,
         tx: mpsc::UnboundedSender<AssistantEvent>,
         history: Vec<String>,
+        active_task: bool,
+        repo_info: Option<RepoInfo>,
+        tasks: Vec<(String, PathBuf, String, Vec<String>)>,
     }
 
     impl TestDispatcher {
@@ -1030,6 +1055,9 @@ mod tests {
                 pending: None,
                 tx,
                 history: Vec::new(),
+                active_task: false,
+                repo_info: None,
+                tasks: Vec::new(),
             }
         }
     }
@@ -1060,7 +1088,7 @@ mod tests {
         }
 
         fn get_session_repo_info(&self) -> Option<RepoInfo> {
-            None
+            self.repo_info.clone()
         }
 
         fn get_input_history(&self) -> &[String] {
@@ -1090,6 +1118,73 @@ mod tests {
         }
 
         fn clear_last_applied_patch(&mut self) {}
+
+        fn has_active_task(&self) -> bool {
+            self.active_task
+        }
+
+        fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]) {
+            self.tasks.push((label.to_string(), cwd, program.to_string(), args.iter().map(|arg| arg.to_string()).collect()));
+        }
+    }
+
+    #[test]
+    fn run_tests_dispatches_explicit_arguments_at_the_detected_project_root() {
+        let directory = tempfile::tempdir().unwrap();
+        for (project_type, program, args) in [
+            (ProjectType::Rust, "cargo", vec!["test"]),
+            (ProjectType::Node, "npm", vec!["test"]),
+            (ProjectType::Python, "pytest", vec![]),
+            (ProjectType::Go, "go", vec!["test", "./..."]),
+        ] {
+            let mut dispatcher = TestDispatcher::new(directory.path().join("src"));
+            dispatcher.repo_info = Some(RepoInfo {
+                project_type,
+                root: directory.path().to_path_buf(),
+                name: None,
+                source_dirs: Vec::new(),
+            });
+            dispatch_intent(&mut dispatcher, &ParsedIntent::new("run_tests", 1.0), "run tests");
+            assert_eq!(dispatcher.tasks, vec![("Tests".to_string(), directory.path().to_path_buf(), program.to_string(), args.iter().map(|arg| arg.to_string()).collect())]);
+            assert!(dispatcher.replies.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_or_unknown_project_does_not_report_a_fake_test_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        handle_run_tests_intent(&mut dispatcher);
+        assert!(dispatcher.tasks.is_empty());
+        assert!(dispatcher.replies.last().unwrap().contains("No project"));
+        dispatcher.repo_info = Some(RepoInfo {
+            project_type: ProjectType::Unknown,
+            root: directory.path().to_path_buf(),
+            name: None,
+            source_dirs: Vec::new(),
+        });
+        handle_run_tests_intent(&mut dispatcher);
+        assert!(dispatcher.tasks.is_empty());
+        assert!(dispatcher.replies.last().unwrap().contains("No test command"));
+    }
+
+    #[test]
+    fn active_tests_block_all_command_entry_points_before_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        dispatcher.active_task = true;
+        for tool in ["shell", "stage", "commit", "save_work", "build", "write_file", "edit_file", "rollback_edit", "status", "shell_repeat"] {
+            assert!(dispatch_intent(&mut dispatcher, &ParsedIntent::new(tool, 1.0), tool));
+            assert!(dispatcher.replies.last().unwrap().contains("Tests are still running"));
+            assert!(dispatcher.pending.is_none());
+        }
+        handle_shell_dispatch(&mut dispatcher, "printf should-not-run");
+        assert!(dispatcher.replies.last().unwrap().contains("Tests are still running"));
+        handle_approved_shell_dispatch(&mut dispatcher, "printf should-not-run");
+        assert!(dispatcher.replies.last().unwrap().contains("Tests are still running"));
+        assert!(!dispatch_intent(&mut dispatcher, &ParsedIntent::new("chat", 1.0), "question"));
+        assert!(dispatch_intent(&mut dispatcher, &ParsedIntent::new("help", 1.0), "help"));
+        assert!(dispatcher.replies.last().unwrap().contains("COMMON COMMANDS"));
     }
 
     #[test]

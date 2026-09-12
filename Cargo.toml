@@ -27,6 +27,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "proce
 strsim = "0.11"
 fuzzy-matcher = "0.3"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 

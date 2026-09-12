@@ -61,6 +61,7 @@ pub struct AppView<'a> {
     pub pending_count: usize,
     pub has_workflow: bool,
     pub ghost_text: Option<&'a str>,
+    pub task_status: Option<String>,
 }
 
 pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
@@ -118,6 +119,15 @@ pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
     let cursor_y = chunks[1].y + 1;
     f.set_cursor(cursor_x, cursor_y);
 
+    // A running task takes precedence over model/cwd details. Keep its final
+    // clause (the cancellation hint or cancelling state) visible when narrow.
+    if let Some(task_status) = view.task_status {
+        let status = Paragraph::new(fit_task_status(&task_status, chunks[2].width as usize))
+            .style(Style::default().fg(Color::Yellow).bold());
+        f.render_widget(status, chunks[2]);
+        return;
+    }
+
     let mut status_parts = vec![
         Span::raw(view.model).bold(),
         Span::raw(" | "),
@@ -139,6 +149,34 @@ pub fn render_ui(f: &mut ratatui::Frame, view: AppView) {
     let status_text = Line::from(status_parts);
     let status = Paragraph::new(status_text);
     f.render_widget(status, chunks[2]);
+}
+
+fn fit_task_status(status: &str, width: usize) -> String {
+    if Line::from(status).width() <= width {
+        return status.to_string();
+    }
+    let (_, final_clause) = status.rsplit_once(" • ").unwrap_or(("", status));
+    let final_width = Line::from(final_clause).width();
+    if final_width >= width {
+        return truncate_to_width(final_clause, width);
+    }
+    let prefix_width = width.saturating_sub(final_width + 2);
+    if prefix_width == 0 {
+        return final_clause.to_string();
+    }
+    format!("{}… {}", truncate_to_width(status, prefix_width), final_clause)
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    for ch in text.chars() {
+        result.push(ch);
+        if Line::from(result.as_str()).width() > width {
+            result.pop();
+            break;
+        }
+    }
+    result
 }
 
 fn render_messages(messages: &[Message], available_width: usize) -> Vec<Line<'static>> {
@@ -187,10 +225,12 @@ fn format_message_body(content: &str) -> Vec<String> {
         // Only trim trailing whitespace, preserve leading indentation
         let trimmed = line.trim_end();
         
-        // Check for bullet points after any leading whitespace
-        if let Some(bullet_pos) = trimmed.find('•') {
-            let indent = &trimmed[..bullet_pos];
-            lines_out.extend(trimmed.split('•').filter_map(|chunk| {
+        // Only list markers after whitespace begin a list. An inline bullet
+        // (such as the elapsed-time separator) must not duplicate its prefix.
+        let indent_len = trimmed.len() - trimmed.trim_start().len();
+        let (indent, body) = trimmed.split_at(indent_len);
+        if let Some(items) = body.strip_prefix('•') {
+            lines_out.extend(items.split('•').filter_map(|chunk| {
                 let part = chunk.trim();
                 if part.is_empty() {
                     None
@@ -278,3 +318,81 @@ fn clip_lines_from_bottom<'a>(
     lines[start..end].to_vec()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn inline_status_separators_are_not_reinterpreted_as_bullet_lists() {
+        let status = "RUNNING — Ctrl+C to cancel • 1.2s";
+        assert_eq!(format_message_body(status), vec![status]);
+        assert_eq!(format_message_body("  • first • second"), vec!["  • first", "  • second"]);
+    }
+
+    fn render_status(width: u16, task_status: Option<&str>) -> (String, Color) {
+        let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_ui(frame, AppView {
+                    messages: &[],
+                    scroll: 0,
+                    input: "still typing",
+                    input_mode: InputMode::Chat,
+                    model: "test-model",
+                    _streaming: true,
+                    cwd: "/very/long/project/directory/that/should/not/hide/cancel".to_string(),
+                    _repo_root: None,
+                    pending_count: 2,
+                    has_workflow: true,
+                    ghost_text: None,
+                    task_status: task_status.map(str::to_string),
+                });
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let status = (0..width)
+            .map(|x| buffer.get(x, 9).symbol())
+            .collect::<String>();
+        (status.trim_end().to_string(), buffer.get(0, 9).fg)
+    }
+
+    #[test]
+    fn running_task_status_shows_identity_elapsed_and_cancel_hint() {
+        let status = "Tests #1 • running 1.2s • Ctrl+C cancel";
+        let (rendered, color) = render_status(80, Some(status));
+        assert_eq!(rendered, status);
+        assert_eq!(color, Color::Yellow);
+    }
+
+    #[test]
+    fn cancelling_task_remains_visible() {
+        let status = "Tests #4 • cancelling 3.1s";
+        let (rendered, _) = render_status(40, Some(status));
+        assert_eq!(rendered, status);
+    }
+
+    #[test]
+    fn narrow_task_status_preserves_cancel_hint() {
+        let status = "Tests #1 • running 1.2s • Ctrl+C cancel";
+        let (rendered, _) = render_status(30, Some(status));
+        assert!(rendered.starts_with("Tests #1"), "{rendered}");
+        assert!(rendered.ends_with("Ctrl+C cancel"), "{rendered}");
+        let (very_narrow, _) = render_status(13, Some(status));
+        assert_eq!(very_narrow, "Ctrl+C cancel");
+    }
+
+    #[test]
+    fn no_task_preserves_existing_status_details() {
+        let (rendered, _) = render_status(120, None);
+        assert_eq!(rendered, "test-model | /very/long/project/directory/that/should/not/hide/cancel | pending: 2 | workflow: confirm");
+    }
+
+    #[test]
+    fn task_status_truncation_respects_terminal_cell_width() {
+        let rendered = fit_task_status("測試 #2 • running 1.2s • Ctrl+C cancel", 26);
+        assert!(Line::from(rendered.as_str()).width() <= 26);
+        assert!(rendered.ends_with("Ctrl+C cancel"));
+        assert_eq!(fit_task_status("Tests #1 • running", 0), "");
+    }
+}

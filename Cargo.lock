@@ -717,6 +717,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "fuzzy-matcher",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

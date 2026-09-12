@@ -32,6 +32,7 @@ mod patch;
 mod repo;
 mod session;
 mod shell_completion;
+mod task_runner;
 #[cfg(test)]
 mod test_support;
 mod tools;

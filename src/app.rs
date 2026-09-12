@@ -28,6 +28,7 @@ use crate::{
     learned::LearnedAliases,
     patch::{self, AppliedPatch, PatchReview},
     session::{Message, Role, SessionState},
+    task_runner::{self, TaskHandle, TaskId, TaskOutcome, TaskSnapshot, TaskSpec},
     ui::{render_ui, AppView, InputMode, TerminalGuard},
     workflow::{generate_commit_message_async, handle_workflow_response, WorkflowResponder, WorkflowState},
 };
@@ -56,48 +57,50 @@ pub async fn run(config: Config) -> Result<()> {
     let tick_rate = Duration::from_millis(100);
     let mut last_tick = Instant::now();
 
-    loop {
-        terminal
-            .terminal
-            .draw(|f| {
-                let view = app.create_view();
-                render_ui(f, view);
-            })
-            .context("drawing frame")?;
+    let result = async {
+        loop {
+            terminal
+                .terminal
+                .draw(|f| {
+                    let view = app.create_view();
+                    render_ui(f, view);
+                })
+                .context("drawing frame")?;
 
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or(Duration::from_millis(0));
+            let timeout = tick_rate
+                .checked_sub(last_tick.elapsed())
+                .unwrap_or(Duration::from_millis(0));
 
-        if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Press {
-                        handle_key_event(&mut app, key);
+            if event::poll(timeout)? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            handle_key_event(&mut app, key);
+                        }
                     }
+                    Event::Mouse(mouse) => handle_mouse_event(&mut app, mouse),
+                    _ => {}
                 }
-                Event::Mouse(mouse) => {
-                    handle_mouse_event(&mut app, mouse);
-                }
-                _ => {}
+            }
+
+            app.poll_assistant();
+            app.poll_command_task();
+
+            if app.should_quit {
+                app.save_input_history();
+                let _ = app.frecency.save();
+                break;
+            }
+
+            if last_tick.elapsed() >= tick_rate {
+                last_tick = Instant::now();
             }
         }
-
-        app.poll_assistant();
-
-        if app.should_quit {
-            app.save_input_history();
-            // Explicitly save frecency data before quitting
-            let _ = app.frecency.save();
-            break;
-        }
-
-        if last_tick.elapsed() >= tick_rate {
-            last_tick = Instant::now();
-        }
-    }
-
-    Ok(())
+        Ok(())
+    }.await;
+    // This also runs when rendering or input fails, not just on Escape.
+    app.shutdown_command_task().await;
+    result
 }
 
 const MAX_INPUT_HISTORY: usize = 500;
@@ -105,6 +108,70 @@ const MAX_INPUT_HISTORY: usize = 500;
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedInput {
     input: String,
+}
+
+struct ActiveTask {
+    id: TaskId,
+    label: String,
+    command: String,
+    cwd: PathBuf,
+    request_cwd: PathBuf,
+    message_idx: usize,
+    started: Instant,
+    cancelling: bool,
+    handle: TaskHandle,
+}
+
+impl ActiveTask {
+    fn status(&self) -> String {
+        format!("{} #{} • running {:.1}s • {}", self.label, self.id.0,
+            self.started.elapsed().as_secs_f64(),
+            if self.cancelling { "cancelling…" } else { "Ctrl+C cancel" })
+    }
+
+    fn render(&self, snapshot: &TaskSnapshot) -> String {
+        let state = match &snapshot.outcome {
+            Some(outcome) => task_outcome_label(outcome),
+            None if self.cancelling => "CANCELLING — stopping child processes".to_string(),
+            None => "RUNNING — Ctrl+C or `cancel task` to stop".to_string(),
+        };
+        let mut text = format!("{} #{} — {}\nDirectory: {}\n{} • {:.1}s\n",
+            self.label, self.id.0, self.command, self.cwd.display(), state,
+            self.started.elapsed().as_secs_f64());
+        for (name, output, truncated) in [
+            ("stdout", &snapshot.stdout, snapshot.stdout_truncated),
+            ("stderr", &snapshot.stderr, snapshot.stderr_truncated),
+        ] {
+            if !output.is_empty() || truncated {
+                text.push_str(&format!("\n{name}:\n"));
+                if truncated {
+                    text.push_str("[Earlier output truncated; showing the retained tail]\n");
+                }
+                // Do not pass terminal-control bytes from a subprocess through
+                // Ratatui. Newlines and tabs remain useful in test diagnostics.
+                text.extend(output.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')));
+                text.push('\n');
+            }
+        }
+        if snapshot.stdout.is_empty() && snapshot.stderr.is_empty() {
+            text.push_str(if snapshot.outcome.is_some() { "\n(no output)" } else { "\nWaiting for output…" });
+        }
+        if snapshot.outcome.is_some() {
+            text.push_str("\nType `run tests` to run the current project's suite again.");
+        }
+        text
+    }
+}
+
+fn task_outcome_label(outcome: &TaskOutcome) -> String {
+    match outcome {
+        TaskOutcome::Succeeded => "PASSED (exit 0)".to_string(),
+        TaskOutcome::Failed { code: Some(code) } => format!("FAILED (exit {code})"),
+        TaskOutcome::Failed { code: None } => "FAILED (terminated by signal)".to_string(),
+        TaskOutcome::Cancelled => "CANCELLED".to_string(),
+        TaskOutcome::TimedOut => "TIMED OUT".to_string(),
+        TaskOutcome::Error(error) => format!("TASK ERROR: {error}"),
+    }
 }
 
 struct App {
@@ -129,6 +196,8 @@ struct App {
     completion_provider: CompletionProvider,
     ghost_text: Option<String>,
     frecency: FrecencyTracker,
+    active_task: Option<ActiveTask>,
+    next_task_id: u64,
 }
 
 impl App {
@@ -164,6 +233,8 @@ impl App {
             completion_provider: CompletionProvider::new(),
             ghost_text: None,
             frecency: FrecencyTracker::load(&frecency_path),
+            active_task: None,
+            next_task_id: 1,
         };
 
         let status = if embeddings_ready {
@@ -205,11 +276,101 @@ impl App {
             pending_count: self.pending_idxs.len(),
             has_workflow: self.pending_workflow.is_some(),
             ghost_text: self.ghost_text.as_deref(),
+            task_status: self.active_task.as_ref().map(ActiveTask::status),
+        }
+    }
+
+    fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]) {
+        if self.active_task.is_some() {
+            self.reply("A test task is already running. Press Ctrl+C or type `cancel task` before starting another.");
+            return;
+        }
+        if self.pending_workflow.is_some() {
+            self.reply("Finish or cancel the pending workflow before starting tests.");
+            return;
+        }
+        let id = TaskId(self.next_task_id);
+        self.next_task_id += 1;
+        let spec = TaskSpec {
+            id,
+            cwd: cwd.clone(),
+            program: program.to_string(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            timeout: Duration::from_secs(self.config.cmd_timeout_secs),
+        };
+        let idx = self.pending_placeholder();
+        let task = ActiveTask {
+            id,
+            label: label.to_string(),
+            command: std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" "),
+            cwd,
+            request_cwd: self.session.cwd.clone(),
+            message_idx: idx,
+            started: Instant::now(),
+            cancelling: false,
+            handle: task_runner::spawn(spec),
+        };
+        let content = task.render(&task.handle.updates.borrow());
+        self.upsert_message(idx, Role::Assistant, content);
+        self.scroll = 0;
+        self.viewing_history = false;
+        self.active_task = Some(task);
+    }
+
+    fn cancel_command_task(&mut self) -> bool {
+        if let Some(task) = self.active_task.as_mut() {
+            task.cancelling = true;
+            task.handle.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn poll_command_task(&mut self) {
+        let Some(task) = self.active_task.take() else { return; };
+        // Latest-only snapshots bound both memory and work per UI tick. Read
+        // even after the sender closes so the final result cannot be lost.
+        let mut snapshot = task.handle.updates.borrow().clone();
+        if snapshot.outcome.is_none() && task.handle.updates.has_changed().is_err() {
+            snapshot.outcome = Some(TaskOutcome::Error(
+                "Task worker stopped unexpectedly; completion could not be confirmed.".to_string()
+            ));
+        }
+        if snapshot.id != task.id {
+            self.active_task = Some(task);
+            return;
+        }
+        let content = task.render(&snapshot);
+        self.upsert_message(task.message_idx, Role::Assistant, content.clone());
+        if let Some(outcome) = &snapshot.outcome {
+            let has_later_messages = task.message_idx + 1 < self.messages.len();
+            self.pending_idxs.retain(|&idx| idx != task.message_idx);
+            self.session.record(Message { role: Role::Assistant, content });
+            if self.session.cwd == task.request_cwd {
+                let summary = format!("{} #{}: {} in {}", task.label, task.id.0, task_outcome_label(outcome), task.cwd.display());
+                self.session.record_output("tests", &summary, &format!("stderr:\n{}\nstdout:\n{}", snapshot.stderr, snapshot.stdout));
+            }
+            if has_later_messages {
+                self.reply(format!("{} #{} finished — {} ({:.1}s).\nDirectory: {}\nFull output is in its task entry above.",
+                    task.label, task.id.0, task_outcome_label(outcome),
+                    task.started.elapsed().as_secs_f64(), task.cwd.display()));
+            }
+        } else {
+            self.active_task = Some(task);
+        }
+    }
+
+    async fn shutdown_command_task(&mut self) {
+        if let Some(task) = self.active_task.take() {
+            task.handle.shutdown().await;
+            self.pending_idxs.retain(|&idx| idx != task.message_idx);
         }
     }
 
     fn poll_assistant(&mut self) {
-        while let Ok(event) = self.assistant_rx.try_recv() {
+        for _ in 0..64 {
+            let Ok(event) = self.assistant_rx.try_recv() else { break; };
             match event {
                 AssistantEvent::Token { idx, chunk } => self.append_assistant_chunk(idx, chunk),
                 AssistantEvent::Completed { idx, content, original_input, cwd } => {
@@ -320,7 +481,7 @@ impl App {
         
         // Check if the response contains shell commands
         let commands = crate::workflow::extract_commands_from_text(&final_content);
-        if !commands.is_empty() && self.pending_workflow.is_none() && self.session.cwd == cwd {
+        if !commands.is_empty() && self.pending_workflow.is_none() && self.active_task.is_none() && self.session.cwd == cwd {
             let combined = commands.join(" && ");
             
             let msg = if commands.len() == 1 {
@@ -753,6 +914,14 @@ impl IntentDispatcher for App {
     fn clear_last_applied_patch(&mut self) {
         self.last_applied_patch = None;
     }
+
+    fn has_active_task(&self) -> bool {
+        self.active_task.is_some()
+    }
+
+    fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]) {
+        self.start_command_task(label, cwd, program, args);
+    }
 }
 
 // Implement WorkflowResponder for App
@@ -781,7 +950,9 @@ impl WorkflowResponder for App {
 fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true
+            if !app.cancel_command_task() {
+                app.should_quit = true;
+            }
         }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Toggle input mode
@@ -850,6 +1021,20 @@ fn submit_input(app: &mut App) {
     
     // User is submitting new input, unlock scroll so new responses appear at bottom
     app.scroll_locked = false;
+
+    // Task control works in either input mode and never enters a shell or LLM.
+    if raw_input.eq_ignore_ascii_case("cancel task") {
+        app.push_recorded(Role::User, raw_input);
+        if !app.cancel_command_task() {
+            app.reply("There is no active test task to cancel.");
+        }
+        return;
+    }
+    if app.active_task.is_some() && matches!(raw_input.to_ascii_lowercase().as_str(), "help" | "?") {
+        app.push_recorded(Role::User, raw_input.clone());
+        dispatch_intent(app, &ParsedIntent::new("help", 1.0), &raw_input);
+        return;
+    }
 
     // Handle pending workflow confirmations first (before recording to history)
     if app.pending_workflow.is_some() {
@@ -1038,6 +1223,10 @@ fn directory_change_target(input: &str) -> Option<&str> {
 }
 
 fn handle_pending_workflow(app: &mut App, prompt: &str) {
+    if app.active_task.is_some() {
+        app.reply("A test task is active. Cancel it before continuing this workflow.");
+        return;
+    }
     if let Some(workflow) = app.pending_workflow.take() {
         // Need to handle special case for SaveWorkPlan
         if matches!(
@@ -1276,5 +1465,257 @@ mod tests {
         assert_eq!(directory_change_target("$ cd ../other"), Some("../other"));
         assert_eq!(directory_change_target("! cd /tmp"), Some("/tmp"));
         assert_eq!(directory_change_target("cargo test"), None);
+    }
+
+    #[cfg(unix)]
+    fn start_fake_test(app: &mut App, script: &str) -> usize {
+        app.start_command_task("Tests", app.session.cwd.clone(), "sh", &["-c", script]);
+        app.active_task.as_ref().unwrap().message_idx
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_task_state(app: &mut App, condition: impl Fn(&App) -> bool) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.poll_command_task();
+                if condition(app) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("background task did not reach the expected state");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_test_output_keeps_typing_and_message_identity_responsive() {
+        let (directory, mut app) = isolated_app();
+        let idx = start_fake_test(&mut app,
+            "printf 'live-marker\\n'; while [ ! -e release-test ]; do sleep 0.05; done; printf 'done-marker\\n'");
+        wait_for_task_state(&mut app, |app| app.messages[idx].content.contains("stdout:\nlive-marker")).await;
+        assert!(app.active_task.is_some(), "output must arrive before the process exits");
+        assert!(app.pending_idxs.contains(&idx));
+        assert!(app.messages[idx].content.contains("RUNNING"));
+
+        for ch in "question".chars() {
+            handle_key_event(&mut app, crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input, "question");
+        assert!(!app.should_quit);
+
+        let newer_idx = app.pending_placeholder();
+        app.finish_assistant(newer_idx, Some("Independent chat reply".to_string()),
+            "question".to_string(), app.session.cwd.clone());
+        fs::write(directory.path().join("release-test"), "release").unwrap();
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+
+        assert!(app.messages[idx].content.contains("PASSED (exit 0)"));
+        assert!(app.messages[idx].content.contains("done-marker"));
+        assert_eq!(app.messages[newer_idx].content, "Independent chat reply");
+        assert!(!app.pending_idxs.contains(&idx));
+        assert_eq!(app.session.recent_outputs.front().unwrap().kind, "tests");
+        assert!(app.session.recent_outputs.front().unwrap().content.contains("done-marker"));
+        assert!(app.create_view().task_status.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_ctrl_c_cancels_without_quitting_or_releasing_task_early() {
+        let (_directory, mut app) = isolated_app();
+        let idx = start_fake_test(&mut app, "printf 'started-marker\\n'; sleep 30");
+        wait_for_task_state(&mut app, |app| app.messages[idx].content.contains("stdout:\nstarted-marker")).await;
+        let id = app.active_task.as_ref().unwrap().id;
+        let ctrl_c = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key_event(&mut app, ctrl_c);
+        handle_key_event(&mut app, ctrl_c);
+
+        assert!(!app.should_quit);
+        let task = app.active_task.as_ref().expect("cancellation must keep the task slot until final delivery");
+        assert_eq!(task.id, id);
+        assert!(task.cancelling);
+        assert!(app.pending_idxs.contains(&idx));
+        assert!(app.create_view().task_status.unwrap().contains("cancelling"));
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert!(app.messages[idx].content.contains("CANCELLED"));
+        assert!(!app.should_quit);
+        assert!(!app.pending_idxs.contains(&idx));
+
+        let next_idx = start_fake_test(&mut app, "printf 'second-test\\n'");
+        assert_ne!(app.active_task.as_ref().unwrap().id, id);
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert!(app.messages[next_idx].content.contains("PASSED (exit 0)"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn escape_shutdown_cleans_up_the_active_test() {
+        let (_directory, mut app) = isolated_app();
+        let idx = start_fake_test(&mut app, "printf 'started-marker\\n'; sleep 30");
+        wait_for_task_state(&mut app, |app| app.messages[idx].content.contains("stdout:\nstarted-marker")).await;
+        handle_key_event(&mut app, crossterm::event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.should_quit);
+        tokio::time::timeout(Duration::from_secs(3), app.shutdown_command_task())
+            .await.expect("exit should stop its child task promptly");
+        assert!(app.active_task.is_none());
+        assert!(!app.pending_idxs.contains(&idx));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn help_and_cd_work_while_tests_run_without_leaking_old_project_context() {
+        let (directory, mut app) = isolated_app();
+        let original_cwd = app.session.cwd.clone();
+        let next_directory = directory.path().join("next-project");
+        fs::create_dir(&next_directory).unwrap();
+        let idx = start_fake_test(&mut app,
+            "printf 'old-project-marker\\n'; while [ ! -e release-test ]; do sleep 0.05; done");
+        wait_for_task_state(&mut app, |app| app.messages[idx].content.contains("stdout:\nold-project-marker")).await;
+
+        for mode in [InputMode::Chat, InputMode::Shell] {
+            app.input_mode = mode;
+            app.input = "help".to_string();
+            submit_input(&mut app);
+            assert!(app.messages.last().unwrap().content.contains("cancel task"));
+            assert!(app.active_task.is_some());
+            assert!(app.pending_workflow.is_none());
+            let help_scroll = app.scroll;
+            app.poll_command_task();
+            assert_eq!(app.scroll, help_scroll, "task output must not steal the help scroll position");
+        }
+
+        app.session.record_output("tests", "Old project output", "old context");
+        app.input = "cd next-project".to_string();
+        submit_input(&mut app);
+        assert_eq!(app.session.cwd, next_directory.canonicalize().unwrap());
+        assert!(app.session.recent_outputs.is_empty());
+        assert!(app.active_task.is_some());
+        fs::write(original_cwd.join("release-test"), "release").unwrap();
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+
+        assert!(app.session.recent_outputs.is_empty(), "old project results must not become the new project's recent output");
+        assert!(app.messages[idx].content.contains(&format!("Directory: {}", original_cwd.display())));
+        assert!(app.messages[idx].content.contains("PASSED (exit 0)"));
+        assert!(app.messages[idx].content.contains("old-project-marker"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_tests_display_both_output_streams_and_exit_code() {
+        let (_directory, mut app) = isolated_app();
+        let idx = start_fake_test(&mut app, "printf 'assertion context\\n'; printf 'failure details\\n' >&2; exit 7");
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        let result = &app.messages[idx].content;
+        assert!(result.contains("FAILED (exit 7)"), "{result}");
+        assert!(result.contains("stdout:\nassertion context"), "{result}");
+        assert!(result.contains("stderr:\nfailure details"), "{result}");
+        assert!(app.session.recent_outputs.front().unwrap().content.contains("failure details"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_command_suggestions_do_not_open_workflows_during_tests() {
+        let (_directory, mut app) = isolated_app();
+        start_fake_test(&mut app, "sleep 30");
+        let idx = app.pending_placeholder();
+        let content = "Try this later:\n```sh\ncargo build\n```".to_string();
+        app.finish_assistant(idx, Some(content.clone()), "How do I build?".to_string(), app.session.cwd.clone());
+        assert_eq!(app.messages[idx].content, content);
+        assert!(app.pending_workflow.is_none());
+        assert!(app.active_task.is_some());
+        app.shutdown_command_task().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_test_task_is_rejected_until_the_first_finishes() {
+        let (directory, mut app) = isolated_app();
+        let first_idx = start_fake_test(&mut app, "sleep 30");
+        let first_id = app.active_task.as_ref().unwrap().id;
+        let next_id = app.next_task_id;
+        app.start_command_task("Tests", app.session.cwd.clone(), "sh", &["-c", "touch forbidden-second-task"]);
+        assert_eq!(app.active_task.as_ref().unwrap().id, first_id);
+        assert_eq!(app.active_task.as_ref().unwrap().message_idx, first_idx);
+        assert_eq!(app.next_task_id, next_id);
+        assert!(app.messages.last().unwrap().content.contains("already running"));
+        app.shutdown_command_task().await;
+        assert!(!directory.path().join("forbidden-second-task").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_bang_and_late_intents_cannot_bypass_the_active_test_guard() {
+        let (directory, mut app) = isolated_app();
+        start_fake_test(&mut app, "sleep 30");
+        let task_id = app.active_task.as_ref().unwrap().id;
+        for (mode, input) in [
+            (InputMode::Shell, "touch forbidden-shell"),
+            (InputMode::Chat, "$ touch forbidden-explicit"),
+            (InputMode::Chat, "!!"),
+        ] {
+            app.input_history.push("$ touch forbidden-bang".to_string());
+            app.input_mode = mode;
+            app.input = input.to_string();
+            submit_input(&mut app);
+            assert!(app.messages.last().unwrap().content.contains("Tests are still running"));
+            assert!(app.pending_workflow.is_none());
+            assert_eq!(app.active_task.as_ref().unwrap().id, task_id);
+        }
+        let idx = app.pending_placeholder();
+        let mut intent = ParsedIntent::new("shell", 1.0);
+        intent.args.command = Some("touch forbidden-late-intent".to_string());
+        app.assistant_tx.send(AssistantEvent::IntentResolved {
+            idx,
+            intent,
+            original_input: "create a file".to_string(),
+            cwd: app.session.cwd.clone(),
+        }).unwrap();
+        app.poll_assistant();
+        assert!(app.messages.last().unwrap().content.contains("Tests are still running"));
+        assert!(app.pending_workflow.is_none());
+        assert_eq!(app.active_task.as_ref().unwrap().id, task_id);
+        assert!(!app.pending_idxs.contains(&idx));
+        app.shutdown_command_task().await;
+        for name in ["forbidden-shell", "forbidden-explicit", "forbidden-bang", "forbidden-late-intent"] {
+            assert!(!directory.path().join(name).exists(), "unexpected command ran: {name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_task_input_works_in_chat_and_shell_modes() {
+        for mode in [InputMode::Chat, InputMode::Shell] {
+            let (_directory, mut app) = isolated_app();
+            let idx = start_fake_test(&mut app, "sleep 30");
+            app.input_mode = mode;
+            app.input = "cancel task".to_string();
+            submit_input(&mut app);
+            assert!(app.active_task.as_ref().unwrap().cancelling);
+            assert!(!app.should_quit);
+            assert!(app.pending_workflow.is_none());
+            wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+            assert!(app.messages[idx].content.contains("CANCELLED"));
+        }
+    }
+
+    #[test]
+    fn ctrl_c_without_a_task_still_exits() {
+        let (_directory, mut app) = isolated_app();
+        assert!(!app.cancel_command_task());
+        handle_key_event(&mut app, crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn cancel_task_without_an_active_task_is_a_noop_in_both_modes() {
+        for mode in [InputMode::Chat, InputMode::Shell] {
+            let (_directory, mut app) = isolated_app();
+            app.input_mode = mode;
+            app.input = "cancel task".to_string();
+            submit_input(&mut app);
+            assert!(app.active_task.is_none());
+            assert!(!app.should_quit);
+            assert!(app.pending_workflow.is_none());
+            assert!(app.messages.last().unwrap().content.contains("no active test task"));
+        }
     }
 }
