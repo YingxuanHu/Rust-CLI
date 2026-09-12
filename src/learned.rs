@@ -130,23 +130,10 @@ impl LearnedAliases {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("reading custom workflows from {}", path.display()))?;
         
-        // Try new format first, fall back to legacy "macros" format
-        if let Ok(data) = toml::from_str::<CustomWorkflowsData>(&contents) {
-            return Ok(data);
-        }
-        
-        // Legacy format with "macros" key
-        #[derive(Deserialize)]
-        struct LegacyData {
-            #[serde(default)]
-            macros: Vec<CustomWorkflow>,
-        }
-        
-        let legacy: LegacyData = toml::from_str(&contents)
-            .context("parsing custom_workflows.toml or macros.toml")?;
-        Ok(CustomWorkflowsData {
-            custom_workflows: legacy.macros,
-        })
+        // Deserialize every supported key through the same schema. Retrying a
+        // different defaulted schema after a parse error can hide invalid data
+        // and replace saved workflows with an empty list.
+        toml::from_str(&contents).context("parsing saved custom workflows")
     }
     
     /// Save a new learned alias to the specified file.
@@ -172,18 +159,21 @@ impl LearnedAliases {
             source: source.to_string(),
         };
         
-        self.aliases.insert(phrase.to_lowercase(), alias.clone());
-        
         // Load existing file or create new
         let mut data = if path.exists() {
-            Self::load_from_file(path).unwrap_or_else(|_| LearnedData { aliases: vec![] })
+            Self::load_from_file(path).with_context(|| {
+                format!(
+                    "cannot update {}; repair the existing learned aliases file and retry (file was not changed)",
+                    path.display()
+                )
+            })?
         } else {
             LearnedData { aliases: vec![] }
         };
         
         // Check if phrase already exists, replace if so
         data.aliases.retain(|a| a.phrase.to_lowercase() != phrase.to_lowercase());
-        data.aliases.push(alias);
+        data.aliases.push(alias.clone());
         
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
@@ -193,6 +183,7 @@ impl LearnedAliases {
         // Save
         let contents = toml::to_string_pretty(&data)?;
         fs::write(path, contents)?;
+        self.aliases.insert(phrase.to_lowercase(), alias);
         
         Ok(())
     }
@@ -219,8 +210,6 @@ impl LearnedAliases {
             source: source.to_string(),
         };
         
-        self.custom_workflows.insert(phrase.to_lowercase(), custom_wf.clone());
-        
         // Determine custom_workflows.toml path
         let workflows_path = if base_path.file_name().map_or(false, |n| n == "learned.toml") {
             base_path.parent()
@@ -231,19 +220,27 @@ impl LearnedAliases {
         };
         
         let legacy_commands_path = workflows_path.with_file_name("custom_commands.toml");
-        
-        // Load existing file or create new
-        let mut data = if workflows_path.exists() {
-            Self::load_custom_workflows_from_file(&workflows_path).unwrap_or_else(|_| CustomWorkflowsData { custom_workflows: vec![] })
-        } else if legacy_commands_path.exists() {
-            Self::load_custom_workflows_from_file(&legacy_commands_path).unwrap_or_else(|_| CustomWorkflowsData { custom_workflows: vec![] })
+        let legacy_macros_path = workflows_path.with_file_name("macros.toml");
+
+        // Use the same precedence as loading so the first save also preserves
+        // workflows from legacy files.
+        let existing_path = [&workflows_path, &legacy_commands_path, &legacy_macros_path]
+            .into_iter()
+            .find(|path| path.exists());
+        let mut data = if let Some(path) = existing_path {
+            Self::load_custom_workflows_from_file(path).with_context(|| {
+                format!(
+                    "cannot update {}; repair the existing workflows file and retry (file was not changed)",
+                    path.display()
+                )
+            })?
         } else {
             CustomWorkflowsData { custom_workflows: vec![] }
         };
         
         // Check if phrase already exists, replace if so
         data.custom_workflows.retain(|m| m.phrase.to_lowercase() != phrase.to_lowercase());
-        data.custom_workflows.push(custom_wf);
+        data.custom_workflows.push(custom_wf.clone());
         
         // Ensure parent directory exists
         if let Some(parent) = workflows_path.parent() {
@@ -253,6 +250,7 @@ impl LearnedAliases {
         // Save
         let contents = toml::to_string_pretty(&data)?;
         fs::write(workflows_path, contents)?;
+        self.custom_workflows.insert(phrase.to_lowercase(), custom_wf);
         
         Ok(())
     }
@@ -300,7 +298,7 @@ struct LearnedData {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CustomWorkflowsData {
-    #[serde(default, alias = "custom_commands")]
+    #[serde(default, alias = "custom_commands", alias = "macros")]
     custom_workflows: Vec<CustomWorkflow>,
 }
 
@@ -355,5 +353,77 @@ mod tests {
             .expect("custom workflow should be matched");
         assert_eq!(intent.tool, "shell");
         assert_eq!(intent.args.command.as_deref(), Some("git reset --hard HEAD"));
+    }
+
+    #[test]
+    fn saving_an_alias_preserves_malformed_existing_files() {
+        for contents in ["[[aliases]\n", "aliases = \"invalid shape\"\n"] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("learned.toml");
+            fs::write(&path, contents).unwrap();
+            let mut learned = LearnedAliases::default();
+
+            let error = learned.save_alias("new alias", "status", &path, "test").unwrap_err();
+
+            assert!(error.to_string().contains(&path.display().to_string()));
+            assert!(error.to_string().contains("repair"));
+            assert_eq!(fs::read(&path).unwrap(), contents.as_bytes());
+            assert!(learned.match_phrase("new alias").is_none());
+        }
+    }
+
+    #[test]
+    fn saving_a_workflow_preserves_malformed_current_and_legacy_files() {
+        for filename in ["custom_workflows.toml", "custom_commands.toml", "macros.toml"] {
+            for contents in [
+                "[[custom_workflows]\n",
+                "[[custom_workflows]]\nphrase = \"missing required fields\"\n",
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let existing_path = directory.path().join(filename);
+                fs::write(&existing_path, contents).unwrap();
+                let mut learned = LearnedAliases::default();
+
+                let error = learned
+                    .save_custom_workflow("new workflow", "git status", directory.path(), "test")
+                    .unwrap_err();
+
+                assert!(error.to_string().contains(&existing_path.display().to_string()));
+                assert!(error.to_string().contains("repair"));
+                assert_eq!(fs::read(&existing_path).unwrap(), contents.as_bytes());
+                assert!(learned.match_phrase("new workflow").is_none());
+                if filename != "custom_workflows.toml" {
+                    assert!(!directory.path().join("custom_workflows.toml").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_macro_data_survives_loading_and_saving_another_workflow() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("macros.toml");
+        fs::write(
+            &path,
+            "[[macros]]\nphrase = \"check work\"\ncommand = \"git status\"\ntimestamp = \"1\"\nsource = \"test\"\n",
+        )
+        .unwrap();
+
+        let learned_path = directory.path().join("learned.toml");
+        let mut learned = LearnedAliases::load(&learned_path, None).unwrap();
+        let matched = learned.match_phrase("check work").expect("legacy workflow was preserved");
+
+        assert_eq!(matched.tool, "shell");
+        assert_eq!(matched.args.command.as_deref(), Some("git status"));
+
+        let original = fs::read(&path).unwrap();
+        learned
+            .save_custom_workflow("show branch", "git branch", &learned_path, "test")
+            .unwrap();
+        let reloaded = LearnedAliases::load(&learned_path, None).unwrap();
+
+        assert!(reloaded.match_phrase("check work").is_some());
+        assert!(reloaded.match_phrase("show branch").is_some());
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 }

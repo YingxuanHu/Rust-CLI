@@ -154,26 +154,24 @@ pub fn expand_command_handlers(
         let commit_msg = generate_commit_message(config, repo_root)
             .unwrap_or_else(|| "chore: update".to_string());
         
-        // Escape quotes in commit message
-        let escaped_msg = commit_msg.replace('"', "\\\"");
-        
-        // Split into subject and body
-        let lines: Vec<&str> = escaped_msg.lines().collect();
-        let subject = lines.first().copied().unwrap_or("chore: update");
-        let body_lines: Vec<&str> = lines.iter().skip(1).copied().collect();
-        
-        // Build git commit command with proper multi-line message
-        let mut commit_cmd = format!("git commit -m \"{}\"", subject);
-        for line in body_lines {
-            if !line.trim().is_empty() {
-                commit_cmd.push_str(&format!(" -m \"{}\"", line.replace('"', "\\\"")));
-            }
-        }
-        
+        let commit_cmd = commit_command_for_message(&commit_msg);
         expanded = expanded.replace("{{GEN_COMMIT_MSG}}", &commit_cmd);
     }
     
     Ok(expanded)
+}
+
+fn commit_command_for_message(message: &str) -> String {
+    let (subject, body) = crate::commands::split_commit_message(message);
+    let mut command = String::from("git commit");
+    for paragraph in std::iter::once(subject).chain(body) {
+        // A generated message is data, including dollar signs, backticks,
+        // backslashes and quotes. Single-quote every argument for POSIX sh.
+        command.push_str(" -m '");
+        command.push_str(&paragraph.replace('\'', "'\"'\"'"));
+        command.push('\'');
+    }
+    command
 }
 
 #[cfg(test)]
@@ -203,5 +201,21 @@ mod tests {
         let cmd = "git status  # Check status first";
         assert_eq!(clean_generated_command(cmd), "git status  # Check status first");
     }
-}
 
+    #[cfg(unix)]
+    #[test]
+    fn generated_commit_message_is_passed_literally_to_the_shell() {
+        let subject = "Keep $(printf INJECTED) and `printf EXECUTED` as text";
+        let body = "- Preserve user's \"quotes\", $HOME and \\ paths";
+        let command = commit_command_for_message(&format!("{subject}\n{body}"));
+        // Replace git with an argument-printing shell function. This tests
+        // real shell interpretation without creating a commit or changing files.
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("git() {{ printf '%s\\n' \"$@\"; }}; {command}"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), format!("commit\n-m\n{subject}\n-m\n{body}\n"));
+    }
+}

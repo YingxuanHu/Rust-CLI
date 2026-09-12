@@ -40,10 +40,11 @@ impl CommandAssessment {
     }
 }
 
-/// Classify a shell command before it is executed. We only label a command
-/// read-only when every simple command is explicitly known to be safe to
-/// inspect. Unknown commands are considered mutating, while known destructive,
-/// networked, and arbitrary-code paths require confirmation.
+/// Heuristically classify a shell command before execution. Known inspection
+/// names can receive a read-only label; recognized destructive, networked,
+/// scripted, and output-writing forms require confirmation. This deliberately
+/// conservative check does not parse every shell expansion or tool option and
+/// is not a security boundary. Unknown commands are considered mutating.
 pub fn assess_shell_command(command: &str) -> CommandAssessment {
     let normalized = command.trim().to_ascii_lowercase();
     let mut reasons = Vec::new();
@@ -61,6 +62,13 @@ pub fn assess_shell_command(command: &str) -> CommandAssessment {
     if contains_pipe_to_interpreter(&normalized) {
         reasons.push("pipes input into a command interpreter".to_string());
     }
+    // This is intentionally conservative, not a shell parser. Even inside
+    // quotes these constructs warrant review rather than a read-only label.
+    if normalized.contains("$(") || normalized.contains('`')
+        || normalized.contains("<(") || normalized.contains(">(")
+    {
+        reasons.push("contains shell command or process substitution".to_string());
+    }
 
     let segments = split_shell_segments(&normalized);
     let mut all_read_only = !segments.is_empty();
@@ -76,6 +84,18 @@ pub fn assess_shell_command(command: &str) -> CommandAssessment {
             reasons.push(format!("uses {command_name}, which can remove or alter local data"));
         } else if is_network_command(&command_name, segment) {
             reasons.push(format!("uses {command_name}, which can contact a network service"));
+        }
+        if has_unsafe_inspection_options(&command_name, segment) {
+            reasons.push(format!("uses {command_name} options or scripts that can write data or execute commands"));
+        }
+        if command_name.starts_with('-') {
+            reasons.push("uses command-wrapper options that require manual review".to_string());
+        }
+        if segment.split_whitespace()
+            .take_while(|word| matches!(*word, "env" | "command") || is_assignment(word))
+            .next().is_some()
+        {
+            reasons.push("uses environment overrides or command wrappers that require manual review".to_string());
         }
 
         if !is_read_only_command(&command_name, segment) {
@@ -123,7 +143,10 @@ fn first_command_name(segment: &str) -> String {
 }
 
 fn is_assignment(token: &str) -> bool {
-    token.contains('=') && !token.starts_with('-') && !token.contains('/')
+    let Some((name, _)) = token.split_once('=') else { return false; };
+    let mut chars = name.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn contains_output_redirection(command: &str) -> bool {
@@ -238,15 +261,52 @@ fn second_word(segment: &str) -> Option<&str> {
     segment.split_whitespace().nth(1)
 }
 
+fn has_unsafe_inspection_options(command_name: &str, segment: &str) -> bool {
+    let words: Vec<_> = segment.split_whitespace().collect();
+    match command_name {
+        // Both tools support embedded programs with filesystem/process effects;
+        // recognizing a harmless subset requires a real expression parser.
+        "sed" | "awk" => true,
+        "find" => words.iter().any(|word| matches!(*word,
+            "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
+                | "-fprint" | "-fprint0" | "-fprintf" | "-fls"
+        )),
+        "rg" => words.iter().any(|word| *word == "--pre" || word.starts_with("--pre=")),
+        "sort" => words.iter().any(|word| *word == "--output" || word.starts_with("--output=")
+            || (*word != "--" && word.starts_with("-o"))),
+        // uniq can overwrite a second positional output file. Keep every use
+        // under review until its option/operand syntax is parsed structurally.
+        "uniq" => true,
+        "git" => {
+            let subcommand = second_word(segment).unwrap_or_default();
+            // Global options such as `-C` or `-c` change the target/context;
+            // don't assume the next token is the real subcommand.
+            subcommand.starts_with('-')
+                || (subcommand == "remote" && words.iter().any(|word| matches!(*word,
+                    "add" | "remove" | "rm" | "rename" | "set-url" | "set-head" | "set-branches" | "prune" | "update"
+                )))
+                || (subcommand == "branch" && words.iter().any(|word| matches!(*word,
+                    "-f" | "--force" | "-m" | "-c" | "--move" | "--copy" | "--edit-description"
+                )))
+                || words.iter().any(|word| *word == "--output" || word.starts_with("--output="))
+        }
+        _ => false,
+    }
+}
+
 fn is_read_only_command(command_name: &str, segment: &str) -> bool {
     match command_name {
-        "git" => matches!(
-            second_word(segment),
-            Some("status" | "diff" | "log" | "show" | "branch" | "rev-parse" | "ls-files" | "remote")
-        ),
+        "git" => {
+            // Branch creation changes local state even without a destructive
+            // option. Only the bare listing is known to be read-only here.
+            (second_word(segment) == Some("branch") && segment.split_whitespace().count() == 2)
+                || matches!(second_word(segment),
+                    Some("status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "remote")
+                )
+        }
         "cargo" => matches!(second_word(segment), Some("metadata" | "tree" | "search")),
-        "rg" | "grep" | "find" | "ls" | "pwd" | "cat" | "head" | "tail" | "sed" | "awk"
-        | "wc" | "sort" | "uniq" | "cut" | "diff" | "stat" | "file" | "which" | "whereis"
+        "rg" | "grep" | "find" | "ls" | "pwd" | "cat" | "head" | "tail"
+        | "wc" | "sort" | "cut" | "diff" | "stat" | "file" | "which" | "whereis"
         | "echo" | "printf" | "date" | "whoami" | "uname" | "env" | "true" | "false" => true,
         _ => false,
     }
@@ -289,5 +349,31 @@ mod tests {
             assert!(assessment.requires_confirmation());
             assert!(!assessment.reasons.is_empty());
         }
+    }
+
+    #[test]
+    fn inspection_commands_with_effects_require_review() {
+        for command in [
+            "echo $(touch marker)",
+            "printf '%s' `touch marker`",
+            "cat <(curl https://example.invalid)",
+            "find . -delete",
+            "find . -exec touch marker \\;",
+            "find . -fprint listing.txt",
+            "sed -i 's/old/new/' notes.txt",
+            "awk 'BEGIN { system(\"touch marker\") }'",
+            "rg --pre=python3 TODO src",
+            "sort -o results.txt input.txt",
+            "uniq input.txt output.txt",
+            "git -C other-repo push",
+            "git remote set-url origin https://example.invalid/repo",
+            "git branch --force main older-commit",
+            "git log --output=history.txt",
+            "env -i rm generated.txt",
+            "env MODE=test git push",
+        ] {
+            assert!(assess_shell_command(command).requires_confirmation(), "{command}");
+        }
+        assert_ne!(assess_shell_command("git branch new-branch").risk, CommandRisk::ReadOnly);
     }
 }

@@ -86,13 +86,18 @@ impl Config {
     pub fn load(config_path: Option<PathBuf>) -> Result<Self> {
         let mut cfg = Config::default();
 
+        let explicit_path = config_path.is_some();
         let path = config_path.unwrap_or_else(default_config_path);
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("reading config at {path:?}"))?;
-            let partial: PartialConfig =
-                toml::from_str(&contents).context("parsing config file as TOML")?;
-            cfg.apply_partial(partial);
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                let partial: PartialConfig =
+                    toml::from_str(&contents).context("parsing config file as TOML")?;
+                cfg.apply_partial(partial);
+            }
+            Err(error) if !explicit_path && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading config at {}", path.display()));
+            }
         }
 
         cfg.apply_env_overrides();
@@ -351,6 +356,21 @@ mod tests {
         assert_eq!(config.cmd_timeout_secs, 12);
         assert_eq!(config.embedding_model, "nomic-embed-text");
         assert_eq!(config.audit_path, PathBuf::from(".llm-cli/audit.jsonl"));
+    }
+
+    #[test]
+    fn a_missing_explicit_config_is_an_error_instead_of_using_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-config.toml");
+
+        let error = Config::load(Some(path.clone())).unwrap_err();
+
+        assert!(error.to_string().contains(&path.display().to_string()));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!path.exists());
     }
 
     #[test]

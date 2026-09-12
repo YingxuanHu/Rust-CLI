@@ -127,14 +127,19 @@ pub fn write_file(path: &Path, content: &str, base: &Path) -> Result<()> {
         bail!("Access denied: path outside allowed directory");
     }
 
-    // `fs::write` follows a final symlink. Reject an existing symlink (or any
-    // existing target) that resolves outside the allowed directory; checking
-    // only its parent would otherwise permit writing through that symlink.
-    if path.exists() {
-        let canonical_target = path.canonicalize().context("canonicalizing existing file")?;
-        if !canonical_target.starts_with(&canonical_base) {
-            bail!("Access denied: file resolves outside allowed directory");
+    // `exists()` follows symlinks and returns false for a dangling link. Check
+    // the directory entry itself before allowing creation of a new file.
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            let canonical_target = path.canonicalize().context(
+                "cannot resolve existing file; repair or remove a dangling symlink before writing",
+            )?;
+            if !canonical_target.starts_with(&canonical_base) {
+                bail!("Access denied: file resolves outside allowed directory");
+            }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("checking file before writing"),
     }
 
     fs::write(path, content).context("writing file")?;
@@ -229,5 +234,52 @@ mod tests {
             fs::read_to_string(base.path().join("generated.txt")).unwrap(),
             "inside the repository"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_a_dangling_symlink_to_an_outside_target() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("new-file.txt");
+        let link = base.path().join("looks-local.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = write_file(&link, "must not escape", base.path()).unwrap_err();
+
+        assert!(error.to_string().contains("dangling symlink"));
+        assert!(!target.exists());
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_an_existing_symlink_to_an_outside_target() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("existing.txt");
+        fs::write(&target, "original").unwrap();
+        let link = base.path().join("looks-local.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = write_file(&link, "must not escape", base.path()).unwrap_err();
+
+        assert!(error.to_string().contains("outside allowed directory"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_allows_a_symlink_to_an_existing_file_inside_the_base() {
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("existing.txt");
+        fs::write(&target, "original").unwrap();
+        let link = base.path().join("local-link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_file(&link, "updated", base.path()).unwrap();
+
+        assert_eq!(fs::read_to_string(target).unwrap(), "updated");
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
     }
 }

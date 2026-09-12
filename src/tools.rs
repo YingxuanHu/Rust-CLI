@@ -75,9 +75,6 @@ pub static TOOLS: &[Tool] = &[
             "save to remote",
             "push changes to remote",
             "sync changes",
-            "save locally",
-            "save local",
-            "save changes locally",
         ],
         requires_repo: true,
     },
@@ -96,7 +93,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "commit",
-        description: "Commit staged changes with a message (without pushing)",
+        description: "Save staged changes in a local commit, without staging other files or pushing",
         examples: &[
             "commit",
             "commit changes",
@@ -106,6 +103,9 @@ pub static TOOLS: &[Tool] = &[
             "create commit",
             "commit locally",
             "local commit",
+            "save locally",
+            "save local",
+            "save changes locally",
         ],
         requires_repo: true,
     },
@@ -140,7 +140,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "run_tests",
-        description: "Run the project's test suite using cargo test",
+        description: "Run the detected project's test command for Rust, Node.js, Python, or Go",
         examples: &[
             "run tests",
             "test",
@@ -248,7 +248,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "explain_project",
-        description: "Show project type, dependencies, and structure",
+        description: "Show detected project type, name, root, and source directories",
         examples: &[
             "what project is this",
             "project info",

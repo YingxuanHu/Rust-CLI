@@ -38,26 +38,32 @@ pub fn check_status(model: &str, ollama_host: &str) -> Result<OllamaStatus> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut has_model = false;
-    let target_base = model.split(':').next().unwrap_or(model);
-
-    for line in stdout.lines().skip(1) {
-        let name = line.split_whitespace().next().unwrap_or("");
-        if name.is_empty() {
-            continue;
-        }
-        let base = name.split(':').next().unwrap_or(name);
-        if name == model || base == target_base {
-            has_model = true;
-            break;
-        }
-    }
+    let has_model = listed_model_available(&stdout, model);
 
     Ok(OllamaStatus {
         reachable: true,
         has_model,
         raw_output: stdout,
     })
+}
+
+fn listed_model_available(output: &str, model: &str) -> bool {
+    let requested = normalize_model_tag(model);
+    output.lines().skip(1).any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|name| normalize_model_tag(name) == requested)
+    })
+}
+
+fn normalize_model_tag(model: &str) -> String {
+    // A registry address can contain a port; only the final path component
+    // determines whether a model tag was supplied.
+    if model.rsplit('/').next().unwrap_or(model).contains(':') {
+        model.to_string()
+    } else {
+        format!("{model}:latest")
+    }
 }
 
 /// Download a model through Ollama while preserving its progress output for
@@ -74,4 +80,44 @@ pub fn pull_model(model: &str, ollama_host: &str) -> Result<()> {
         bail!("Ollama could not download model '{model}' (exit status {status})");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::listed_model_available;
+
+    #[test]
+    fn a_different_model_tag_does_not_satisfy_the_requested_model() {
+        let inventory = "NAME ID SIZE MODIFIED\nllama3:8b abc 4GB now\n";
+        assert!(listed_model_available(inventory, "llama3:8b"));
+        assert!(!listed_model_available(inventory, "llama3:70b"));
+        assert!(!listed_model_available(inventory, "llama3"));
+        assert!(!listed_model_available(inventory, "llama3:latest"));
+    }
+
+    #[test]
+    fn an_untagged_model_means_latest() {
+        let inventory = "NAME ID SIZE MODIFIED\nllama3:latest abc 4GB now\n";
+        assert!(listed_model_available(inventory, "llama3"));
+        assert!(listed_model_available(inventory, "llama3:latest"));
+        assert!(!listed_model_available(inventory, "llama3:8b"));
+        assert!(!listed_model_available(inventory, "llama3.2"));
+    }
+
+    #[test]
+    fn registry_ports_are_not_model_tags() {
+        let inventory =
+            "NAME ID SIZE MODIFIED\nlocalhost:5000/team/model:latest abc 4GB now\n";
+        assert!(listed_model_available(inventory, "localhost:5000/team/model"));
+        assert!(!listed_model_available(
+            inventory,
+            "localhost:5000/team/model:small"
+        ));
+    }
+
+    #[test]
+    fn an_empty_inventory_has_no_models() {
+        assert!(!listed_model_available("NAME ID SIZE MODIFIED\n", "llama3"));
+        assert!(!listed_model_available("", "llama3"));
+    }
 }

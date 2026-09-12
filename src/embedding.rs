@@ -35,6 +35,9 @@ struct EmbeddingResponse {
 struct EmbeddingCacheData {
     /// Model name used to generate embeddings
     model: String,
+    /// Endpoint that produced these vectors; equal model names need not mean
+    /// equal model weights on different servers.
+    ollama_host: String,
     /// Map from example phrase to (tool_name, embedding)
     examples: HashMap<String, (String, Vec<f32>)>,
     /// Version of the cache format (for future compatibility)
@@ -81,16 +84,20 @@ impl EmbeddingCache {
             }
         }
 
-        // Compute embeddings from scratch
+        // Publish only a complete cache. A failed initialization must not leave
+        // a partial set looking ready to the classifier.
+        let mut examples = HashMap::new();
         for tool in TOOLS {
             for &example in tool.examples {
                 let embedding = self.get_embedding(example).await?;
-                self.examples.insert(
+                examples.insert(
                     example.to_string(),
                     (tool.name.to_string(), embedding),
                 );
             }
         }
+        validate_examples(&examples)?;
+        self.examples = examples;
 
         // Save to cache if path is provided
         if let Some(path) = cache_path {
@@ -121,10 +128,13 @@ impl EmbeddingCache {
             );
         }
 
-        // Check version (currently only version 1 is supported)
-        if cache_data.version != 1 {
+        if cache_data.version != 2 {
             bail!("Unsupported cache version: {}", cache_data.version);
         }
+        if cache_data.ollama_host != self.ollama_host {
+            bail!("Cache endpoint differs from the configured Ollama endpoint");
+        }
+        validate_examples(&cache_data.examples)?;
 
         self.examples = cache_data.examples;
         Ok(())
@@ -134,8 +144,9 @@ impl EmbeddingCache {
     fn save_to_cache(&self, path: &Path) -> Result<()> {
         let cache_data = EmbeddingCacheData {
             model: self.model.clone(),
+            ollama_host: self.ollama_host.clone(),
             examples: self.examples.clone(),
-            version: 1,
+            version: 2,
         };
 
         // Create parent directory if it doesn't exist
@@ -156,6 +167,22 @@ impl EmbeddingCache {
     /// Check if the cache is initialized (has embeddings).
     pub fn is_initialized(&self) -> bool {
         !self.examples.is_empty()
+    }
+
+    /// Retrieve a precomputed tool example without making a network request.
+    pub fn example_embedding(&self, example: &str) -> Option<&[f32]> {
+        self.examples.get(example).map(|(_, vector)| vector.as_slice())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_examples(host: &str) -> Self {
+        let mut cache = Self::new(Some("test-embed"), 1, host);
+        for tool in TOOLS {
+            for &example in tool.examples {
+                cache.examples.insert(example.to_string(), (tool.name.to_string(), vec![1.0, 0.0]));
+            }
+        }
+        cache
     }
 
     /// Get embedding for a text string from Ollama.
@@ -190,8 +217,42 @@ impl EmbeddingCache {
             .await
             .context("parsing embedding response")?;
 
+        validate_vector(&embedding_response.embedding)?;
         Ok(embedding_response.embedding)
     }
+}
+
+fn validate_vector(vector: &[f32]) -> Result<()> {
+    if vector.is_empty()
+        || vector.iter().any(|value| !value.is_finite())
+        || vector.iter().all(|value| *value == 0.0)
+    {
+        bail!("Embedding must be a nonempty finite vector with a nonzero magnitude");
+    }
+    Ok(())
+}
+
+fn validate_examples(examples: &HashMap<String, (String, Vec<f32>)>) -> Result<()> {
+    let expected: HashMap<_, _> = TOOLS.iter().flat_map(|tool| {
+        tool.examples.iter().map(move |example| (*example, tool.name))
+    }).collect();
+    if expected.len() != examples.len() {
+        bail!("Cached examples differ from the current tool catalog");
+    }
+    let mut dimension = None;
+    for (phrase, expected_tool) in expected {
+        let (tool, vector) = examples.get(phrase)
+            .with_context(|| format!("Missing cached example: {phrase}"))?;
+        if tool != expected_tool {
+            bail!("Cached example has changed tools: {phrase}");
+        }
+        validate_vector(vector)?;
+        if dimension.is_some_and(|size| size != vector.len()) {
+            bail!("Cached embedding dimensions differ");
+        }
+        dimension = Some(vector.len());
+    }
+    Ok(())
 }
 
 /// Compute cosine similarity between two vectors.
@@ -215,6 +276,56 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn populated_cache(host: &str) -> EmbeddingCache {
+        EmbeddingCache::with_test_examples(host)
+    }
+
+    #[tokio::test]
+    async fn warm_classification_only_requests_the_input_embedding() {
+        // This server accepts exactly one request. Re-embedding any catalog
+        // example fails, catching the previous O(number of examples) calls.
+        let server = crate::test_support::MockHttpServer::respond_once(200, r#"{"embedding":[1.0,0.0]}"#);
+        let cache = populated_cache(server.host());
+        let intent = crate::keyword_classifier::KeywordClassifier::classify("run tests please", &cache)
+            .await.unwrap().expect("test intent");
+        assert_eq!(intent.tool, "run_tests");
+        assert!(server.finish().contains("\"prompt\":\"run tests please\""));
+    }
+
+    #[test]
+    fn disk_cache_requires_matching_host_catalog_and_vector_dimensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("embeddings.toml");
+        let mut original = populated_cache("127.0.0.1:11434");
+        original.save_to_cache(&path).unwrap();
+        let mut loaded = EmbeddingCache::new(Some("test-embed"), 1, "127.0.0.1:11434");
+        loaded.load_from_cache(&path).unwrap();
+        assert_eq!(loaded.example_embedding("run tests"), Some([1.0, 0.0].as_slice()));
+        let mut different_host = EmbeddingCache::new(Some("test-embed"), 1, "127.0.0.1:11435");
+        assert!(different_host.load_from_cache(&path).is_err());
+
+        original.examples.get_mut("run tests").unwrap().0 = "commit".into();
+        original.save_to_cache(&path).unwrap();
+        assert!(loaded.load_from_cache(&path).is_err());
+
+        original = populated_cache("127.0.0.1:11434");
+        original.examples.get_mut("run tests").unwrap().1 = vec![1.0];
+        original.save_to_cache(&path).unwrap();
+        assert!(loaded.load_from_cache(&path).is_err());
+
+        original.examples.remove("run tests");
+        original.save_to_cache(&path).unwrap();
+        assert!(loaded.load_from_cache(&path).is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_embedding_is_rejected() {
+        let server = crate::test_support::MockHttpServer::respond_once(200, r#"{"embedding":[]}"#);
+        let cache = EmbeddingCache::new(Some("test-embed"), 1, server.host());
+        assert!(cache.get_embedding("question").await.is_err());
+        server.finish();
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {

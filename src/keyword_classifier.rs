@@ -46,7 +46,7 @@ impl KeywordClassifier {
             let keyword_score = Self::score_keywords(&words, tool);
             
             // 2. Embedding similarity (best match from tool examples)
-            let embedding_score = Self::score_embeddings(&input_embedding, tool, cache).await?;
+            let embedding_score = Self::score_embeddings(&input_embedding, tool, cache);
             
             // 3. Combine scores (60% keywords, 40% embeddings)
             let combined_score = 0.6 * keyword_score + 0.4 * embedding_score;
@@ -105,21 +105,22 @@ impl KeywordClassifier {
         score.min(1.0)
     }
     
-    async fn score_embeddings(
+    fn score_embeddings(
         input_embedding: &[f32],
         tool: &crate::tools::Tool,
         cache: &EmbeddingCache,
-    ) -> Result<f32> {
+    ) -> f32 {
         let mut best_similarity: f32 = 0.0;
         
         // Compare against all examples for this tool
         for example in tool.examples {
-            let example_embedding = cache.get_embedding(example).await?;
-            let similarity = cosine_similarity(input_embedding, &example_embedding);
-            best_similarity = best_similarity.max(similarity);
+            if let Some(example_embedding) = cache.example_embedding(example) {
+                let similarity = cosine_similarity(input_embedding, example_embedding);
+                best_similarity = best_similarity.max(similarity);
+            }
         }
         
-        Ok(best_similarity)
+        best_similarity
     }
 }
 
@@ -135,4 +136,3 @@ mod tests {
         assert!(score > 0.5);
     }
 }
-

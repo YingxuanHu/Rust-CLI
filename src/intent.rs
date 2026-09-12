@@ -1,8 +1,8 @@
 //! Intent parsing using a tiered resolution system.
 //!
-//! Tier 1: Fuzzy matching (< 1ms)
-//! Tier 2: Keyword + embedding hybrid (~50ms)
-//! Tier 3: Small LLM classifier (~500ms) → fallback to "chat"
+//! Tier 1: Local fuzzy matching
+//! Tier 2: Keyword + cached embedding hybrid
+//! Tier 3: Small LLM classifier → fallback to "chat"
 
 use anyhow::Result;
 
@@ -44,26 +44,28 @@ pub async fn resolve_intent(
 ) -> Result<ParsedIntent> {
     tracing::debug!("[Intent Resolution] Input: '{}'", input);
     
-    // Tier 1: Fuzzy matching + learned aliases (< 1ms)
-    if let Some(mut intent) = fuzzy::fuzzy_match(input, learned) {
+    // Tier 1: Fuzzy matching + learned aliases
+    if let Some(intent) = fuzzy::fuzzy_match(input, learned) {
         tracing::debug!("[Intent Resolution] ✓ Tier 1 (Fuzzy): {}", intent.tool);
-        let extracted = extract_args_from_input(input, &intent.tool);
-        intent.args.merge_missing(extracted);
-        return Ok(intent);
+        return Ok(enrich_intent(intent, input));
     }
     
-    // Tier 2: Keyword + embedding classifier (~50ms)
-    if let Some(mut intent) = KeywordClassifier::classify(input, cache).await? {
-        tracing::debug!("[Intent Resolution] ✓ Tier 2 (Keyword/Embedding): {}", intent.tool);
-        let extracted = extract_args_from_input(input, &intent.tool);
-        intent.args.merge_missing(extracted);
-        return Ok(intent);
+    // Tier 2: Keyword + embedding classifier
+    match KeywordClassifier::classify(input, cache).await {
+        Ok(Some(intent)) => {
+            tracing::debug!("[Intent Resolution] ✓ Tier 2 (Keyword/Embedding): {}", intent.tool);
+            return Ok(enrich_intent(intent, input));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(%error, "Embedding classification unavailable; trying the LLM classifier");
+        }
     }
     
-    // Tier 3: Small LLM classifier (~500ms)
+    // Tier 3: Small LLM classifier
     // This can return "chat" if user is just chatting, or a tool name if they're trying to do something
     tracing::debug!("[Intent Resolution] Attempting Tier 3 (LLM) with model: '{}'", llm_model);
-    if let Some(mut intent) = llm_classifier::classify_with_llm(
+    if let Some(intent) = llm_classifier::classify_with_llm(
         input,
         llm_model,
         request_timeout_secs,
@@ -71,8 +73,7 @@ pub async fn resolve_intent(
     )
     .await?
     {
-        let extracted = extract_args_from_input(input, &intent.tool);
-        intent.args.merge_missing(extracted);
+        let intent = enrich_intent(intent, input);
         
         // If LLM classified as "chat", return it directly
         if intent.tool == "chat" {
@@ -95,13 +96,33 @@ pub async fn resolve_intent(
     })
 }
 
+fn enrich_intent(mut intent: ParsedIntent, input: &str) -> ParsedIntent {
+    let extracted = extract_args_from_input(input, &intent.tool);
+    intent.args.merge_missing(extracted);
+    // Missing a requested path must not silently widen a natural-language
+    // staging request to the entire repository. Leave ambiguous wording in
+    // chat until the user supplies an explicit scope.
+    if intent.tool == "stage" && intent.args.path.is_none() && !is_explicit_stage_all(input) {
+        return ParsedIntent::new("chat", intent.confidence);
+    }
+    intent
+}
+
+fn is_explicit_stage_all(input: &str) -> bool {
+    let trimmed = input.trim();
+    matches!(trimmed.to_ascii_lowercase().as_str(),
+        "stage all" | "stage changes" | "stage all files"
+            | "stage all changes" | "add all files" | "git add ."
+    ) || matches!(trimmed, "git add -A" | "git add --all")
+}
+
 /// Extract arguments from user input based on the matched tool.
 fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
     let mut args = ToolArgs::default();
     
     match tool {
         "show_file" => {
-            let lower = input.to_lowercase();
+            let lower = input.to_ascii_lowercase();
             for prefix in ["show file ", "read file ", "open file ", "show ", "read ", "open "] {
                 if lower.starts_with(prefix) {
                     let path = input[prefix.len()..].trim();
@@ -113,15 +134,19 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
             }
         }
         "stage" => {
-            let lower = input.to_lowercase();
-            if lower.starts_with("stage ") && !lower.starts_with("stage all") {
-                let path = input[6..].trim();
-                if !path.is_empty() {
-                    args.path = Some(path.to_string());
-                }
-            } else if lower.starts_with("git add ") && !lower.contains("-a") && !lower.contains("-A") {
-                let path = input[8..].trim();
-                if !path.is_empty() {
+            let trimmed = input.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            // Only explicit whole phrases mean "all". A filename such as
+            // `all-important.txt` or `file-a.rs` must retain its scope.
+            if !is_explicit_stage_all(trimmed) {
+                let path = if lower.starts_with("stage ") {
+                    Some(trimmed[6..].trim())
+                } else if lower.starts_with("git add ") {
+                    Some(trimmed[8..].trim())
+                } else {
+                    None
+                };
+                if let Some(path) = path.filter(|path| !path.is_empty()) {
                     args.path = Some(path.to_string());
                 }
             }
@@ -133,7 +158,7 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
             }
         }
         "list_files" => {
-            let lower = input.to_lowercase();
+            let lower = input.to_ascii_lowercase();
             for prefix in ["list files in ", "show files in ", "ls ", "dir "] {
                 if lower.starts_with(prefix) {
                     let path = input[prefix.len()..].trim();
@@ -145,9 +170,9 @@ fn extract_args_from_input(input: &str, tool: &str) -> ToolArgs {
             }
         }
         "write_file" => {
-            let lower = input.to_lowercase();
+            let lower = input.to_ascii_lowercase();
             
-            for prefix in ["write to ", "save to ", "create ", "write file "] {
+            for prefix in ["write to ", "save to ", "create file ", "create ", "write file "] {
                 if lower.starts_with(prefix) {
                     let rest = input[prefix.len()..].trim();
                     if let Some(space_idx) = rest.find(char::is_whitespace) {
@@ -284,6 +309,72 @@ mod tests {
     fn test_extract_args_stage() {
         let args = extract_args_from_input("stage src/lib.rs", "stage");
         assert_eq!(args.path, Some("src/lib.rs".to_string()));
+    }
+
+    #[test]
+    fn staging_keeps_filenames_that_look_like_all_flags() {
+        for (input, expected) in [
+            ("stage all-important.txt", "all-important.txt"),
+            ("git add file-a.rs", "file-a.rs"),
+            ("git add src/Feature-A.rs", "src/Feature-A.rs"),
+            ("stage All Changes.txt", "All Changes.txt"),
+        ] {
+            assert_eq!(extract_args_from_input(input, "stage").path.as_deref(), Some(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn staging_all_requires_an_explicit_whole_phrase() {
+        for input in ["stage all", "stage changes", "stage all files", "git add -A", "git add --all", "git add ."] {
+            assert!(extract_args_from_input(input, "stage").path.is_none(), "{input}");
+        }
+        assert_eq!(extract_args_from_input("git add -a", "stage").path.as_deref(), Some("-a"));
+    }
+
+    #[test]
+    fn unresolved_staging_scope_does_not_default_to_all_files() {
+        for input in ["stage", "git add", "please stage README.md", "add this file", "add only my Rust source"] {
+            assert_eq!(enrich_intent(ParsedIntent::new("stage", 0.9), input).tool, "chat", "{input}");
+        }
+        assert_eq!(enrich_intent(ParsedIntent::new("stage", 0.9), "stage all").tool, "stage");
+    }
+
+    #[test]
+    fn create_file_keeps_the_requested_filename() {
+        let args = extract_args_from_input("create file Notes.txt with content: Hello", "write_file");
+        assert_eq!(args.path.as_deref(), Some("Notes.txt"));
+        assert_eq!(args.content.as_deref(), Some("Hello"));
+        let unicode = extract_args_from_input("write file İ.txt with content: 😀", "write_file");
+        assert_eq!(unicode.path.as_deref(), Some("İ.txt"));
+        assert_eq!(unicode.content.as_deref(), Some("😀"));
+    }
+
+    #[test]
+    fn local_save_phrases_never_select_the_push_workflow() {
+        let learned = LearnedAliases::default();
+        for input in ["save locally", "save local", "save changes locally"] {
+            assert_eq!(fuzzy::fuzzy_match(input, &learned).unwrap().tool, "commit", "{input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_still_tries_the_classifier() {
+        let embeddings = crate::test_support::MockHttpServer::respond_once(500, "{}");
+        let classifier = crate::test_support::MockHttpServer::respond_once(200, r#"{"response":"draft_commit_message"}"#);
+        let cache = EmbeddingCache::with_test_examples(embeddings.host());
+        let intent = resolve_intent(
+            "prepare a thoughtful summary of the changes I have staged for later review",
+            &cache,
+            &LearnedAliases::default(),
+            "test-classifier",
+            1,
+            classifier.host(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(intent.tool, "draft_commit_message");
+        assert!(embeddings.finish().starts_with("POST /api/embeddings HTTP/1.1"));
+        assert!(classifier.finish().starts_with("POST /api/generate HTTP/1.1"));
     }
 
     #[test]

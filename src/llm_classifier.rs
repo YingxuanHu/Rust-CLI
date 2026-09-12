@@ -119,39 +119,48 @@ pub async fn classify_with_llm(
         return Ok(None);
     }
     
-    let llm_response = llm_response.trim().to_lowercase();
-    tracing::debug!("[LLM Classifier] ✓ Raw LLM response: '{}'", llm_response);
-    
-    // Check for "chat" response
-    if llm_response == "chat" || llm_response.contains("chat") {
-        tracing::debug!("[LLM Classifier] ✓ Classified as CHAT");
-        return Ok(Some(ParsedIntent::new("chat", LLM_CONFIDENCE_THRESHOLD)));
-    }
-    
-    // Check if response matches a valid tool
-    for tool in TOOLS {
-        if llm_response == tool.name || llm_response.contains(tool.name) {
-            tracing::debug!("[LLM Classifier] ✓ Classified as TOOL: {}", tool.name);
-            return Ok(Some(ParsedIntent::new(tool.name, LLM_CONFIDENCE_THRESHOLD)));
+    Ok(parse_classifier_response(llm_response))
+}
+
+/// Model output must name exactly one catalog entry. Substring matching can
+/// turn `draft_commit_message` into `commit`, or explanatory prose into an
+/// unintended action. Invalid output falls back to chat.
+fn parse_classifier_response(response: &str) -> Option<ParsedIntent> {
+    let response = response.trim();
+    let response = if response.starts_with("```") {
+        let (opening, body) = response.split_once('\n')?;
+        if !matches!(opening, "```" | "```text" | "```plaintext") {
+            return None;
         }
-    }
-    
-    // Also check if tool name is contained in response (handles "the tool is: status")
-    for tool in TOOLS {
-        if tool.name.contains(&llm_response) && llm_response.len() > 3 {
-            tracing::debug!("[LLM Classifier] ✓ Classified as TOOL (fuzzy): {}", tool.name);
-            return Ok(Some(ParsedIntent::new(tool.name, LLM_CONFIDENCE_THRESHOLD * 0.9)));
-        }
-    }
-    
-    // If LLM couldn't classify, return None (will fall through to ask_user)
-    tracing::debug!("[LLM Classifier] ✗ Could not match response '{}' to any tool or 'chat'", llm_response);
-    Ok(None)
+        body.strip_suffix("```")?.trim()
+    } else {
+        response
+    };
+    let name = response.to_ascii_lowercase();
+    TOOLS.iter()
+        .find(|tool| tool.name == name)
+        .map(|tool| ParsedIntent::new(tool.name, LLM_CONFIDENCE_THRESHOLD))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::classify_with_llm;
+    use super::{classify_with_llm, parse_classifier_response};
+
+    #[test]
+    fn every_catalog_tool_round_trips_without_substring_collisions() {
+        for tool in crate::tools::TOOLS {
+            assert_eq!(parse_classifier_response(tool.name).unwrap().tool, tool.name);
+        }
+        assert_eq!(parse_classifier_response("  DRAFT_COMMIT_MESSAGE\n").unwrap().tool, "draft_commit_message");
+        assert_eq!(parse_classifier_response("```text\ndraft_commit_message\n```").unwrap().tool, "draft_commit_message");
+    }
+
+    #[test]
+    fn ambiguous_or_explanatory_model_output_does_not_dispatch() {
+        for response in ["not commit", "status or save_work", "the tool is: shell", "draft", "", "```\ncommit\nshell\n```"] {
+            assert!(parse_classifier_response(response).is_none(), "{response}");
+        }
+    }
 
     #[tokio::test]
     async fn classifier_uses_configured_host_and_parses_a_tool_response() {
