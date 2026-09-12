@@ -53,6 +53,13 @@ downloads; run `llm_cli init` first if setup is incomplete.
 `ask` is read-only and does not execute natural-language requests as commands
 or workflows.
 
+In the interactive assistant, `run tests` shows live output and keeps input
+available. Ctrl+C (or `cancel task`) stops that test task without exiting. Esc
+exits after bounded task cleanup. Test tasks use `cmd_timeout_secs`, defaulting
+to 60 seconds; set a larger value in `.llm-cli/config.toml` for longer suites.
+These background-test controls require current source until a newer release
+is published. Git, shell, build, and file commands have not yet been migrated.
+
 ## Binary release install (no Cargo required)
 
 Download the installer and run it locally (rather than piping it to a shell):

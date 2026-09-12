@@ -2,6 +2,27 @@
 
 Reviewed 2026-09-12. Baseline: `3c26eda` (before this revision).
 
+## Follow-up: first background-task slice
+
+The next implementation migrates **`run tests`** to a dedicated async runner:
+explicit command arguments and immutable directory/task identity, live bounded
+stdout/stderr tails (64 KiB each), elapsed time, exit status, cancellation, and
+deadline coverage for both process exit and output pipes. Ctrl+C cancels without
+closing the assistant; Escape waits for bounded cleanup before exit. Unix
+process-group cleanup covers ordinary descendants, not deliberately detached
+processes; the Windows fallback stops only the direct child.
+
+Only one test task runs at a time. Other command workflows are held back while
+it runs, while help, directory switching, and Chat-mode questions stay available.
+Task results remain attached to their original message and directory; changing
+directories clears old output context. Exact `run tests` and help commands bypass
+model classification. Fake-process and UI-state regressions cover streaming,
+cancellation, output limits, failures, input handling, and project isolation.
+
+This is the first slice of Phase 1, not its completion: Git/shell/build/file
+execution and runtime probes still need migration; project task detection,
+output-backed explanations, and model-chat cancellation remain next work.
+
 ## Recommendation
 
 Focus on **making recurring repository tasks easy to complete and repeat**:

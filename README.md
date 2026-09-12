@@ -23,7 +23,7 @@ llm_cli
 Install and open [Ollama](https://ollama.com) if it is not already available.
 The first launch checks the configured chat model and asks before downloading
 it. Run from the project you want to work on. Type `show me around` for starter
-actions; use Esc or Ctrl+C to exit.
+actions. Esc exits; Ctrl+C cancels an active test task, or exits when none is running.
 
 Windows archives and platform details are in the
 [installation guide](docs/INSTALL.md). Binary releases can lag behind `main`:
@@ -44,7 +44,7 @@ Enter these in the interactive assistant:
 | Get oriented | `show me around` | Suggestions based on the detected project |
 | Understand the project | `project info` | Manifest-derived project information |
 | Inspect changes | `what changed` | Git status and a diff summary |
-| Check the project | `run tests` | Detected project's test command |
+| Check the project | `run tests` | Live test output, elapsed time, and pass/fail status |
 | Prepare one file | `stage src/main.rs` | Review and stage the named path |
 | Commit staged work locally | `commit` or `save locally` | Review a message and commit; no push |
 | Stage, commit, and push | `save work` | Review the combined Git workflow |
@@ -57,6 +57,14 @@ Generated command suggestions can be reviewed, executed, skipped, or saved as
 learned workflows. Tab accepts ghost text; Up/Down recalls inputs. Ctrl+S
 switches between Chat and Shell modes. `cd path/to/project` changes the session
 directory. `help` lists available actions.
+
+`run tests` keeps the interface responsive and shows the command and its working
+directory. Press Ctrl+C or type `cancel task` to stop it without exiting. Output
+retains the latest 64 KiB from each of stdout and stderr, with a truncation
+notice when needed. Tests use `cmd_timeout_secs` (60 seconds by default); increase
+it in your configuration for longer suites. You can ask questions in Chat mode,
+use help, or change directories while tests run; other command workflows wait
+until the task finishes. Running `run tests` again uses the current project.
 
 For one answer in the current terminal (current source):
 
@@ -102,8 +110,12 @@ ancestor discovery and user-wide defaults are planned.
   or a full repository understanding system.
 - Reviewed edits cover one existing file. There is no automatic test-and-repair
   loop or durable multi-file rollback.
-- Some built-in shell, Git, and test operations still block the TUI. Chat
-  streaming runs in the background; request-level cancellation is still planned.
+- Tests now stream in the background with cancellation. Git, shell, build,
+  and file workflows still need migration to the background runner. Model-chat
+  cancellation remains planned.
+- Test cancellation stops the process group on macOS/Linux; processes that
+  deliberately leave that group are not covered. Windows currently stops only
+  the direct test process, not its descendants.
 - Command-risk checks are heuristic, not a sandbox. Review the displayed
   command. The audit log covers direct shell execution, not every workflow step.
 - Input history can contain the text you entered, including shell arguments.

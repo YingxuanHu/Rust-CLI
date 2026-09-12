@@ -54,7 +54,8 @@ tools. Files and stdin are not automatically attached as context.
 - Tab accepts ghost text; Up/Down recalls prior inputs.
 - Ctrl+S switches between chat and direct shell input.
 - `cd /path/to/project` changes the session directory.
-- `help` lists supported actions. Esc or Ctrl+C exits.
+- `help` lists supported actions. Esc exits; Ctrl+C cancels active tests without
+  exiting, or exits when no test task is running.
 - `llm_cli init` retries setup; `llm_cli doctor --full` explains prerequisites.
 - `llm_cli setup` creates an optional commented project config.
 
