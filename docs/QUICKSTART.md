@@ -1,295 +1,71 @@
-# Quick Start Guide
+# Quick Start
 
-For the shortest install path, see [INSTALL.md](INSTALL.md). This page focuses
-on intent routing after the CLI is installed.
+Install with the [installation guide](INSTALL.md), open Ollama, and start
+`llm_cli` in your project. The first launch offers to download the configured
+chat model. Optional models can be added later with `llm_cli init --full`.
 
-## Prerequisites
+## First useful actions
 
-Make sure you have Ollama installed and running:
+Type `show me around`. The assistant suggests actions based on your detected
+project. Start with `project info`, `what changed`, or `run tests`.
 
-```bash
-# Check if Ollama is running
-ollama list
+You can read a file with `show src/main.rs`, list a directory with `list files
+in src`, or ask a general question. The assistant currently has only limited
+project context; it does not automatically read or understand the entire repo.
 
-# If not running, start it
-ollama serve
+## Prepare work for a local commit
+
+1. Use `what changed` to inspect status. If a diff prompt is open, press Enter
+   to close it before starting another task.
+2. Use `stage src/main.rs` to review and stage a specific path, or `stage all`
+   when you intend to include every change.
+3. Use `commit` to review the suggested message. Accept it, enter a replacement,
+   or type `cancel`. This commits staged changes locally.
+
+`save locally` means the same staged-only commit. `save work` is the separate
+combined workflow that stages all changes, prepares a message, commits, and
+pushes. Review its plan before proceeding.
+
+## Make a reviewed edit
+
+```text
+edit src/main.rs: improve the error message
 ```
 
-## Optional Routing Models
+Wait for the proposed diff, review it, and accept or cancel. `rollback last
+edit` checks and reverses the most recent reviewed edit in this session. Edits
+are single-file; tests are not run automatically after applying one.
 
-The first launch offers to download the required chat model. For local semantic
-matching and intent classification, use the guided command:
+## Quick questions without the full-screen interface
 
-```bash
-llm_cli init --full
-```
-
-## Build and Run
-
-```bash
-# Build the project
-cargo build --release
-
-# Run the TUI (the first launch guides missing local setup)
-./target/release/llm_cli
-
-# Or just:
-cargo run --release
-```
-
-## One-Off Questions
-
-Use `ask` when you want an answer in the current terminal instead of an
-interactive session:
+Available in current source; release v0.1.0 predates these commands:
 
 ```bash
 llm_cli ask "explain Rust ownership"
 llm_cli ask "give me a concise testing checklist" --json
 ```
 
-The normal form streams text. `--json` prints one response object for scripts;
-both forms are read-only and do not run tools or workflows.
-
-## First Run
-
-On first run, the CLI gives a short, contextual guide instead of requiring a
-command vocabulary:
-
-```
-Ready. Local model: llama3 (embeddings: ready).
-
-You're in my-project (Rust).
-Try one of these:
-• explain this project — get a quick overview
-• run tests — check that it works
-• what changed — see Git status and the diff summary
-```
-
-Type naturally, or type `show me around` at any time to reopen this guide.
-This creates `.llm-cli/embeddings.toml` when embeddings are available (takes a
-few seconds, then is reused in later sessions).
-
-## Try It Out
-
-### Tier 1: Exact/Fuzzy Matching (< 1ms)
-
-```
-> status
-→ Instantly shows git status
-
-> stauts
-→ Fuzzy matches to "status" (typo tolerance)
-
-> save work
-→ Instantly matches "save_work" tool
-```
-
-### Tier 2: Natural Language (~50ms)
-
-```
-> push my changes
-→ Matches "save_work" via keyword + embedding
-
-> what changed
-→ Matches "status" via semantic similarity
-
-> upload code
-→ Matches "save_work"
-```
-
-### Tier 3: Novel Phrasing (~500ms)
-
-```
-> ship it to production
-→ LLM classifies as "save_work"
-
-> show me the todos
-→ LLM classifies as "find_todos"
-```
-
-### Saving a command suggested by chat
-
-When a normal chat response includes recognizable shell commands, the CLI
-shows a confirmation prompt. Type `y` to execute them, `s` to save the command
-sequence as a reusable workflow for the same original phrase, or `n` to skip.
-Saved workflows are matched before the normal intent tiers on later use.
-
-## Configuration
-
-### Optional: Customize Your Config
-
-Create `.llm-cli/config.toml` in your project directory:
-
-```toml
-# Main chat model
-model = "llama3"
-
-# Ollama daemon address (`host:port`) or an HTTPS API base such as https://ollama.com
-ollama_host = "127.0.0.1:11434"
-
-# Embedding model for Tier 2
-embedding_model = "nomic-embed-text"
-
-# Classifier model for Tier 3 (choose based on speed vs accuracy)
-classifier_model = "qwen2:1.5b"    # Recommended (default)
-# classifier_model = "qwen2:0.5b"  # Faster
-# classifier_model = "phi3:mini"   # More accurate
-
-# Optional: custom paths (all default to .llm-cli/ directory)
-# learned_path = ".llm-cli/learned.toml"
-# embedding_cache_path = ".llm-cli/embeddings.toml"
-# history_path = ".llm-cli/history.jsonl"
-```
-
-### Debug Logging
-
-The application uses structured logging via the `tracing` crate. By default, only `info`, `warn`, and `error` messages are shown. To enable debug logging (useful for troubleshooting intent resolution, LLM classification, and embedding cache):
-
-```bash
-# Show all debug messages
-RUST_LOG=debug cargo run --release
-
-# Show debug messages for specific modules
-RUST_LOG=llm_cli::intent=debug,llm_cli::llm_classifier=debug cargo run --release
-
-# Show trace-level messages (very verbose)
-RUST_LOG=trace cargo run --release
-
-# Or set it before running
-export RUST_LOG=debug
-./target/release/llm_cli
-```
-
-Debug logs include:
-- **Intent Resolution**: Which tier matched your input and why
-- **LLM Classifier**: API calls to Ollama and response parsing
-- **Keyword Classifier**: Scoring details for each tool
-- **Embedding Cache**: Cache loading and saving operations
-
-## Shell Commands
-
-Shell commands bypass all tiers for instant execution:
-
-```
-$ ls -la              # Direct shell execution
-$ git status          # Direct shell execution
-! pwd                 # Alternative prefix
-!!                    # Repeat last shell command
-```
-
-## View Learned Aliases and Workflows
-
-```bash
-# Tool aliases
-cat .llm-cli/learned.toml
-
-# Custom workflows
-cat .llm-cli/custom_workflows.toml
-```
-
-Example **learned.toml** (tool mappings):
-
-```toml
-[[aliases]]
-phrase = "yeet"
-tool = "save_work"
-timestamp = "1702053600"
-source = "user_feedback"
-```
-
-Example **custom_workflows.toml** (shell command workflows):
-
-```toml
-[[custom_workflows]]
-phrase = "deploy staging"
-command = "ssh staging 'cd /app && git pull'"
-timestamp = "1702053700"
-source = "user_custom_generated"
-```
-
-## Project-Specific Storage
-
-All data is stored per-project in the `.llm-cli/` directory:
-- **learned.toml**: Tool aliases (e.g., "yeet" → save_work)
-- **custom_workflows.toml**: Custom shell workflows
-- **embeddings.toml**: Cached embeddings for faster intent matching
-- **history.jsonl**: Submitted-input history for recall and completion
-- **config.toml**: Project-specific configuration (optional)
-
-This means each project can have its own learned commands and history!
-
-## Tips
-
-1. **Save useful suggestions** - Use `s` at a chat command confirmation to make a reusable workflow.
-
-2. **Use natural language** - The system understands:
-   - "push my code"
-   - "what's going on"
-   - "ship it"
-   - "show me todos"
-
-3. **Typos are fine** - Fuzzy matching handles:
-   - "stauts" → "status"
-   - "comit" → "commit"
-   - "statsu" → "status"
-
-4. **Shell commands stay fast** - Always use `$` prefix for shell commands to skip tiers.
-
-5. **Check which tier matched** - Fast responses (< 50ms) = Tier 1 or 2. Slower (~500ms) = Tier 3.
-
-## Troubleshooting
-
-### A request falls back to chat instead of a tool
-
-**Option 1:** Lower the confidence threshold in `src/keyword_classifier.rs`:
-```rust
-const CONFIDENCE_THRESHOLD: f32 = 0.6;  // Default: 0.7
-```
-
-**Option 2:** Use a better classifier model:
-```toml
-classifier_model = "qwen2:1.5b"  # or "phi3:mini"
-```
-
-### Tier 3 is too slow
-
-Use the fastest classifier:
-```toml
-classifier_model = "qwen2:0.5b"
-```
-
-### Wrong tool keeps matching
-
-Check and edit learned aliases:
-```bash
-cat .llm-cli/learned.toml
-# Remove incorrect entries, then save a corrected workflow from a chat suggestion.
-```
-
-### Embeddings initialization is slow
-
-This only happens once per project. The cache is stored in `.llm-cli/embeddings.toml` and reused on subsequent runs.
-
-## Performance Expectations
-
-| Query Type | Tier | Latency | Example |
-|-----------|------|---------|---------|
-| Exact match | 1 | < 1ms | "status" |
-| Learned alias | 1 | < 1ms | "yeet" |
-| Typo | 1 | < 1ms | "stauts" |
-| Natural language | 2 | ~50ms | "push my changes" |
-| Novel phrasing | 3 | ~500ms | "ship it to prod" |
-| Unknown | Chat | Model response | Conceptual question or unsupported task |
-
-Saved custom workflows move to Tier 1 on later use.
-
-## Next Steps
-
-- Read [INTENT_SYSTEM.md](INTENT_SYSTEM.md) for detailed architecture
-- Read [AUTOCOMPLETION.md](AUTOCOMPLETION.md) for ghost-text behavior
-- Read [SEMANTIC_CONTEXT.md](SEMANTIC_CONTEXT.md) for reference handling
-- Customize your config in `.llm-cli/config.toml` (optional)
-- Run `llm_cli doctor --full` before troubleshooting a setup or model issue.
-
-The system stays local, with deterministic routing for supported actions and
-chat as the fallback for everything else.
+Plain output streams. JSON mode emits one response object, or an error object
+and exit status 2 for setup/configuration/runtime failures. `ask` never executes
+tools. Files and stdin are not automatically attached as context.
+
+## Input and setup shortcuts
+
+- Tab accepts ghost text; Up/Down recalls prior inputs.
+- Ctrl+S switches between chat and direct shell input.
+- `cd /path/to/project` changes the session directory.
+- `help` lists supported actions. Esc or Ctrl+C exits.
+- `llm_cli init` retries setup; `llm_cli doctor --full` explains prerequisites.
+- `llm_cli setup` creates an optional commented project config.
+
+For a different model, set `LLM_CLI_MODEL` or the `model` field in
+`.llm-cli/config.toml`. Use an installed model tag. The embedding and classifier
+models are optional; their absence should not prevent basic chat.
+
+If an action is misunderstood, use the explicit forms above. For example,
+`stage README.md` is unambiguous, while `add this file` lacks a named file and
+will not automatically stage everything. Inspect saved aliases if the same
+phrase keeps selecting an unexpected workflow.
+
+See [intent routing](INTENT_SYSTEM.md) for implementation details and
+[the review](PROJECT_REVIEW.md) for limitations and planned improvements.

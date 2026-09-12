@@ -8,10 +8,13 @@ The LLM CLI now supports **persistent embedding caching** to significantly speed
 
 1. **First Run**: On the first startup (or when the cache is invalid), the CLI computes embeddings for all tool examples using Ollama's embedding model and saves them to a cache file.
 
-2. **Subsequent Runs**: The CLI loads pre-computed embeddings from the cache file, making startup almost instantaneous.
+2. **Subsequent Runs**: The CLI loads pre-computed embeddings from the cache file, avoiding regeneration. Semantic routing embeds the current input once and compares tool examples in memory.
 
 3. **Cache Invalidation**: The cache is automatically invalidated if:
    - The embedding model changes
+   - The Ollama endpoint changes
+   - The tool examples or their tool assignments change
+   - Vectors are empty, inconsistent in dimension, or otherwise invalid
    - The cache version is incompatible
    - The cache file is corrupted
 
@@ -53,7 +56,8 @@ The cache is stored as a TOML file with the following structure:
 
 ```toml
 model = "nomic-embed-text"
-version = 1
+ollama_host = "127.0.0.1:11434"
+version = 2
 
 [examples]
 "example phrase" = ["tool_name", [embedding_vector...]]
@@ -88,10 +92,12 @@ If you switch to a different embedding model, the cache will automatically be in
 
 ## Performance Impact
 
-- **Without Cache**: ~1-2 seconds to compute all embeddings on startup
-- **With Cache**: ~0.1 seconds to load embeddings from disk
-
-This results in a **10-20x speedup** for subsequent runs!
+The regression suite verifies that a warm semantic lookup makes exactly one
+embedding request, for the user input. Previously, it requested the input plus
+every tool example again despite having a disk cache. This is a verified
+reduction in request count, not a measured wall-clock speedup. Startup and
+routing latency depend on hardware, model state, and catalog size; the earlier
+10–20x estimate has no reproducible benchmark in this repository.
 
 ## Troubleshooting
 

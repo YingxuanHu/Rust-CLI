@@ -6,14 +6,21 @@ also needs Rust; release binaries do not.
 
 ## Fast path
 
-From a checked-out copy of this repository:
+Install the latest verified binary on macOS or Linux x86_64:
 
 ```bash
-bash scripts/install.sh
+curl -fLO https://raw.githubusercontent.com/YingxuanHu/Rust-CLI/main/scripts/install.sh
+bash install.sh --binary
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-That installs the binary with Cargo. On the first launch, `llm_cli` checks the
-local runtime and asks before downloading its chat model.
+Install and open [Ollama](https://ollama.com). On the first launch, `llm_cli`
+checks the local runtime and asks before downloading its chat model. Add the
+PATH line to your shell's startup file to keep it in future terminals.
+
+**Version note:** v0.1.0 predates `ask`, shell completion, and the current review
+fixes. These newer features require installing current source until the next
+release: `cargo install --path . --locked` from this repository.
 
 Then, in the repository where you want to use the assistant:
 
@@ -40,7 +47,9 @@ llm_cli ask "give me a concise testing checklist" --json
 ```
 
 Normal output streams directly to the terminal. `--json` prints one JSON object
-for scripts (and returns a JSON error with status 2 if setup is incomplete).
+for scripts (and returns a JSON error with status 2 for setup, configuration,
+or runtime failures). Piped and redirected invocations do not prompt for model
+downloads; run `llm_cli init` first if setup is incomplete.
 `ask` is read-only and does not execute natural-language requests as commands
 or workflows.
 
@@ -70,14 +79,30 @@ The command can complete its subcommands, flags, and shell names with Tab. It
 does not alter shell startup files automatically. Choose the command for your
 shell:
 
+For Bash, enable this terminal; add the same line to `~/.bashrc` to persist it:
+
 ```bash
-# Bash: enable for this terminal; add the same line to ~/.bashrc to persist it.
 source <(llm_cli completions bash)
+```
 
-# Zsh: persist it in a directory already in $fpath, then start a new shell.
-llm_cli completions zsh > "${fpath[1]}/_llm_cli"
+For Zsh, generate into a user-owned directory:
 
-# Fish: persist it using Fish's normal completion directory.
+```zsh
+mkdir -p ~/.zsh/completions
+llm_cli completions zsh > ~/.zsh/completions/_llm_cli
+```
+
+Add these lines to `~/.zshrc`, placing `fpath` before any existing `compinit`:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -Uz compinit && compinit
+```
+
+For Fish:
+
+```fish
+mkdir -p ~/.config/fish/completions
 llm_cli completions fish > ~/.config/fish/completions/llm_cli.fish
 ```
 
@@ -91,7 +116,7 @@ llm_cli completions powershell | Out-String | Invoke-Expression
 `--config` is global, so it works before or after a subcommand. For example:
 
 ```bash
-llm_cli ask "summarize this project" --config /path/to/config.toml
+llm_cli ask "explain Rust ownership" --config /path/to/config.toml
 ```
 
 ## Manual path
@@ -114,7 +139,8 @@ Use `llm_cli --help` for CLI help and `llm_cli doctor --full` for the complete
 read-only dependency check. The repository also provides
 `bash scripts/health.sh`, which checks the source-tree toolchain and default models.
 
-If `llm_cli` is not found after installing, ensure Cargo's binary directory is
-on your `PATH` (rustup prints the required setup command during installation).
+If `llm_cli` is not found after a binary install, use
+`export PATH="$HOME/.local/bin:$PATH"`. For a Cargo source install, use
+`export PATH="$HOME/.cargo/bin:$PATH"` (or the custom install location).
 If the embedding or classifier model is missing, chat still starts, but intent
 matching falls back to the remaining tiers.

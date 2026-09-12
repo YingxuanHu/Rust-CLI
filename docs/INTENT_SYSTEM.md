@@ -1,347 +1,84 @@
-# Tiered Intent Resolution System
+# Intent Routing
 
-This document explains how the LLM CLI determines what you want to do when you type a command.
+The application maps plain language to a catalog of built-in workflows. The
+pipeline is a heuristic router, not an autonomous planner or a calibrated
+probability model.
 
-## Overview
+## Routing order
 
-The system uses **3 tiers** of intent resolution, from fastest to most flexible:
+1. Explicit syntax: shell prefixes, `edit path: instruction`, rollback and
+   starter-guide phrases have direct handling in `intent::quick_match`.
+2. Learned aliases, exact tool names, exact examples, then FZF subsequence
+   matching in `fuzzy.rs`.
+3. Keyword/embedding scoring in `keyword_classifier.rs` when the cache is ready.
+4. A small Ollama model classifies into an exact catalog tool name or `chat`.
+5. Unrecognized requests fall through to chat.
 
-```
-User Input → Tier 1 → Tier 2 → Tier 3 → Execute or Chat
-              (< 1ms)   (~50ms)  (~500ms)
-```
+Arguments are extracted from supported forms and then validated. Classification
+does not currently supply a general structured argument schema. For staging,
+only a named path or an explicit whole-project phrase is accepted; missing
+scope cannot silently become `git add -A`. Known local-save phrases resolve to
+staged-only `commit`, not the combined stage/commit/push workflow.
 
-Each tier tries to understand your intent. If successful, it executes immediately. If uncertain, it falls through to the next tier, ultimately defaulting to conversational chat.
+## Exact and fuzzy matching
 
----
+The catalog in `src/tools.rs` supplies examples and metadata. Learned aliases
+have highest precedence. Exact names/examples take priority over fuzzy matching.
+FZF matches ordered subsequences; it is not a general spellchecker and cannot
+be assumed to handle every transposition. `staus` is a tested match for `status`.
 
-## Architecture
+## Semantic scoring
 
-### Tier 1: Fuzzy Matching (< 1ms)
-**Method:** String similarity matching  
-**Technology:** 100% Rust, `fuzzy-matcher` crate
-**Confidence:** High (exact or near-exact matches)
+The embedding cache contains the catalog examples and tool assignments. A warm
+lookup requests an embedding for the current input once, then compares the
+stored vectors in memory. The best example similarity per tool is combined
+with keyword overlap:
 
-Checks in order:
-1. **Learned aliases** (highest priority)
-   - Your previously confirmed commands
-   - Stored in `.llm-cli/learned.toml` in project directory
-
-2. **Exact tool names**
-   - `status` → `status` tool
-   - `commit` → `commit` tool
-
-3. **Exact tool examples**
-   - `save work` → `save_work` tool
-   - `git status` → `status` tool
-
-4. **Fuzzy matches** (typo-tolerant)
-   - `stauts` → `status` (85%+ similarity)
-   - `comit` → `commit`
-
-**Why this tier:** Instant feedback for common commands and learned patterns.
-
----
-
-### Tier 2: Keyword + Embedding Classifier (~50ms)
-**Method:** Hybrid scoring (deterministic keywords + semantic embeddings)  
-**Technology:** 100% Rust, Ollama embedding API  
-**Confidence:** Threshold 0.7+
-
-Combines two approaches:
-
-**A. Keyword Scoring (60% weight)**
-- Analyzes word overlap between your input and tool examples
-- Deterministic and explainable
-- Example:
-  ```
-  Input: "push my changes"
-  → Contains: "push", "changes"
-  → Matches "save_work" examples: "push my changes", "sync with remote"
-  → High keyword score
-  ```
-
-**B. Embedding Similarity (40% weight)**
-- Computes semantic similarity using vector embeddings
-- Handles paraphrasing and synonyms
-- Cached for speed
-- Example:
-  ```
-  Input: "upload code"
-  → Embedding similar to "push to github"
-  → Matches "save_work" tool
-  ```
-
-**Combined Score:** `0.6 * keyword_score + 0.4 * embedding_score`
-
-**Why this tier:** Balances speed and flexibility. Handles most natural language queries without LLM latency.
-
----
-
-### Tier 3: Small LLM Classifier (~500ms)
-**Method:** Structured prompt to lightweight LLM  
-**Technology:** Ollama API with `qwen2:0.5b` (default)  
-**Confidence:** Threshold 0.5+
-
-When Tier 2 is uncertain, asks a small, fast LLM:
-
-```
-You are a command classifier. Respond with ONLY the tool name, nothing else.
-Available tools: save_work, status, commit, stage, ...
-
-User input: "ship it to production"
-Tool name:
+```text
+score = 0.6 × keyword_score + 0.4 × embedding_similarity
 ```
 
-**Supported Models:**
-- `qwen2:0.5b` - Fastest (default, ~200-300ms)
-- `qwen2:1.5b` - Better accuracy (~400-500ms)
-- `phi3:mini` - Best accuracy (~800ms-1s)
-
-**Why this tier:** Handles novel phrasing and edge cases that don't match patterns. Falls back to conversational chat when uncertain, providing a natural user experience.
-
----
-
-## Learned Aliases
-
-### File Locations
-
-**Project aliases** (stored in project directory):
-```
-.llm-cli/learned.toml
-```
-
-### Format
-
-```toml
-[[aliases]]
-phrase = "yeet my changes"
-tool = "save_work"
-timestamp = "1702053600"
-source = "user_feedback"
-
-[[aliases]]
-phrase = "what's up"
-tool = "status"
-timestamp = "1702053700"
-source = "user_feedback"
-```
-
-### Storage
-
-- All learned aliases are stored per-project in `.llm-cli/learned.toml`
-- Each project has its own set of learned commands
-- This allows different meanings for the same phrase across different projects (e.g., "deploy" might mean different things in different repos)
-
----
-
-## Performance Characteristics
-
-| Tier | Latency | Accuracy | Technology | Fallback |
-|------|---------|----------|------------|----------|
-| 1 | < 1ms | Very High | Fuzzy matching | Yes |
-| 2 | ~50ms | High | Keyword + Embeddings | Yes |
-| 3 | ~500ms | High | Small LLM | Chat |
-
-**Real-world performance:**
-- **90% of commands:** Resolved in Tier 1 (< 1ms)
-- **9% of commands:** Resolved in Tier 2 (~50ms)
-- **1% of commands:** Resolved in Tier 3 or fall back to chat
-- **Over time:** More commands move to Tier 1 through custom workflow learning
-
----
-
-## Configuration
-
-### Example Config (`.llm-cli/config.toml`)
-
-```toml
-# Main chat model
-model = "llama3"
-
-# Daemon used for embeddings and the classifier as well as chat
-ollama_host = "127.0.0.1:11434"
-
-# Embedding model for Tier 2
-embedding_model = "nomic-embed-text"
-
-# Classifier model for Tier 3
-classifier_model = "qwen2:1.5b"  # or "qwen2:0.5b", "phi3:mini"
-
-# Paths (all default to .llm-cli/ directory)
-learned_path = ".llm-cli/learned.toml"
-embedding_cache_path = ".llm-cli/embeddings.toml"
-history_path = ".llm-cli/history.jsonl"
-```
-
-### Model Recommendations
-
-**For speed-critical use (vim-like feel):**
-```toml
-classifier_model = "qwen2:0.5b"
-```
-
-**For better accuracy:**
-```toml
-classifier_model = "qwen2:1.5b"
-```
-
-**For best accuracy (slight delay acceptable):**
-```toml
-classifier_model = "phi3:mini"
-```
-
----
-
-## Explicit Learning Mode
-
-You can also teach the system explicitly without waiting for Tier 4:
-
-```
-# This feature is planned for future implementation
-> learn: yeet → save_work
-✓ Learned: "yeet" → save_work
-
-> learn: what's cooking → status
-✓ Learned: "what's cooking" → status
-```
-
----
-
-## Shell Command Bypass
-
-Shell commands with `$` or `!` prefix **bypass all tiers** for instant execution:
-
-```
-$ ls -la        # Direct shell execution
-! git status    # Direct shell execution
-!!              # Repeat last shell command
-```
-
-This ensures shell commands remain fast and predictable.
-
----
-
-## Technical Details
-
-### File Structure
-
-```
-src/
-├── fuzzy.rs              # Tier 1: Fuzzy matching
-├── keyword_classifier.rs # Tier 2: Keyword + embedding hybrid
-├── llm_classifier.rs     # Tier 3: Small LLM fallback
-├── learned.rs            # Learned alias management
-└── intent.rs             # Orchestrates all tiers
-```
-
-### Data Flow
-
-```rust
-// Simplified pseudo-code
-
-async fn resolve_intent(input: &str) -> Intent {
-    // Tier 1: Fuzzy match
-    if let Some(intent) = fuzzy_match(input) {
-        return intent;  // < 1ms
-    }
-    
-    // Tier 2: Keyword + embedding
-    if let Some(intent) = keyword_classify(input).await {
-        return intent;  // ~50ms
-    }
-    
-    // Tier 3: LLM classifier
-    if let Some(intent) = llm_classify(input).await {
-        return intent;  // ~500ms
-    }
-    
-    // Fallback: Default to chat
-    Intent::Chat
-}
-```
-
----
-
-## Advantages
-
-✅ **Fast:** 90% of queries resolved in < 1ms  
-✅ **Flexible:** Handles natural language and novel phrasing  
-✅ **Natural fallback:** Defaults to conversational chat when uncertain  
-✅ **Explainable:** Can see why each match succeeded  
-✅ **100% Rust:** No Python, no C++ dependencies  
-✅ **Offline:** Works without internet (Ollama runs locally)  
-✅ **Clean:** All state in standard config directories  
-
----
-
-## Future Enhancements
-
-Potential improvements (not yet implemented):
-
-1. **Explicit learning syntax**
-   - `learn: yeet → save_work`
-
-2. **Confidence display**
-   - Show which tier matched and confidence score
-   - `status [Tier 1, 100%]`
-
-3. **Learning statistics**
-   - `learned stats` - Show most used aliases
-
-4. **Import/export aliases**
-   - Share learned aliases between machines
-
-5. **Negative learning**
-   - `unlearn: yeet`
-   - Remove incorrect aliases
-
----
-
-## Troubleshooting
-
-### Commands not being recognized
-
-**Solution:** Lower Tier 2 threshold in `src/keyword_classifier.rs`:
-```rust
-const CONFIDENCE_THRESHOLD: f32 = 0.6;  // Default: 0.7
-```
-
-### Tier 3 is too slow
-
-**Solution:** Use faster classifier model:
-```toml
-classifier_model = "qwen2:0.5b"  # Fastest
-```
-
-Or skip Tier 3 entirely (will default to chat):
-```toml
-classifier_model = ""  # Disables Tier 3
-```
-
-### Wrong tool keeps matching
-
-**Solution:** Check learned aliases:
-```bash
-cat .llm-cli/learned.toml
-```
-
-Remove incorrect entry and re-learn correctly.
-
----
-
-## Learning Custom Commands
-
-When the LLM generates shell commands during chat, the system offers to save them as custom workflows. These are stored in `.llm-cli/custom_workflows.toml` (legacy `.llm-cli/custom_commands.toml`) and matched instantly in Tier 1 (< 1ms).
-
----
-
-## Summary
-
-The 3-tier intent system provides:
-1. **Speed** - Most queries resolve instantly (< 1ms)
-2. **Flexibility** - Handles natural language via semantic matching and LLM
-3. **Natural fallback** - Defaults to chat when uncertain
-4. **Clarity** - Explainable, deterministic matches
-
-It's designed to be **fast, local, and clean** - resolving most commands instantly while providing a natural conversational experience for everything else.
+The current acceptance threshold is 0.7. These weights are implementation
+heuristics, not measured intent accuracy. An embedding request failure allows
+the model-classification fallback to continue. See [cache behavior](EMBEDDING_CACHE.md)
+for catalog validation and persistence.
+
+## Model fallback and execution boundary
+
+The default classifier is `qwen2:1.5b`; configure `classifier_model` or
+`LLM_CLI_CLASSIFIER_MODEL` to change it. Its reply must match a known tool name
+exactly after simple formatting normalization. For example,
+`draft_commit_message` remains that tool and cannot match `commit` by substring.
+Ambiguous prose such as `commit or status` is rejected.
+
+Typed background events carry resolved intent, original input, and directory
+back to the UI. Model chat text is never parsed as an internal `__INTENT__`
+control signal. A result for a different current directory or an already-busy
+workflow is rejected with an actionable message.
+
+Each tool still owns its review behavior. The shell risk policy is a heuristic
+review aid, not a shell parser or sandbox. Natural-language confidence alone
+must not be treated as authorization to expand a requested action's scope.
+
+## Learned workflows
+
+The TUI can save reviewed command suggestions for a phrase. Current workflow
+data uses `.llm-cli/custom_workflows.toml`; legacy `custom_commands`/`macros`
+data is accepted. Malformed existing data causes save failure without replacing
+the file with empty state. Saved workflows are currently shell strings rather
+than parameterized, resumable typed steps.
+
+## Testing and performance
+
+Regression tests cover exact classifier output, local-save scope, staging
+arguments, Unicode extraction, embedding-failure fallback, cache validity and
+the one-request warm-cache contract. These do not establish live-model routing
+accuracy across unseen phrasing.
+
+Earlier latency and 90%/9%/1% tier-distribution estimates were not backed by a
+reproducible benchmark in this repository and are not product guarantees.
+Measure p50/p95 and incorrect-action rates on a published corpus, recording
+hardware and warm/cold model state, before making comparative speed claims.
+
+The planned next step is structured task discovery and explicit arguments,
+followed by reusable verified recipes. See [the project review](PROJECT_REVIEW.md).
