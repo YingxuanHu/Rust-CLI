@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
-use crate::repo::RepoInfo;
 use crate::context::RecentOutput;
+use crate::repo::RepoInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
@@ -78,11 +78,22 @@ fn truncate_to_bytes(content: &str, max_bytes: usize) -> String {
         return content.to_string();
     }
 
-    let mut end = max_bytes;
-    while !content.is_char_boundary(end) {
-        end -= 1;
+    // Keep the opening command context and final diagnostics, where test and
+    // build tools usually explain a failure. The marker shares the same limit.
+    const MARKER: &str = "\n...[output truncated]...\n";
+    if max_bytes < MARKER.len() {
+        return MARKER[..max_bytes].to_owned();
     }
-    format!("{}...[truncated]", &content[..end])
+    let available = max_bytes - MARKER.len();
+    let mut head = available.div_ceil(2);
+    while !content.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = content.len() - available / 2;
+    while !content.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{MARKER}{}", &content[..head], &content[tail..])
 }
 
 #[cfg(test)]
@@ -105,8 +116,49 @@ mod tests {
     fn output_truncation_preserves_utf8_boundaries() {
         let content = "🦀".repeat(1_000);
         let truncated = truncate_to_bytes(&content, 2_000);
-        assert!(truncated.ends_with("...[truncated]"));
+        assert!(truncated.contains("...[output truncated]..."));
+        assert!(truncated.len() <= 2_000);
+        assert!(truncated.starts_with("🦀"));
+        assert!(truncated.ends_with("🦀"));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn recording_large_output_keeps_the_start_and_final_failure() {
+        let mut session = SessionState::new();
+        let content = format!(
+            "running 500 tests\n{}\nFAILURE: expected 42 but received 0",
+            "test parser::roundtrip ... ok\n".repeat(500),
+        );
+        session.record_output("tests", "cargo test failed", &content);
+        let stored = &session.recent_outputs.front().unwrap().content;
+        assert!(stored.starts_with("running 500 tests"));
+        assert!(stored.ends_with("FAILURE: expected 42 but received 0"));
+        assert!(stored.contains("...[output truncated]..."));
+        assert!(stored.len() <= 2_000);
+    }
+
+    #[test]
+    fn small_capture_budgets_are_strict_and_utf8_safe() {
+        let content = "ASCII🦀é漢字".repeat(100);
+        for budget in 0..256 {
+            let truncated = truncate_to_bytes(&content, budget);
+            assert!(truncated.len() <= budget);
+            assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+        }
+        assert_eq!(truncate_to_bytes("short🦀", 2_000), "short🦀");
+        assert_eq!(truncate_to_bytes("", 0), "");
+    }
+
+    #[test]
+    fn recording_outputs_keeps_only_the_five_newest() {
+        let mut session = SessionState::new();
+        for index in 0..10 {
+            session.record_output("tests", &format!("run {index}"), &format!("result {index}"));
+        }
+        assert_eq!(session.recent_outputs.len(), 5);
+        assert_eq!(session.recent_outputs.front().unwrap().content, "result 9");
+        assert_eq!(session.recent_outputs.back().unwrap().content, "result 5");
     }
 }
 
