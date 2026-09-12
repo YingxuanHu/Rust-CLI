@@ -5,6 +5,8 @@
 //! process group, which is killed on cancellation, timeout, completion, or task
 //! abortion so descendants cannot keep pipes open. On other platforms Tokio's
 //! child-only cleanup is used; descendant cleanup is not yet guaranteed there.
+//! Cancellation and timeout retain the bounded output already read; unread pipe
+//! bytes can be discarded during cleanup, so these snapshots are not transcripts.
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
@@ -30,6 +32,8 @@ pub struct TaskSpec {
     pub cwd: PathBuf,
     pub program: String,
     pub args: Vec<String>,
+    /// Applied to this child only, after the default plain-output environment.
+    pub environment: Vec<(String, String)>,
     pub timeout: Duration,
 }
 
@@ -49,6 +53,8 @@ pub struct TaskSnapshot {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// Total raw bytes read from both pipes, before UTF-8 decoding or retention.
+    pub output_bytes: usize,
     pub outcome: Option<TaskOutcome>,
 }
 
@@ -64,19 +70,36 @@ impl TaskHandle {
     }
 
     /// Cancel and wait for bounded cleanup before closing the application.
-    pub async fn shutdown(mut self) {
+    /// Returns the final retained output for reporting and audit records. If a
+    /// worker stops without publishing an outcome, return an explicit error.
+    pub async fn shutdown(mut self) -> TaskSnapshot {
         self.cancel();
+        let mut worker_error = None;
         if let Some(mut worker) = self.worker.take() {
-            if timeout(CLEANUP_TIMEOUT + Duration::from_secs(1), &mut worker)
-                .await
-                .is_err()
-            {
-                // The process-group guard and kill_on_drop remain active if
-                // cleanup itself stalls or this task is interrupted.
-                worker.abort();
-                let _ = worker.await;
+            match timeout(CLEANUP_TIMEOUT + Duration::from_secs(1), &mut worker).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    worker_error = Some(format!(
+                        "Command worker stopped before reporting its outcome: {error}"
+                    ));
+                }
+                Err(_) => {
+                    // The process-group guard and kill_on_drop remain active if
+                    // cleanup itself stalls or this task is interrupted.
+                    worker.abort();
+                    let _ = worker.await;
+                    worker_error =
+                        Some("Command worker did not finish within the cleanup deadline".into());
+                }
             }
         }
+        let mut snapshot = self.updates.borrow().clone();
+        if snapshot.outcome.is_none() {
+            snapshot.outcome = Some(TaskOutcome::Error(worker_error.unwrap_or_else(|| {
+                "Command worker closed without reporting its outcome".into()
+            })));
+        }
+        snapshot
     }
 }
 
@@ -95,6 +118,7 @@ pub fn spawn(spec: TaskSpec) -> TaskHandle {
         stderr: String::new(),
         stdout_truncated: false,
         stderr_truncated: false,
+        output_bytes: 0,
         outcome: None,
     };
     let (updates, receiver) = watch::channel(initial);
@@ -182,6 +206,7 @@ async fn run(
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0")
         .env("TERM", "dumb")
+        .envs(spec.environment.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -200,8 +225,9 @@ async fn run(
                 &stdout_capture,
                 &stderr_capture,
                 Some(TaskOutcome::Error(format!(
-                    "Could not start {}: {error}",
-                    spec.program
+                    "Could not start {} in {}: {error}",
+                    spec.program,
+                    spec.cwd.display()
                 ))),
             );
             return;
@@ -332,6 +358,7 @@ fn publish(
         stderr: stderr.text.clone(),
         stdout_truncated: stdout.truncated,
         stderr_truncated: stderr.truncated,
+        output_bytes: stdout.bytes.saturating_add(stderr.bytes),
         outcome,
     });
 }
@@ -341,10 +368,12 @@ struct TailCapture {
     text: String,
     pending: Vec<u8>,
     truncated: bool,
+    bytes: usize,
 }
 
 impl TailCapture {
     fn push(&mut self, bytes: &[u8], eof: bool) {
+        self.bytes = self.bytes.saturating_add(bytes.len());
         self.pending.extend_from_slice(bytes);
         loop {
             match std::str::from_utf8(&self.pending) {
@@ -401,6 +430,17 @@ mod tests {
         let mut capture = TailCapture::default();
         capture.push(&[b'a', 0xff, b'b', 0xf0, 0x9f], true);
         assert_eq!(capture.text, "a�b�");
+        assert_eq!(capture.bytes, 5);
+    }
+
+    #[test]
+    fn output_byte_count_saturates_without_overflow() {
+        let mut capture = TailCapture {
+            bytes: usize::MAX - 1,
+            ..TailCapture::default()
+        };
+        capture.push(b"abc", true);
+        assert_eq!(capture.bytes, usize::MAX);
     }
 
     #[test]
@@ -440,12 +480,69 @@ mod tests {
             cwd: std::env::current_dir().unwrap(),
             program: "llm-cli-nonexistent-runner-test-program".into(),
             args: vec![],
+            environment: vec![],
             timeout: Duration::from_secs(2),
         });
         let result = finished(&mut handle.updates).await;
         assert_eq!(result.id, TaskId(1));
         assert!(matches!(result.outcome, Some(TaskOutcome::Error(_))));
-        handle.shutdown().await;
+        assert_eq!(handle.shutdown().await, result);
+    }
+
+    #[tokio::test]
+    async fn missing_working_directory_is_a_final_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("does-not-exist");
+        let mut handle = spawn(TaskSpec {
+            id: TaskId(2),
+            cwd: cwd.clone(),
+            program: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![],
+            environment: vec![],
+            timeout: Duration::from_secs(2),
+        });
+        let result = finished(&mut handle.updates).await;
+        assert_eq!(result.id, TaskId(2));
+        match &result.outcome {
+            Some(TaskOutcome::Error(message)) => {
+                assert!(message.contains(&cwd.display().to_string()))
+            }
+            other => panic!("missing directory should fail gracefully, got {other:?}"),
+        }
+        assert_eq!(handle.shutdown().await, result);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_closed_worker_without_losing_snapshot() {
+        let initial = TaskSnapshot {
+            id: TaskId(42),
+            stdout: "retained output".into(),
+            stderr: "retained diagnostic".into(),
+            stdout_truncated: true,
+            stderr_truncated: false,
+            output_bytes: OUTPUT_LIMIT_BYTES + 20,
+            outcome: None,
+        };
+        let (updates, receiver) = watch::channel(initial.clone());
+        let (cancellation, _cancelled) = watch::channel(false);
+        drop(updates);
+        let handle = TaskHandle {
+            updates: receiver,
+            cancellation,
+            worker: Some(tokio::spawn(async {})),
+        };
+        let result = handle.shutdown().await;
+        assert!(matches!(result.outcome, Some(TaskOutcome::Error(_))));
+        assert_eq!(
+            TaskSnapshot {
+                outcome: None,
+                ..result
+            },
+            initial
+        );
     }
 
     #[cfg(unix)]
@@ -455,6 +552,7 @@ mod tests {
             cwd: std::env::current_dir().unwrap(),
             program: "sh".into(),
             args: vec!["-c".into(), script.into()],
+            environment: vec![],
             timeout: limit,
         })
     }
@@ -462,11 +560,23 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn output_is_visible_before_completion() {
-        let mut handle = shell(
-            "printf 'started'; sleep 0.5; printf ' finished'",
-            Duration::from_secs(4),
-        );
-        timeout(Duration::from_secs(2), async {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release");
+        let mut handle = spawn(TaskSpec {
+            id: TaskId(9),
+            cwd: directory.path().to_path_buf(),
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf 'started'; while [ ! -f \"$1\" ]; do sleep 0.02; done; printf ' finished'"
+                    .into(),
+                "test".into(),
+                release.to_string_lossy().into_owned(),
+            ],
+            environment: vec![],
+            timeout: Duration::from_secs(10),
+        });
+        timeout(Duration::from_secs(5), async {
             loop {
                 handle.updates.changed().await.unwrap();
                 let state = handle.updates.borrow_and_update().clone();
@@ -478,10 +588,42 @@ mod tests {
         })
         .await
         .unwrap();
+        std::fs::write(release, b"release").unwrap();
         let result = finished(&mut handle.updates).await;
         assert_eq!(result.outcome, Some(TaskOutcome::Succeeded));
         assert_eq!(result.stdout, "started finished");
         handle.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn environment_overrides_are_child_local() {
+        const VARIABLE: &str = "LLM_CLI_RUNNER_CHILD_ENV_51D67583";
+        let original = std::env::var_os(VARIABLE);
+        let mut handle = spawn(TaskSpec {
+            id: TaskId(10),
+            cwd: std::env::current_dir().unwrap(),
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '%s|%s|%s|%s' \"$LLM_CLI_RUNNER_CHILD_ENV_51D67583\" \"$TERM\" \"$NO_COLOR\" \"$CLICOLOR\"".into(),
+            ],
+            environment: vec![
+                (VARIABLE.into(), "child-only".into()),
+                ("TERM".into(), "explicit-terminal".into()),
+                ("NO_COLOR".into(), "explicit-no-color".into()),
+                ("CLICOLOR".into(), "explicit-cli-color".into()),
+            ],
+            timeout: Duration::from_secs(2),
+        });
+        let result = finished(&mut handle.updates).await;
+        assert_eq!(result.outcome, Some(TaskOutcome::Succeeded));
+        assert_eq!(
+            result.stdout,
+            "child-only|explicit-terminal|explicit-no-color|explicit-cli-color"
+        );
+        assert_eq!(std::env::var_os(VARIABLE), original);
+        assert_eq!(handle.shutdown().await, result);
     }
 
     #[cfg(unix)]
@@ -509,6 +651,20 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(3));
             handle.shutdown().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_preserves_output_already_read_from_both_pipes() {
+        let mut handle = shell(
+            "printf 'partial stdout'; printf 'partial stderr' >&2; exec sleep 30",
+            Duration::from_secs(2),
+        );
+        let result = finished(&mut handle.updates).await;
+        assert_eq!(result.outcome, Some(TaskOutcome::TimedOut));
+        assert_eq!(result.stdout, "partial stdout");
+        assert_eq!(result.stderr, "partial stderr");
+        assert_eq!(handle.shutdown().await, result);
     }
 
     #[cfg(unix)]
@@ -588,12 +744,26 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn shutdown_returns_cancelled_state_and_retained_output() {
+        let mut handle = shell("sleep 30 & printf '%s' $!; wait", Duration::from_secs(10));
+        let pid = wait_for_pid(&mut handle).await;
+        let result = handle.shutdown().await;
+        assert_eq!(result.id, TaskId(7));
+        assert_eq!(result.outcome, Some(TaskOutcome::Cancelled));
+        assert_eq!(result.stdout, pid);
+        assert_process_stopped(&pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn aborting_worker_still_cleans_its_process_group() {
         let mut handle = shell("sleep 30 & printf '%s' $!; wait", Duration::from_secs(10));
         let pid = wait_for_pid(&mut handle).await;
-        let worker = handle.worker.take().unwrap();
-        worker.abort();
-        assert!(worker.await.unwrap_err().is_cancelled());
+        handle.worker.as_ref().unwrap().abort();
+        let result = handle.shutdown().await;
+        assert_eq!(result.id, TaskId(7));
+        assert_eq!(result.stdout, pid);
+        assert!(matches!(result.outcome, Some(TaskOutcome::Error(_))));
         assert_process_stopped(&pid).await;
     }
 
@@ -609,6 +779,7 @@ mod tests {
         assert!(result.stdout_truncated && result.stderr_truncated);
         assert!(result.stdout.len() <= OUTPUT_LIMIT_BYTES);
         assert!(result.stderr.len() <= OUTPUT_LIMIT_BYTES);
+        assert!(result.output_bytes > result.stdout.len() + result.stderr.len());
         assert!(result.stdout.ends_with("final stdout 🦀"));
         assert!(result.stderr.ends_with("final stderr 你好"));
         handle.shutdown().await;
@@ -642,6 +813,7 @@ mod tests {
                 "test".into(),
                 argument.into(),
             ],
+            environment: vec![],
             timeout: Duration::from_secs(2),
         });
         let result = finished(&mut handle.updates).await;

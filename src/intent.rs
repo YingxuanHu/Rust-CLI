@@ -43,6 +43,14 @@ pub async fn resolve_intent(
     ollama_host: &str,
 ) -> Result<ParsedIntent> {
     tracing::debug!("[Intent Resolution] Input: '{}'", input);
+
+    // Explaining an existing result is read-only, even if a learned alias or
+    // classifier associates its build/test keywords with an executable tool.
+    // This must precede every classification tier, not just quick_match: chat
+    // quick matches still reach this entry point before prompt composition.
+    if is_output_explanation(input) {
+        return Ok(ParsedIntent::new("chat", 1.0));
+    }
     
     // Tier 1: Fuzzy matching + learned aliases
     if let Some(intent) = fuzzy::fuzzy_match(input, learned) {
@@ -94,6 +102,27 @@ pub async fn resolve_intent(
         args: ToolArgs::default(),
         confidence: 0.5,
     })
+}
+
+fn is_output_explanation(input: &str) -> bool {
+    let normalized = input.trim()
+        .trim_end_matches(|ch| matches!(ch, '?' | '!' | '.'))
+        .trim()
+        .to_ascii_lowercase();
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    if matches!(words.first().copied(), Some("why" | "explain" | "summarize"))
+        && crate::context::contains_reference(input)
+    {
+        return true;
+    }
+
+    // Bare references are also requests about prior results, not instructions
+    // to run again. Match whole phrases so "run tests and explain" remains an
+    // action request and filenames such as last-build-error.rs are unaffected.
+    matches!(words.as_slice(),
+        ["last", "build" | "test" | "tests" | "error" | "errors" | "failure" | "output" | "result"]
+        | ["last", "build" | "test" | "tests", "error" | "errors" | "failure" | "failures" | "output" | "result" | "results"]
+    )
 }
 
 fn enrich_intent(mut intent: ParsedIntent, input: &str) -> ParsedIntent {
@@ -232,8 +261,19 @@ pub fn quick_match(input: &str) -> Option<ParsedIntent> {
 
     match trimmed.to_ascii_lowercase().as_str() {
         "run tests" => return Some(ParsedIntent::new("run_tests", 1.0)),
+        "build" => return Some(ParsedIntent::new("build", 1.0)),
+        "tasks" | "project tasks" => return Some(ParsedIntent::new("project_tasks", 1.0)),
+        "status" | "what changed" => return Some(ParsedIntent::new("status", 1.0)),
+        "commit" | "save locally" => return Some(ParsedIntent::new("commit", 1.0)),
+        "save work" => return Some(ParsedIntent::new("save_work", 1.0)),
         "help" | "?" => return Some(ParsedIntent::new("help", 1.0)),
         _ => {}
+    }
+
+    if let Some(path) = trimmed.get(..5).filter(|prefix| prefix.eq_ignore_ascii_case("diff "))
+        .map(|_| trimmed[5..].trim()).filter(|path| !path.is_empty()) {
+        return Some(ParsedIntent { tool: "show_diff".into(), confidence: 1.0,
+            args: ToolArgs { path: Some(path.to_string()), ..ToolArgs::default() } });
     }
 
     if matches!(
@@ -293,6 +333,33 @@ mod tests {
         assert_eq!(quick_match("help").unwrap().tool, "help");
         assert_eq!(quick_match("?").unwrap().tool, "help");
         assert!(quick_match("how do I run tests?").is_none());
+    }
+
+    #[test]
+    fn common_actions_resolve_locally_without_matching_questions() {
+        for (input, tool) in [
+            ("BUILD", "build"), ("tasks", "project_tasks"),
+            ("project tasks", "project_tasks"), ("status", "status"),
+            ("what changed", "status"), ("commit", "commit"),
+            ("save locally", "commit"), ("save work", "save_work"),
+        ] {
+            assert_eq!(quick_match(input).unwrap().tool, tool);
+        }
+        for question in ["why did the build fail?", "how do I commit?", "explain tasks"] {
+            assert!(quick_match(question).is_none());
+        }
+    }
+
+    #[test]
+    fn direct_diff_preserves_path_text() {
+        for path in ["--output=secret", "src/My File.rs", "中文/🦀.rs", ":(top)*"] {
+            let parsed = quick_match(&format!("DIFF {path}")).unwrap();
+            assert_eq!(parsed.tool, "show_diff");
+            assert_eq!(parsed.args.path.as_deref(), Some(path));
+        }
+        assert!(quick_match("diff").is_none());
+        assert!(quick_match("diff  ").is_none());
+        assert!(quick_match("🦀🦀🦀").is_none());
     }
 
     #[test]
@@ -368,6 +435,49 @@ mod tests {
         let learned = LearnedAliases::default();
         for input in ["save locally", "save local", "save changes locally"] {
             assert_eq!(fuzzy::fuzzy_match(input, &learned).unwrap().tool, "commit", "{input}");
+        }
+    }
+
+    #[tokio::test]
+    async fn output_explanations_bypass_action_aliases_and_unavailable_classifiers() {
+        let fixture = tempfile::tempdir().expect("isolated aliases");
+        let mut learned = LearnedAliases::default();
+        learned.save_alias(
+            "why did tests fail?",
+            "build",
+            &fixture.path().join("learned.toml"),
+            "regression fixture",
+        ).unwrap();
+        let unavailable_host = "http://127.0.0.1:0";
+        let cache = EmbeddingCache::with_test_examples(unavailable_host);
+        for input in [
+            "why did tests fail?",
+            "Why did the build fail?",
+            "explain the output",
+            "explain that failure",
+            "summarize the results",
+            "last build error",
+            "last test failure",
+            "last tests",
+            "last error?",
+        ] {
+            let parsed = resolve_intent(
+                input, &cache, &learned, "unavailable-classifier", 1, unavailable_host,
+            ).await.expect("output questions must not contact a classifier");
+            assert_eq!(parsed.tool, "chat", "{input}");
+            assert_eq!(parsed.confidence, 1.0, "{input} must resolve deterministically");
+        }
+    }
+
+    #[test]
+    fn output_explanation_guard_does_not_capture_actions_or_unrelated_questions() {
+        for input in [
+            "run tests", "build", "save work", "stage all", "save locally",
+            "run tests and explain why they failed", "build and summarize the output",
+            "$ explain the output", "show file last-build-error.rs", "why build?",
+            "how do I commit?", "explain tasks", "summarizer the output",
+        ] {
+            assert!(!is_output_explanation(input), "{input}");
         }
     }
 

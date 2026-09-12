@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 use crate::config::Config;
-use crate::workflow::generate_commit_message;
+use crate::workflow::generate_commit_message_async;
 
 /// Generate a shell command from natural language description using LLM.
 #[allow(dead_code)]
@@ -142,7 +142,7 @@ fn clean_generated_command(cmd: &str) -> String {
 /// 
 /// Supported placeholders:
 /// - {{GEN_COMMIT_MSG}} - Generate commit message from staged changes
-pub fn expand_command_handlers(
+pub async fn expand_command_handlers(
     command: &str,
     config: &Config,
     repo_root: &Path,
@@ -151,7 +151,7 @@ pub fn expand_command_handlers(
     
     // Handle {{GEN_COMMIT_MSG}} placeholder
     if expanded.contains("{{GEN_COMMIT_MSG}}") {
-        let commit_msg = generate_commit_message(config, repo_root)
+        let commit_msg = generate_commit_message_async(config, repo_root).await
             .unwrap_or_else(|| "chore: update".to_string());
         
         let commit_cmd = commit_command_for_message(&commit_msg);

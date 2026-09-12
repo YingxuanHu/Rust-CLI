@@ -70,41 +70,6 @@ pub fn run_command_with_timeout_with_input(
     Ok(output.stdout.trim().to_string())
 }
 
-/// Shell-mode counterpart to [`run_command_with_timeout`].
-pub fn run_shell_command_with_timeout(
-    cwd: &std::path::Path,
-    cmd: &str,
-    timeout: Duration,
-) -> Result<String> {
-    if is_potentially_interactive(cmd) {
-        bail!(
-            "Command appears to require interactive input: {}\n\
-             Hint: For git commit, use 'git commit -m \"message\"' instead of bare 'git commit'",
-            cmd
-        );
-    }
-
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(cmd).current_dir(cwd);
-    let output = run_process_with_timeout(&mut command, &format!("sh -c {cmd}"), None, timeout)?;
-
-    if !output.status.success() {
-        if !output.stderr.trim().is_empty() {
-            bail!("{}", output.stderr.trim());
-        }
-        bail!("command exited with {}", output.status);
-    }
-
-    let mut result = output.stdout;
-    if !output.stderr.trim().is_empty() {
-        if !result.is_empty() {
-            result.push('\n');
-        }
-        result.push_str(&output.stderr);
-    }
-    Ok(result.trim().to_string())
-}
-
 struct TimedOutput {
     status: ExitStatus,
     stdout: String,
@@ -193,7 +158,7 @@ fn join_reader(
 }
 
 /// Check if a command is likely to require interactive input
-fn is_potentially_interactive(cmd: &str) -> bool {
+pub fn is_potentially_interactive(cmd: &str) -> bool {
     let cmd_lower = cmd.to_lowercase();
     
     // Check for git commit without -m, -F, or --amend flags
@@ -245,28 +210,6 @@ pub fn split_commit_message(msg: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn timed_shell_command_captures_stderr_without_failing() {
-        let output = run_shell_command_with_timeout(
-            std::path::Path::new("."),
-            "printf out; printf err >&2",
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(output, "out\nerr");
-    }
-
-    #[test]
-    fn timed_shell_command_is_terminated() {
-        let error = run_shell_command_with_timeout(
-            std::path::Path::new("."),
-            "sleep 1",
-            Duration::from_millis(20),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-    }
 
     #[test]
     fn timed_command_can_receive_standard_input_without_a_shell() {

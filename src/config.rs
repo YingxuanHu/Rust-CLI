@@ -27,7 +27,7 @@ llm_timeout_secs = 45
 # Maximum duration for a tool or shell command.
 cmd_timeout_secs = 60
 # Approximate prompt budget. The application reserves space for the system
-# prompt and current input before adding recent-context summaries.
+# prompt and current input before adding bounded recent-output excerpts.
 max_context_tokens = 4096
 streaming = true
 # HTTP timeout used by Ollama's embedding and intent-classifier APIs.

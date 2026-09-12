@@ -30,7 +30,7 @@ use crate::{
     session::{Message, Role, SessionState},
     task_runner::{self, TaskHandle, TaskId, TaskOutcome, TaskSnapshot, TaskSpec},
     ui::{render_ui, AppView, InputMode, TerminalGuard},
-    workflow::{generate_commit_message_async, handle_workflow_response, WorkflowResponder, WorkflowState},
+    workflow::{generate_commit_message_async, handle_workflow_response, GitContinuation, WorkflowKind, WorkflowResponder, WorkflowState},
 };
 
 pub async fn run(config: Config) -> Result<()> {
@@ -120,9 +120,35 @@ struct ActiveTask {
     started: Instant,
     cancelling: bool,
     handle: TaskHandle,
+    purpose: TaskPurpose,
+}
+
+enum TaskPurpose {
+    Tests,
+    Build,
+    Shell { risk: crate::command_policy::CommandRisk, audit_path: PathBuf },
+    Git(GitContinuation),
+}
+
+impl TaskPurpose {
+    fn context_kind(&self) -> &'static str {
+        match self {
+            Self::Tests => "tests",
+            Self::Build => "build",
+            Self::Shell { .. } => "command",
+            Self::Git(_) => "git",
+        }
+    }
 }
 
 impl ActiveTask {
+    fn outcome_label(&self, outcome: &TaskOutcome) -> String {
+        if matches!(outcome, TaskOutcome::Succeeded) && !matches!(self.purpose, TaskPurpose::Tests) {
+            "COMPLETED (exit 0)".to_string()
+        } else {
+            task_outcome_label(outcome)
+        }
+    }
     fn status(&self) -> String {
         format!("{} #{} • running {:.1}s • {}", self.label, self.id.0,
             self.started.elapsed().as_secs_f64(),
@@ -131,7 +157,7 @@ impl ActiveTask {
 
     fn render(&self, snapshot: &TaskSnapshot) -> String {
         let state = match &snapshot.outcome {
-            Some(outcome) => task_outcome_label(outcome),
+            Some(outcome) => self.outcome_label(outcome),
             None if self.cancelling => "CANCELLING — stopping child processes".to_string(),
             None => "RUNNING — Ctrl+C or `cancel task` to stop".to_string(),
         };
@@ -156,8 +182,15 @@ impl ActiveTask {
         if snapshot.stdout.is_empty() && snapshot.stderr.is_empty() {
             text.push_str(if snapshot.outcome.is_some() { "\n(no output)" } else { "\nWaiting for output…" });
         }
-        if snapshot.outcome.is_some() {
-            text.push_str("\nType `run tests` to run the current project's suite again.");
+        if let Some(outcome) = &snapshot.outcome {
+            match self.purpose {
+                TaskPurpose::Tests => text.push_str("\nType `run tests` to run the current project's suite again."),
+                TaskPurpose::Build => text.push_str("\nType `build` to build the current project again."),
+                _ => {}
+            }
+            if matches!(outcome, TaskOutcome::Cancelled | TaskOutcome::TimedOut | TaskOutcome::Error(_)) {
+                text.push_str("\nStopping does not undo completed changes. Inspect files, Git state, and any remote effects before retrying.");
+            }
         }
         text
     }
@@ -171,6 +204,74 @@ fn task_outcome_label(outcome: &TaskOutcome) -> String {
         TaskOutcome::Cancelled => "CANCELLED".to_string(),
         TaskOutcome::TimedOut => "TIMED OUT".to_string(),
         TaskOutcome::Error(error) => format!("TASK ERROR: {error}"),
+    }
+}
+
+/// Keep each task below the Session capture and the context formatter's per-
+/// entry budget, including when all five history slots have maximum metadata.
+/// Joining unbounded pipes before either truncation can lose stderr's ending.
+fn task_context_output(snapshot: &TaskSnapshot, outcome_label: &str) -> String {
+    const CONTEXT_BYTES: usize = 1_000;
+    let outcome = task_evidence_excerpt(outcome_label, 256);
+    let prefix = format!("Outcome: {outcome}\n");
+    let stderr_label = if snapshot.stderr_truncated {
+        "stderr (retained tail):\n"
+    } else {
+        "stderr:\n"
+    };
+    let stdout_label = if snapshot.stdout_truncated {
+        "stdout (retained tail):\n"
+    } else {
+        "stdout:\n"
+    };
+    let stderr = if snapshot.stderr.is_empty() { "(no output)" } else { &snapshot.stderr };
+    let stdout = if snapshot.stdout.is_empty() { "(no output)" } else { &snapshot.stdout };
+    let available = CONTEXT_BYTES - prefix.len() - stderr_label.len() - stdout_label.len() - 1;
+    // A quiet pipe donates unused space to the other, but neither noisy pipe
+    // can crowd out the other's ending diagnostics.
+    let stderr_budget = if stderr.len() <= available / 2 {
+        stderr.len()
+    } else if stdout.len() <= available / 2 {
+        available - stdout.len()
+    } else {
+        available / 2
+    };
+    let stdout_budget = available - stderr_budget;
+    format!("{prefix}{stderr_label}{}\n{stdout_label}{}",
+        task_evidence_excerpt(stderr, stderr_budget),
+        task_evidence_excerpt(stdout, stdout_budget))
+}
+
+fn task_evidence_excerpt(text: &str, budget: usize) -> String {
+    if text.len() <= budget {
+        return text.to_owned();
+    }
+    const MARKER: &str = "\n...[truncated]...\n";
+    if budget < MARKER.len() {
+        return MARKER[..budget].to_owned();
+    }
+    let available = budget - MARKER.len();
+    let mut head = available.div_ceil(2);
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - available / 2;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{MARKER}{}", &text[..head], &text[tail..])
+}
+
+fn record_task_audit(purpose: &TaskPurpose, cwd: &std::path::Path, command: &str, snapshot: &TaskSnapshot) {
+    let TaskPurpose::Shell { risk, audit_path } = purpose else { return; };
+    let outcome = match &snapshot.outcome {
+        Some(TaskOutcome::Succeeded) => "completed",
+        Some(TaskOutcome::Cancelled) => "cancelled",
+        Some(TaskOutcome::TimedOut) => "timed_out",
+        _ => "failed",
+    };
+    if let Err(error) = crate::audit::append_shell_execution(audit_path, cwd, command, *risk, outcome, snapshot.output_bytes) {
+        tracing::warn!(%error, "could not append shell audit record");
     }
 }
 
@@ -198,6 +299,7 @@ struct App {
     frecency: FrecencyTracker,
     active_task: Option<ActiveTask>,
     next_task_id: u64,
+    pending_commit_idx: Option<usize>,
 }
 
 impl App {
@@ -235,6 +337,7 @@ impl App {
             frecency: FrecencyTracker::load(&frecency_path),
             active_task: None,
             next_task_id: 1,
+            pending_commit_idx: None,
         };
 
         let status = if embeddings_ready {
@@ -281,12 +384,30 @@ impl App {
     }
 
     fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]) {
+        let purpose = if label == "Build" { TaskPurpose::Build } else { TaskPurpose::Tests };
+        self.start_process_task(label, cwd, program, args, purpose);
+    }
+
+    fn start_shell_task(&mut self, cwd: PathBuf, command: &str, risk: crate::command_policy::CommandRisk) {
+        let purpose = TaskPurpose::Shell {
+            risk,
+            audit_path: crate::audit::resolve_audit_path(&self.config.audit_path, &cwd),
+        };
+        self.start_process_task("Shell", cwd, "sh", &["-c", command], purpose);
+    }
+
+    fn start_git_task(&mut self, cwd: PathBuf, label: &str, args: Vec<String>, continuation: GitContinuation) {
+        let refs: Vec<_> = args.iter().map(String::as_str).collect();
+        self.start_process_task(label, cwd, "git", &refs, TaskPurpose::Git(continuation));
+    }
+
+    fn start_process_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str], purpose: TaskPurpose) {
         if self.active_task.is_some() {
-            self.reply("A test task is already running. Press Ctrl+C or type `cancel task` before starting another.");
+            self.reply("A task is already running. Press Ctrl+C or type `cancel task` before starting another.");
             return;
         }
         if self.pending_workflow.is_some() {
-            self.reply("Finish or cancel the pending workflow before starting tests.");
+            self.reply("Finish or cancel the pending workflow before starting another task.");
             return;
         }
         let id = TaskId(self.next_task_id);
@@ -297,18 +418,26 @@ impl App {
             program: program.to_string(),
             args: args.iter().map(|arg| arg.to_string()).collect(),
             timeout: Duration::from_secs(self.config.cmd_timeout_secs),
+            environment: if matches!(purpose, TaskPurpose::Git(_)) {
+                vec![("GIT_TERMINAL_PROMPT".into(), "0".into()), ("GIT_PAGER".into(), "cat".into())]
+            } else { vec![] },
         };
         let idx = self.pending_placeholder();
         let task = ActiveTask {
             id,
             label: label.to_string(),
-            command: std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" "),
+            command: if matches!(purpose, TaskPurpose::Shell { .. }) {
+                args[1].to_string()
+            } else {
+                std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" ")
+            },
             cwd,
             request_cwd: self.session.cwd.clone(),
             message_idx: idx,
             started: Instant::now(),
             cancelling: false,
             handle: task_runner::spawn(spec),
+            purpose,
         };
         let content = task.render(&task.handle.updates.borrow());
         self.upsert_message(idx, Role::Assistant, content);
@@ -348,17 +477,25 @@ impl App {
         let content = task.render(&snapshot);
         self.upsert_message(task.message_idx, Role::Assistant, content.clone());
         if let Some(outcome) = &snapshot.outcome {
+            record_task_audit(&task.purpose, &task.cwd, &task.command, &snapshot);
             let has_later_messages = task.message_idx + 1 < self.messages.len();
             self.pending_idxs.retain(|&idx| idx != task.message_idx);
             self.session.record(Message { role: Role::Assistant, content });
             if self.session.cwd == task.request_cwd {
-                let summary = format!("{} #{}: {} in {}", task.label, task.id.0, task_outcome_label(outcome), task.cwd.display());
-                self.session.record_output("tests", &summary, &format!("stderr:\n{}\nstdout:\n{}", snapshot.stderr, snapshot.stdout));
+                let outcome_label = task.outcome_label(outcome);
+                let summary = format!("{} #{}: {} in {}", task.label, task.id.0, outcome_label, task.cwd.display());
+                self.session.record_output(task.purpose.context_kind(), &summary, &task_context_output(&snapshot, &outcome_label));
             }
             if has_later_messages {
                 self.reply(format!("{} #{} finished — {} ({:.1}s).\nDirectory: {}\nFull output is in its task entry above.",
-                    task.label, task.id.0, task_outcome_label(outcome),
+                    task.label, task.id.0, task.outcome_label(outcome),
                     task.started.elapsed().as_secs_f64(), task.cwd.display()));
+            }
+            if matches!(outcome, TaskOutcome::Succeeded)
+                && !task.cancelling && !self.should_quit
+                && self.session.cwd == task.request_cwd && self.pending_workflow.is_none()
+            {
+                self.advance_git_task(&task, &snapshot);
             }
         } else {
             self.active_task = Some(task);
@@ -367,15 +504,69 @@ impl App {
 
     async fn shutdown_command_task(&mut self) {
         if let Some(task) = self.active_task.take() {
-            task.handle.shutdown().await;
+            let snapshot = task.handle.shutdown().await;
+            record_task_audit(&task.purpose, &task.cwd, &task.command, &snapshot);
             self.pending_idxs.retain(|&idx| idx != task.message_idx);
         }
+    }
+
+    fn advance_git_task(&mut self, task: &ActiveTask, snapshot: &TaskSnapshot) {
+        let TaskPurpose::Git(continuation) = &task.purpose else { return; };
+        match continuation {
+            GitContinuation::None => {}
+            GitContinuation::StatusSummary => {
+                self.start_git_task(task.cwd.clone(), "Git diff summary", vec!["diff".into(), "--no-ext-diff".into(), "--no-textconv".into(), "--stat".into()], GitContinuation::None);
+            }
+            GitContinuation::SavePreview => {
+                if snapshot.stdout_truncated {
+                    self.reply("The status preview was truncated. Inspect the repository before starting a save-work plan.");
+                    return;
+                }
+                self.reply("Save-work plan: stage all changes, review a commit message, commit locally, then ask before pushing.\nReview the status above. Press Enter or type 'yes' to stage all; anything else cancels.");
+                self.pending_workflow = Some(WorkflowState { kind: WorkflowKind::SaveWorkPlan, repo_root: task.cwd.clone() });
+            }
+            GitContinuation::SaveWorkStaged => {
+                self.start_git_task(task.cwd.clone(), "Staged changes", vec!["diff".into(), "--cached".into(), "--no-ext-diff".into(), "--no-textconv".into(), "--stat".into()], GitContinuation::CommitPreview { save_work: true });
+            }
+            GitContinuation::CommitPreview { save_work } => {
+                if snapshot.stdout_truncated {
+                    self.reply("Staged preview was truncated. Review the staged diff before committing manually; no commit was started.");
+                } else if snapshot.stdout.trim().is_empty() {
+                    self.reply("Nothing is staged to commit. Stage the intended files first; no commit or push was started.");
+                } else {
+                    self.prepare_commit_plan(task.cwd.clone(), *save_work);
+                }
+            }
+            GitContinuation::OfferPush => {
+                self.reply("Local commit completed. Nothing has been pushed yet.\nType 'yes' to run git push, or anything else to keep this commit local.");
+                self.pending_workflow = Some(WorkflowState { kind: WorkflowKind::PushConfirm, repo_root: task.cwd.clone() });
+            }
+        }
+    }
+
+    fn prepare_commit_plan(&mut self, repo_root: PathBuf, save_work: bool) {
+        let idx = self.pending_placeholder();
+        self.pending_commit_idx = Some(idx);
+        let tx = self.assistant_tx.clone();
+        let config = self.config.clone();
+        self.pending_workflow = Some(WorkflowState {
+            kind: if save_work { WorkflowKind::SaveWorkMessagePending } else { WorkflowKind::CommitMessagePending },
+            repo_root: repo_root.clone(),
+        });
+        tokio::spawn(async move {
+            let suggested = generate_commit_message_async(&config, &repo_root).await
+                .unwrap_or_else(|| "chore: update".to_string());
+            let _ = tx.send(AssistantEvent::CommitPlanReady { idx, suggested, repo_root, save_work });
+        });
     }
 
     fn poll_assistant(&mut self) {
         for _ in 0..64 {
             let Ok(event) = self.assistant_rx.try_recv() else { break; };
             match event {
+                AssistantEvent::ShellExpanded { idx, command, cwd } => {
+                    self.finish_shell_expansion(idx, command, cwd);
+                }
                 AssistantEvent::Token { idx, chunk } => self.append_assistant_chunk(idx, chunk),
                 AssistantEvent::Completed { idx, content, original_input, cwd } => {
                     self.finish_assistant(idx, content, original_input, cwd);
@@ -422,6 +613,27 @@ impl App {
         self.scroll = 0;
         self.viewing_history = false;
         idx
+    }
+
+    fn finish_shell_expansion(&mut self, idx: usize, command: Result<String, String>, cwd: PathBuf) {
+        if self.session.cwd != cwd || self.active_task.is_some() || self.pending_workflow.is_some() {
+            self.fail_assistant(idx, "command preparation was superseded; submit it again in the intended directory".to_string());
+            return;
+        }
+        match command {
+            Ok(command) => {
+                let assessment = crate::command_policy::assess_shell_command(&command);
+                let content = format!("Prepared command (nothing has run):\n$ {command}\nType 'yes' to execute, or anything else to cancel.");
+                self.upsert_message(idx, Role::Assistant, content.clone());
+                self.session.record(Message { role: Role::Assistant, content });
+                self.pending_idxs.retain(|&i| i != idx);
+                self.pending_workflow = Some(WorkflowState {
+                    kind: WorkflowKind::ShellCommandConfirm { command, assessment },
+                    repo_root: cwd,
+                });
+            }
+            Err(error) => self.fail_assistant(idx, error),
+        }
     }
 
     fn reply(&mut self, content: impl Into<String>) {
@@ -553,7 +765,7 @@ impl App {
 
     fn finish_commit_plan(&mut self, idx: usize, suggested: String, repo_root: PathBuf, save_work: bool) {
         use crate::workflow::WorkflowKind;
-        let expected = self.pending_workflow.as_ref().is_some_and(|workflow| {
+        let expected = self.pending_commit_idx == Some(idx) && self.pending_workflow.as_ref().is_some_and(|workflow| {
             workflow.repo_root == repo_root && matches!(
                 (&workflow.kind, save_work),
                 (WorkflowKind::SaveWorkMessagePending, true) | (WorkflowKind::CommitMessagePending, false)
@@ -563,8 +775,10 @@ impl App {
             self.fail_assistant(idx, "this commit request was superseded before its suggestion arrived".to_string());
             return;
         }
+        self.pending_commit_idx = None;
         let content = format!(
-            "Suggested commit message:\n{suggested}\nPress Enter (or type 'yes') to accept, or type a custom message. Type 'cancel' to abort."
+            "Suggested commit message:\n{suggested}\nPress Enter (or type 'yes') to commit locally, or type a custom message. Type 'cancel' to abort.{}",
+            if save_work { " You will be asked separately before pushing." } else { " This workflow will not push." }
         );
         self.upsert_message(idx, Role::Assistant, content.clone());
         self.session.record(Message { role: Role::Assistant, content });
@@ -926,10 +1140,21 @@ impl IntentDispatcher for App {
     fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]) {
         self.start_command_task(label, cwd, program, args);
     }
+
+    fn start_shell_task(&mut self, cwd: PathBuf, command: &str, risk: crate::command_policy::CommandRisk) {
+        self.start_shell_task(cwd, command, risk);
+    }
+
+    fn start_git_task(&mut self, cwd: PathBuf, label: &str, args: Vec<String>, continuation: GitContinuation) {
+        self.start_git_task(cwd, label, args, continuation);
+    }
 }
 
 // Implement WorkflowResponder for App
 impl WorkflowResponder for App {
+    fn start_git_task(&mut self, cwd: PathBuf, label: &str, args: Vec<String>, continuation: GitContinuation) {
+        self.start_git_task(cwd, label, args, continuation);
+    }
     fn reply(&mut self, content: impl Into<String>) {
         self.reply(content);
     }
@@ -1030,7 +1255,7 @@ fn submit_input(app: &mut App) {
     if raw_input.eq_ignore_ascii_case("cancel task") {
         app.push_recorded(Role::User, raw_input);
         if !app.cancel_command_task() {
-            app.reply("There is no active test task to cancel.");
+            app.reply("There is no active command task to cancel.");
         }
         return;
     }
@@ -1228,59 +1453,11 @@ fn directory_change_target(input: &str) -> Option<&str> {
 
 fn handle_pending_workflow(app: &mut App, prompt: &str) {
     if app.active_task.is_some() {
-        app.reply("A test task is active. Cancel it before continuing this workflow.");
+        app.reply("A command task is active. Cancel it before continuing this workflow.");
         return;
     }
     if let Some(workflow) = app.pending_workflow.take() {
-        // Need to handle special case for SaveWorkPlan
         if matches!(
-            &workflow.kind,
-            crate::workflow::WorkflowKind::SaveWorkPlan
-        ) {
-            let confirmed = matches!(prompt.trim().to_lowercase().as_str(), "" | "y" | "yes");
-            if confirmed {
-                // Run git add -A first
-                match crate::commands::run_command_with_timeout(
-                    &workflow.repo_root,
-                    "git",
-                    &["add", "-A"],
-                    Duration::from_secs(app.config.cmd_timeout_secs),
-                ) {
-                    Ok(out) => {
-                        if !out.trim().is_empty() {
-                            app.reply(format!("git add -A output:\n{out}"));
-                        }
-                    }
-                    Err(err) => {
-                        app.reply(format!("git add -A failed: {}", crate::commands::format_error(&err)));
-                        return;
-                    }
-                }
-
-                // Generate the commit message without freezing the event loop.
-                let idx = app.pending_placeholder();
-                let tx = app.assistant_tx.clone();
-                let config = app.config.clone();
-                let repo_root = workflow.repo_root.clone();
-                app.pending_workflow = Some(WorkflowState {
-                    kind: crate::workflow::WorkflowKind::SaveWorkMessagePending,
-                    repo_root: repo_root.clone(),
-                });
-                tokio::spawn(async move {
-                    let suggested = generate_commit_message_async(&config, &repo_root)
-                        .await
-                        .unwrap_or_else(|| "chore: save work".to_string());
-                    let _ = tx.send(AssistantEvent::CommitPlanReady {
-                        idx,
-                        suggested,
-                        repo_root,
-                        save_work: true,
-                    });
-                });
-            } else {
-                app.reply("Workflow cancelled.");
-            }
-        } else if matches!(
             workflow.kind,
             crate::workflow::WorkflowKind::SaveWorkMessagePending
                 | crate::workflow::WorkflowKind::CommitMessagePending
@@ -1660,7 +1837,7 @@ mod tests {
             app.input_mode = mode;
             app.input = input.to_string();
             submit_input(&mut app);
-            assert!(app.messages.last().unwrap().content.contains("Tests are still running"));
+            assert!(app.messages.last().unwrap().content.contains("A task is still running"));
             assert!(app.pending_workflow.is_none());
             assert_eq!(app.active_task.as_ref().unwrap().id, task_id);
         }
@@ -1674,7 +1851,7 @@ mod tests {
             cwd: app.session.cwd.clone(),
         }).unwrap();
         app.poll_assistant();
-        assert!(app.messages.last().unwrap().content.contains("Tests are still running"));
+        assert!(app.messages.last().unwrap().content.contains("A task is still running"));
         assert!(app.pending_workflow.is_none());
         assert_eq!(app.active_task.as_ref().unwrap().id, task_id);
         assert!(!app.pending_idxs.contains(&idx));
@@ -1709,6 +1886,350 @@ mod tests {
         assert!(app.should_quit);
     }
 
+    #[cfg(unix)]
+    async fn wait_for_worker_result(app: &mut App) -> TaskSnapshot {
+        // Observe the worker without polling the App: continuations must wait
+        // for the UI to consume the final result, even when the child has exited.
+        let updates = &mut app.active_task.as_mut().unwrap().handle.updates;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = updates.borrow_and_update().clone();
+                if snapshot.outcome.is_some() {
+                    return snapshot;
+                }
+                updates.changed().await.expect("worker must publish a final result");
+            }
+        }).await.expect("command should finish promptly")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn builds_stream_output_and_preserve_input_until_completion() {
+        let (directory, mut app) = isolated_app();
+        app.start_command_task("Build", app.session.cwd.clone(), "sh", &["-c",
+            "printf 'building-marker\\n'; while [ ! -e release-build ]; do sleep 0.02; done; printf 'built-marker\\n'"]);
+        let idx = app.active_task.as_ref().unwrap().message_idx;
+        wait_for_task_state(&mut app, |app| app.messages[idx].content.contains("stdout:\nbuilding-marker")).await;
+        assert!(app.active_task.is_some());
+        handle_key_event(&mut app, crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.input, "q");
+        fs::write(directory.path().join("release-build"), "release").unwrap();
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert!(app.messages[idx].content.contains("COMPLETED (exit 0)"));
+        assert!(app.messages[idx].content.contains("built-marker"));
+        assert!(app.messages[idx].content.contains("Type `build`"));
+        assert!(!app.messages[idx].content.contains("PASSED"));
+        assert_eq!(app.session.recent_outputs.front().unwrap().kind, "build");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorded_task_evidence_preserves_each_pipe_tail_in_the_chat_prompt() {
+        let (_directory, mut app) = isolated_app();
+        for run in 0..5 {
+            let script = format!("printf '%070000d' 0; printf '\\nSTDOUT-FINAL-{run}: compiler stopped'; printf '%05000d' 0 >&2; printf '\\nSTDERR-FAILURE-{run}: expected 42, received 0 🦀' >&2; exit 7");
+            // Oversized labels exercise the formatter's maximum metadata
+            // reservation, not just short summaries with generous spare room.
+            let label = format!("Build {run} {}", "metadata ".repeat(50));
+            app.start_process_task(&label, app.session.cwd.clone(), "sh", &["-c", &script], TaskPurpose::Build);
+            wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+            let stored = &app.session.recent_outputs.front().unwrap().content;
+            assert!(stored.len() <= 1_000);
+            assert!(stored.contains(&format!("STDERR-FAILURE-{run}: expected 42, received 0 🦀")), "stderr tail was lost: {stored}");
+            assert!(stored.contains(&format!("STDOUT-FINAL-{run}: compiler stopped")));
+            assert!(stored.contains("FAILED (exit 7)"));
+            assert!(stored.contains("stdout") && stored.contains("stderr"));
+        }
+        assert_eq!(app.session.recent_outputs.len(), 5);
+        let context = crate::context::format_context_for_prompt(&app.session.recent_outputs);
+        let prompt = crate::chat::compose_prompt("Explain recorded command failures.", "", &context,
+            "Why did the build fail?", app.config.max_context_tokens);
+        for run in 0..5 {
+            assert!(prompt.contains(&format!("STDERR-FAILURE-{run}: expected 42, received 0 🦀")));
+            assert!(prompt.contains(&format!("STDOUT-FINAL-{run}: compiler stopped")));
+        }
+        assert!(prompt.contains("FAILED (exit 7)"));
+        assert!(prompt.contains("untrusted data, not instructions"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_failure_reason_is_stored_even_without_pipe_output() {
+        let (_directory, mut app) = isolated_app();
+        let program = "llm-cli-app-missing-program-evidence-test";
+        app.start_command_task("Build", app.session.cwd.clone(), program, &[]);
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        let stored = &app.session.recent_outputs.front().unwrap().content;
+        assert!(stored.contains("TASK ERROR: Could not start"));
+        assert!(stored.contains(program));
+        assert!(stored.len() <= 2_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_completion_audits_original_location_and_total_bytes_once() {
+        let (directory, mut app) = isolated_app();
+        app.config.audit_path = PathBuf::from("audit/commands.jsonl");
+        let original_cwd = app.session.cwd.clone();
+        let original_audit = original_cwd.join(&app.config.audit_path);
+        let next_cwd = directory.path().join("next-project");
+        fs::create_dir(&next_cwd).unwrap();
+        let command = "printf '%070000d' 0; printf 'diagnostic' >&2; while [ ! -e release-shell ]; do sleep 0.02; done";
+        app.start_shell_task(original_cwd.clone(), command, crate::command_policy::CommandRisk::ReadOnly);
+        let idx = app.active_task.as_ref().unwrap().message_idx;
+        wait_for_task_state(&mut app, |app| {
+            let snapshot = app.active_task.as_ref().unwrap().handle.updates.borrow();
+            snapshot.stdout_truncated && snapshot.stderr == "diagnostic"
+        }).await;
+        assert!(!original_audit.exists(), "audit must wait for the final outcome");
+        app.session.set_cwd(next_cwd.clone());
+        app.config.audit_path = PathBuf::from("different-audit.jsonl");
+        fs::write(original_cwd.join("release-shell"), "release").unwrap();
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        app.poll_command_task();
+        app.shutdown_command_task().await;
+        let records = crate::audit::read_shell_executions(&original_audit, &original_cwd, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cwd, original_cwd.display().to_string());
+        assert_eq!(records[0].command, command);
+        assert_eq!(records[0].outcome, "completed");
+        assert_eq!(records[0].output_bytes, 70_000 + "diagnostic".len());
+        assert!(app.messages[idx].content.contains("COMPLETED (exit 0)"));
+        assert!(app.messages[idx].content.contains("Earlier output truncated"));
+        assert!(app.session.recent_outputs.is_empty());
+        assert!(!next_cwd.join("different-audit.jsonl").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_shutdown_audits_cancelled_output_exactly_once() {
+        let (_directory, mut app) = isolated_app();
+        app.config.audit_path = PathBuf::from("audit/shutdown.jsonl");
+        let cwd = app.session.cwd.clone();
+        app.start_shell_task(cwd.clone(), "printf 'started'; printf 'warning' >&2; exec sleep 30",
+            crate::command_policy::CommandRisk::ReadOnly);
+        let idx = app.active_task.as_ref().unwrap().message_idx;
+        wait_for_task_state(&mut app, |app| {
+            let snapshot = app.active_task.as_ref().unwrap().handle.updates.borrow();
+            snapshot.stdout == "started" && snapshot.stderr == "warning"
+        }).await;
+        app.shutdown_command_task().await;
+        app.shutdown_command_task().await;
+        app.poll_command_task();
+        let records = crate::audit::read_shell_executions(&app.config.audit_path, &cwd, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cwd, cwd.display().to_string());
+        assert_eq!(records[0].outcome, "cancelled");
+        assert_eq!(records[0].output_bytes, "startedwarning".len());
+        assert!(!app.pending_idxs.contains(&idx));
+        assert!(app.active_task.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_preserves_already_completed_shell_audit_outcome() {
+        let (_directory, mut app) = isolated_app();
+        app.config.audit_path = PathBuf::from("audit/completed-on-exit.jsonl");
+        app.start_shell_task(app.session.cwd.clone(), "printf done", crate::command_policy::CommandRisk::ReadOnly);
+        assert_eq!(wait_for_worker_result(&mut app).await.outcome, Some(TaskOutcome::Succeeded));
+        app.shutdown_command_task().await;
+        let records = crate::audit::read_shell_executions(&app.config.audit_path, &app.session.cwd, 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, "completed");
+        assert_eq!(records[0].output_bytes, 4);
+    }
+
+    #[cfg(unix)]
+    fn git_fixture_command(cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args).current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn successful_git(cwd: &std::path::Path, args: &[&str]) -> String {
+        let output = git_fixture_command(cwd, args);
+        assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(unix)]
+    fn initialize_git_fixture(cwd: &std::path::Path) {
+        successful_git(cwd, &["init", "--template=", "--initial-branch=main"]);
+        for (key, value) in [
+            ("user.name", "CLI test"), ("user.email", "cli-test@example.invalid"),
+            ("commit.gpgsign", "false"), ("core.hooksPath", "/dev/null"),
+            ("core.fsmonitor", "false"), ("push.default", "current"),
+        ] {
+            successful_git(cwd, &["config", "--local", key, value]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_save_commit_needs_a_separate_explicit_push() {
+        let (directory, mut app) = isolated_app();
+        let cwd = app.session.cwd.clone();
+        initialize_git_fixture(&cwd);
+        let remote = directory.path().join("remote.git");
+        fs::create_dir(&remote).unwrap();
+        successful_git(&remote, &["init", "--bare", "--template=", "--initial-branch=main"]);
+        successful_git(&cwd, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        fs::write(cwd.join("file.txt"), "a change\n").unwrap();
+        successful_git(&cwd, &["add", "--", "file.txt"]);
+        let idx = app.pending_placeholder();
+        app.pending_commit_idx = Some(idx);
+        app.pending_workflow = Some(WorkflowState { kind: WorkflowKind::SaveWorkMessagePending, repo_root: cwd.clone() });
+        app.finish_commit_plan(idx, "test: local change".into(), cwd.clone(), true);
+        handle_pending_workflow(&mut app, "yes");
+        assert_eq!(app.active_task.as_ref().unwrap().label, "Git commit");
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind), Some(WorkflowKind::PushConfirm)));
+        let local_head = successful_git(&cwd, &["rev-parse", "HEAD"]);
+        assert!(!git_fixture_command(&remote, &["rev-parse", "--verify", "refs/heads/main"]).status.success());
+        handle_pending_workflow(&mut app, "");
+        assert!(app.active_task.is_none(), "Enter must not approve publication");
+        assert!(app.pending_workflow.is_none());
+        assert!(!git_fixture_command(&remote, &["rev-parse", "--verify", "refs/heads/main"]).status.success());
+        app.pending_workflow = Some(WorkflowState { kind: WorkflowKind::PushConfirm, repo_root: cwd });
+        handle_pending_workflow(&mut app, "yes");
+        assert_eq!(app.active_task.as_ref().unwrap().label, "Git push");
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert_eq!(successful_git(&remote, &["rev-parse", "refs/heads/main"]), local_head);
+        assert!(app.pending_workflow.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_git_results_do_not_continue_after_cancel_exit_or_cwd_change() {
+        for boundary in ["cancel", "quit", "cwd", "workflow"] {
+            let (directory, mut app) = isolated_app();
+            app.start_process_task("Git fixture", app.session.cwd.clone(), "sh", &["-c", "printf complete"],
+                TaskPurpose::Git(GitContinuation::OfferPush));
+            assert_eq!(wait_for_worker_result(&mut app).await.outcome, Some(TaskOutcome::Succeeded));
+            match boundary {
+                "cancel" => { assert!(app.cancel_command_task()); }
+                "quit" => app.should_quit = true,
+                "cwd" => {
+                    let next = directory.path().join("next-project");
+                    fs::create_dir(&next).unwrap();
+                    app.session.set_cwd(next);
+                }
+                "workflow" => app.pending_workflow = Some(WorkflowState {
+                    kind: WorkflowKind::StagePlan { args: vec!["add".into(), "one-file".into()] },
+                    repo_root: app.session.cwd.clone(),
+                }),
+                _ => unreachable!(),
+            }
+            app.poll_command_task();
+            assert!(app.active_task.is_none());
+            assert!(!matches!(app.pending_workflow.as_ref().map(|w| &w.kind), Some(WorkflowKind::PushConfirm)), "boundary: {boundary}");
+            if boundary == "workflow" {
+                assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind), Some(WorkflowKind::StagePlan { .. })));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn empty_staged_preview_never_generates_a_message_or_commit() {
+        let (_directory, mut app) = isolated_app();
+        let cwd = app.session.cwd.clone();
+        initialize_git_fixture(&cwd);
+        app.start_git_task(cwd.clone(), "Staged changes", vec!["diff".into(), "--cached".into(), "--stat".into()],
+            GitContinuation::CommitPreview { save_work: true });
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert!(app.messages.last().unwrap().content.contains("Nothing is staged"));
+        assert!(app.pending_workflow.is_none());
+        assert!(app.pending_commit_idx.is_none());
+        assert!(!git_fixture_command(&cwd, &["rev-parse", "--verify", "HEAD"]).status.success());
+    }
+
+    #[test]
+    fn stale_commit_suggestion_cannot_replace_a_newer_request() {
+        let (_directory, mut app) = isolated_app();
+        let old_idx = app.pending_placeholder();
+        let current_idx = app.pending_placeholder();
+        app.pending_commit_idx = Some(current_idx);
+        app.pending_workflow = Some(WorkflowState { kind: WorkflowKind::CommitMessagePending, repo_root: app.session.cwd.clone() });
+        app.finish_commit_plan(old_idx, "stale message".into(), app.session.cwd.clone(), false);
+        assert_eq!(app.pending_commit_idx, Some(current_idx));
+        assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind), Some(WorkflowKind::CommitMessagePending)));
+        assert!(app.messages[old_idx].content.contains("superseded"));
+        assert!(app.pending_idxs.contains(&current_idx));
+        app.finish_commit_plan(current_idx, "current message".into(), app.session.cwd.clone(), false);
+        assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind),
+            Some(WorkflowKind::CommitOnlyConfirm { suggested }) if suggested == "current message"));
+        assert!(app.pending_commit_idx.is_none());
+    }
+
+    #[test]
+    fn task_context_excerpt_is_utf8_safe_and_reuses_quiet_pipe_budget() {
+        let text = "🦀é漢字".repeat(2_000);
+        for budget in 0..256 {
+            let excerpt = task_evidence_excerpt(&text, budget);
+            assert!(excerpt.len() <= budget);
+            assert!(std::str::from_utf8(excerpt.as_bytes()).is_ok());
+        }
+        let mut snapshot = TaskSnapshot {
+            id: TaskId(1),
+            stdout: format!("opening\n{}\nstdout-final 🦀", "🦀".repeat(1_000)),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            output_bytes: 4_026,
+            outcome: Some(TaskOutcome::Succeeded),
+        };
+        let context = task_context_output(&snapshot, "COMPLETED (exit 0)");
+        assert!(context.len() <= 1_000);
+        assert!(context.contains("opening"));
+        assert!(context.ends_with("stdout-final 🦀"));
+        assert!(context.len() > 900, "quiet pipe should donate its unused budget");
+        snapshot.stderr = format!("stderr-opening\n{}\nstderr-final 🦀", "漢".repeat(1_000));
+        let context = task_context_output(&snapshot, &format!("TASK ERROR: {}reason-at-end", text));
+        assert!(context.len() <= 1_000);
+        assert!(context.contains("reason-at-end"));
+        assert!(context.contains("stderr-final 🦀"));
+        assert!(context.contains("stdout-final 🦀"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expanded_shell_commands_always_require_explicit_review() {
+        let (_directory, mut app) = isolated_app();
+        for command in ["printf reviewed", "touch expanded-marker", "sh -c 'printf reviewed'"] {
+            let idx = app.pending_placeholder();
+            app.finish_shell_expansion(idx, Ok(command.into()), app.session.cwd.clone());
+            assert!(app.active_task.is_none());
+            assert!(app.messages[idx].content.contains("nothing has run"));
+            assert!(matches!(app.pending_workflow.as_ref().map(|w| &w.kind),
+                Some(WorkflowKind::ShellCommandConfirm { command: reviewed, .. }) if reviewed == command));
+            handle_pending_workflow(&mut app, "");
+            assert!(app.pending_workflow.is_none());
+            assert!(app.active_task.is_none());
+        }
+        assert!(!app.session.cwd.join("expanded-marker").exists());
+        let idx = app.pending_placeholder();
+        app.finish_shell_expansion(idx, Ok("printf reviewed".into()), app.session.cwd.clone());
+        handle_pending_workflow(&mut app, "yes");
+        let task_idx = app.active_task.as_ref().unwrap().message_idx;
+        wait_for_task_state(&mut app, |app| app.active_task.is_none()).await;
+        assert!(app.messages[task_idx].content.contains("stdout:\nreviewed"));
+        assert!(app.messages[task_idx].content.contains("COMPLETED (exit 0)"));
+    }
+
+    #[test]
+    fn expanded_shell_result_from_a_previous_directory_is_rejected() {
+        let (directory, mut app) = isolated_app();
+        let idx = app.pending_placeholder();
+        app.finish_shell_expansion(idx, Ok("touch should-not-run".into()), directory.path().join("old-project"));
+        assert!(app.active_task.is_none());
+        assert!(app.pending_workflow.is_none());
+        assert!(!app.pending_idxs.contains(&idx));
+        assert!(app.messages[idx].content.contains("superseded"));
+    }
+
     #[test]
     fn cancel_task_without_an_active_task_is_a_noop_in_both_modes() {
         for mode in [InputMode::Chat, InputMode::Shell] {
@@ -1719,7 +2240,7 @@ mod tests {
             assert!(app.active_task.is_none());
             assert!(!app.should_quit);
             assert!(app.pending_workflow.is_none());
-            assert!(app.messages.last().unwrap().content.contains("no active test task"));
+            assert!(app.messages.last().unwrap().content.contains("no active command task"));
         }
     }
 }

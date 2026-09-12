@@ -2,14 +2,12 @@ use std::{path::PathBuf, time::Duration};
 
 use crate::{
     command_policy::CommandAssessment,
-    commands::{
-        format_error, run_command_with_timeout, run_command_with_timeout_with_env,
-        split_commit_message,
-    },
+    commands::split_commit_message,
     config::Config,
     file_ops,
     learned::LearnedAliases,
     patch::{self, AppliedPatch, PatchReview},
+    task_runner::{self, TaskId, TaskOutcome, TaskSpec},
 };
 
 use tokio::process::Command as TokioCommand;
@@ -24,12 +22,22 @@ pub struct WorkflowState {
 pub enum WorkflowKind {
     SaveWorkPlan,
     SaveWorkMessagePending,
-    SaveWorkCommit { suggested: String },
+    SaveWorkCommit {
+        suggested: String,
+    },
     CommitMessagePending,
-    CommitOnlyConfirm { suggested: String },
-    EditPatchPending { file: String },
-    StagePlan { args: Vec<String> },
-    DiffPreview { file: Option<String> },
+    CommitOnlyConfirm {
+        suggested: String,
+    },
+    /// A successful save-work commit is local until this separate review is
+    /// explicitly accepted. Cancellation never implicitly publishes it.
+    PushConfirm,
+    EditPatchPending {
+        file: String,
+    },
+    StagePlan {
+        args: Vec<String>,
+    },
     WriteFileConfirm {
         path: String,
         content: String,
@@ -51,7 +59,21 @@ pub enum WorkflowKind {
         command: String,
         assessment: CommandAssessment,
     },
-    ApplyDiff { review: PatchReview },
+    ApplyDiff {
+        review: PatchReview,
+    },
+}
+
+/// The UI owns task completion and must only advance a continuation after a
+/// successful, uncancelled task in the request's original working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitContinuation {
+    None,
+    SaveWorkStaged,
+    OfferPush,
+    SavePreview,
+    StatusSummary,
+    CommitPreview { save_work: bool },
 }
 
 pub trait WorkflowResponder {
@@ -62,6 +84,13 @@ pub trait WorkflowResponder {
     /// Execute the exact command a user just approved after an elevated-risk
     /// prompt. This avoids asking the same confirmation twice.
     fn execute_approved_shell_command(&mut self, cmd: &str);
+    fn start_git_task(
+        &mut self,
+        repo_root: PathBuf,
+        label: &str,
+        args: Vec<String>,
+        continuation: GitContinuation,
+    );
     fn command_timeout_secs(&self) -> u64;
     fn set_last_applied_patch(&mut self, patch: AppliedPatch);
 }
@@ -82,7 +111,9 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
             responder.reply("Commit-message generation is still in progress. Please wait.");
         }
         WorkflowKind::EditPatchPending { file } => {
-            responder.reply(format!("Generating a patch for {file} is still in progress. Please wait."));
+            responder.reply(format!(
+                "Generating a patch for {file} is still in progress. Please wait."
+            ));
         }
         WorkflowKind::SaveWorkCommit { suggested } => {
             handle_save_work_commit(responder, &workflow.repo_root, prompt, suggested);
@@ -90,32 +121,62 @@ pub fn handle_workflow_response<R: WorkflowResponder>(
         WorkflowKind::StagePlan { args } => {
             handle_stage_plan(responder, &workflow.repo_root, prompt, args);
         }
-        WorkflowKind::DiffPreview { file } => {
-            handle_diff_preview(responder, &workflow.repo_root, prompt, file);
-        }
         WorkflowKind::CommitOnlyConfirm { suggested } => {
             handle_commit_only_confirm(responder, &workflow.repo_root, prompt, suggested);
+        }
+        WorkflowKind::PushConfirm => {
+            if matches!(prompt.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
+                responder.start_git_task(
+                    workflow.repo_root,
+                    "Git push",
+                    vec!["push".into()],
+                    GitContinuation::None,
+                );
+            } else {
+                responder
+                    .reply("Push cancelled. Your commit remains local; nothing was published.");
+            }
         }
         WorkflowKind::WriteFileConfirm {
             path,
             content,
             overwrite,
         } => {
-            handle_write_file_confirm(responder, &workflow.repo_root, prompt, path, content, overwrite);
+            handle_write_file_confirm(
+                responder,
+                &workflow.repo_root,
+                prompt,
+                path,
+                content,
+                overwrite,
+            );
         }
         WorkflowKind::CustomWorkflowConfirm {
             original_input,
             generated_cmd,
             save_path,
         } => {
-            handle_custom_workflow_confirm(responder, prompt, original_input, generated_cmd, save_path);
+            handle_custom_workflow_confirm(
+                responder,
+                prompt,
+                original_input,
+                generated_cmd,
+                save_path,
+            );
         }
         WorkflowKind::ChatCommandsConfirm {
             original_query,
             commands,
             combined_command,
         } => {
-            handle_chat_commands_confirm(responder, &workflow.repo_root, prompt, original_query, commands, combined_command);
+            handle_chat_commands_confirm(
+                responder,
+                &workflow.repo_root,
+                prompt,
+                original_query,
+                commands,
+                combined_command,
+            );
         }
         WorkflowKind::ShellCommandConfirm {
             command,
@@ -136,10 +197,7 @@ fn handle_shell_command_confirm<R: WorkflowResponder>(
     assessment: CommandAssessment,
 ) {
     if matches!(prompt.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-        responder.reply(format!(
-            "Executing approved {} command.",
-            assessment.risk
-        ));
+        responder.reply(format!("Executing approved {} command.", assessment.risk));
         responder.execute_approved_shell_command(&command);
     } else {
         responder.reply("High-impact command cancelled.");
@@ -157,25 +215,12 @@ fn handle_save_work_plan<R: WorkflowResponder>(
         return;
     }
 
-    match run_command_with_timeout(
-        repo_root,
-        "git",
-        &["add", "-A"],
-        Duration::from_secs(responder.command_timeout_secs()),
-    ) {
-        Ok(out) => {
-            if !out.trim().is_empty() {
-                responder.reply(format!("git add -A output:\n{out}"));
-            }
-        }
-        Err(err) => {
-            responder.reply(format!("git add -A failed: {}", format_error(&err)));
-            return;
-        }
-    }
-
-    // Note: The suggested message generation and next workflow step
-    // need to be handled by the caller
+    responder.start_git_task(
+        repo_root.to_path_buf(),
+        "Git stage all",
+        vec!["add".into(), "-A".into()],
+        GitContinuation::SaveWorkStaged,
+    );
 }
 
 fn handle_save_work_commit<R: WorkflowResponder>(
@@ -194,7 +239,13 @@ fn handle_save_work_commit<R: WorkflowResponder>(
     } else {
         prompt.trim().to_string()
     };
-    run_save_work_impl(responder, repo_root, &commit_msg);
+    responder.reply(format!("Using commit message:\n{commit_msg}\nA successful commit will be followed by a separate push confirmation."));
+    responder.start_git_task(
+        repo_root.to_path_buf(),
+        "Git commit",
+        commit_arguments(&commit_msg),
+        GitContinuation::OfferPush,
+    );
 }
 
 fn handle_stage_plan<R: WorkflowResponder>(
@@ -204,64 +255,15 @@ fn handle_stage_plan<R: WorkflowResponder>(
     args: Vec<String>,
 ) {
     if matches!(prompt.trim().to_lowercase().as_str(), "" | "yes" | "y") {
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        match run_command_with_timeout(
-            repo_root,
-            "git",
-            &arg_refs,
-            Duration::from_secs(responder.command_timeout_secs()),
-        ) {
-            Ok(out) => {
-                let detail = if out.trim().is_empty() {
-                    "ok".to_string()
-                } else {
-                    out
-                };
-                responder.reply(format!("git {} ok\n{}", args.join(" "), detail));
-            }
-            Err(err) => responder.reply(format!(
-                "git {} failed: {}",
-                args.join(" "),
-                format_error(&err)
-            )),
-        }
+        responder.start_git_task(
+            repo_root.to_path_buf(),
+            "Git stage",
+            args,
+            GitContinuation::None,
+        );
     } else {
         responder.reply("Staging cancelled.");
     }
-}
-
-fn handle_diff_preview<R: WorkflowResponder>(
-    responder: &mut R,
-    repo_root: &std::path::Path,
-    prompt: &str,
-    file: Option<String>,
-) {
-    let input = prompt.trim();
-    if matches!(input.to_lowercase().as_str(), "cancel" | "no" | "n") {
-        responder.reply("Cancelled.");
-        return;
-    }
-    if input.is_empty() || input.eq_ignore_ascii_case("yes") || input.eq_ignore_ascii_case("y") {
-        responder.reply("Ok.");
-        return;
-    }
-    let target = if input.is_empty() {
-        file.unwrap_or_default()
-    } else {
-        input.to_string()
-    };
-    if target.is_empty() {
-        responder.reply("No file specified.");
-        return;
-    }
-    let diff = run_command_with_timeout(
-        repo_root,
-        "git",
-        &["diff", "--", &target],
-        Duration::from_secs(responder.command_timeout_secs()),
-    )
-        .unwrap_or_else(|e| format!("(git diff failed: {})", format_error(&e)));
-    responder.reply(format!("Diff for {}:\n{}", target, diff));
 }
 
 fn handle_commit_only_confirm<R: WorkflowResponder>(
@@ -280,27 +282,15 @@ fn handle_commit_only_confirm<R: WorkflowResponder>(
     } else {
         prompt.trim().to_string()
     };
-    let mut logs = vec![format!("Using commit message:\n{}", commit_msg)];
-    let (subject, body_lines) = split_commit_message(&commit_msg);
-    let mut commit_args: Vec<String> = vec!["commit".into(), "-m".into(), subject];
-    for line in body_lines {
-        commit_args.push("-m".into());
-        commit_args.push(line);
-    }
-    let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
-    if !run_workflow_step(
-        &mut logs,
-        repo_root,
-        "git commit",
-        "git",
-        &commit_arg_refs,
-        Duration::from_secs(responder.command_timeout_secs()),
-    ) {
-        responder.reply(logs.join("\n"));
-        return;
-    }
-    logs.push("Commit completed (no push).".to_string());
-    responder.reply(logs.join("\n"));
+    responder.reply(format!(
+        "Using commit message:\n{commit_msg}\nThis creates a local commit only; it will not push."
+    ));
+    responder.start_git_task(
+        repo_root.to_path_buf(),
+        "Git commit (local only)",
+        commit_arguments(&commit_msg),
+        GitContinuation::None,
+    );
 }
 
 fn handle_write_file_confirm<R: WorkflowResponder>(
@@ -366,111 +356,14 @@ fn handle_apply_diff<R: WorkflowResponder>(
     responder.reply("Patch review is still open. Press Enter (or type 'yes') to apply, or 'no' to cancel.");
 }
 
-fn run_save_work_impl<R: WorkflowResponder>(
-    responder: &mut R,
-    repo_root: &std::path::Path,
-    commit_msg: &str,
-) {
-    let mut logs = vec!["Running save-work workflow…".to_string()];
-
-    logs.push(format!("Using commit message: {}", commit_msg));
-
+fn commit_arguments(commit_msg: &str) -> Vec<String> {
     let (subject, body_lines) = split_commit_message(commit_msg);
     let mut commit_args: Vec<String> = vec!["commit".into(), "-m".into(), subject];
     for line in body_lines {
         commit_args.push("-m".into());
         commit_args.push(line);
     }
-    let commit_arg_refs: Vec<&str> = commit_args.iter().map(|s| s.as_str()).collect();
-
-    if !run_workflow_step(
-        &mut logs,
-        repo_root,
-        "git commit",
-        "git",
-        &commit_arg_refs,
-        Duration::from_secs(responder.command_timeout_secs()),
-    ) {
-        responder.reply(logs.join("\n"));
-        return;
-    }
-
-    if !run_workflow_step(
-        &mut logs,
-        repo_root,
-        "git push",
-        "git",
-        &["push"],
-        Duration::from_secs(responder.command_timeout_secs()),
-    ) {
-        responder.reply(logs.join("\n"));
-        return;
-    }
-
-    logs.push("Workflow completed successfully.".to_string());
-    responder.reply(logs.join("\n"));
-}
-
-fn run_workflow_step(
-    logs: &mut Vec<String>,
-    repo_root: &std::path::Path,
-    label: &str,
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> bool {
-    match run_command_with_timeout(repo_root, program, args, timeout) {
-        Ok(out) => {
-            logs.push(format!("{label} OK\n{out}"));
-            true
-        }
-        Err(err) => {
-            logs.push(format!("{label} failed: {err}"));
-            false
-        }
-    }
-}
-
-pub fn generate_commit_message(config: &Config, repo_root: &std::path::Path) -> Option<String> {
-    if !config.generate_commit_message {
-        return None;
-    }
-    let command_timeout = Duration::from_secs(config.cmd_timeout_secs);
-    let stat = run_command_with_timeout(
-        repo_root,
-        "git",
-        &["diff", "--cached", "--stat"],
-        command_timeout,
-    )
-    .ok()?;
-    if stat.trim().is_empty() {
-        return None;
-    }
-    let patch = run_command_with_timeout(
-        repo_root,
-        "git",
-        &["diff", "--cached", "--unified=3", "--max-count=1"],
-        command_timeout,
-    )
-    .unwrap_or_default();
-    let patch_snippet = truncate_for_display(&patch, 4000);
-    let prompt = format!(
-        "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
-    );
-    let output = run_command_with_timeout_with_env(
-        repo_root,
-        "ollama",
-        &["run", &config.model, &prompt],
-        &[("OLLAMA_HOST", config.ollama_host.as_str())],
-        Duration::from_secs(config.llm_timeout_secs),
-    )
-    .ok()?;
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    commit_args
 }
 
 pub async fn generate_commit_message_async(
@@ -481,23 +374,33 @@ pub async fn generate_commit_message_async(
         return None;
     }
     let command_timeout = Duration::from_secs(config.cmd_timeout_secs);
-    let stat = run_command_with_timeout(
+    let stat = capture_git_output(
         repo_root,
-        "git",
-        &["diff", "--cached", "--stat"],
+        &[
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--stat",
+        ],
         command_timeout,
     )
-    .ok()?;
+    .await?;
     if stat.trim().is_empty() {
         return None;
     }
-    let patch = run_command_with_timeout(
+    let patch = capture_git_output(
         repo_root,
-        "git",
-        &["diff", "--cached", "--unified=3", "--max-count=1"],
+        &[
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+        ],
         command_timeout,
     )
-    .unwrap_or_default();
+    .await?;
     let patch_snippet = truncate_for_display(&patch, 4000);
     let prompt = format!(
         "Generate a git commit message with:\n- Subject line in imperative mood, <=72 chars, include scope if obvious.\n- Then 1-2 bullet lines summarizing key changes (no line counts or LOC numbers; describe what changed).\nFormat exactly:\nSubject line\n- bullet\n- bullet\nAvoid filler. Staged changes (stat):\n{stat}\n\nPatch snippet:\n{patch_snippet}\n\nReturn only the formatted commit message."
@@ -509,23 +412,58 @@ pub async fn generate_commit_message_async(
         .arg(prompt)
         .env("OLLAMA_HOST", &config.ollama_host)
         .kill_on_drop(true);
-    let result = tokio::time::timeout(
+    let mut response_bytes = 0usize;
+    let stdout = crate::model_stream::run(
+        command,
         Duration::from_secs(config.llm_timeout_secs),
-        command.output(),
+        |chunk| {
+            response_bytes = response_bytes.saturating_add(chunk.len());
+            anyhow::ensure!(
+                response_bytes <= 8192,
+                "generated commit message exceeded 8192 bytes"
+            );
+            Ok(())
+        },
     )
     .await
-    .ok()?
     .ok()?;
-
-    if !result.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// Read-only background preparation uses the same bounded subprocess runner
+/// as visible tasks. Do not treat a truncated tail as a complete staged diff.
+async fn capture_git_output(
+    repo_root: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let mut handle = task_runner::spawn(TaskSpec {
+        id: TaskId(0),
+        cwd: repo_root.to_path_buf(),
+        program: "git".into(),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        environment: vec![
+            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+            ("GIT_PAGER".into(), "cat".into()),
+        ],
+        timeout,
+    });
+    loop {
+        let snapshot = handle.updates.borrow_and_update().clone();
+        if let Some(outcome) = snapshot.outcome {
+            return (outcome == TaskOutcome::Succeeded
+                && !snapshot.stdout_truncated
+                && !snapshot.stderr_truncated)
+                .then_some(snapshot.stdout);
+        }
+        if handle.updates.changed().await.is_err() {
+            return None;
+        }
     }
 }
 
@@ -776,22 +714,29 @@ fn is_shell_command(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::{Path, PathBuf}, time::Duration};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::Duration,
+    };
 
     use tempfile::TempDir;
 
     use super::{
-        handle_workflow_response, WorkflowKind, WorkflowResponder, WorkflowState,
+        GitContinuation, WorkflowKind, WorkflowResponder, WorkflowState, capture_git_output,
+        handle_workflow_response,
     };
     use crate::{
         commands::run_command_with_timeout,
         patch::{AppliedPatch, PatchReview},
+        task_runner::{self, TaskId, TaskOutcome, TaskSpec},
     };
 
     #[derive(Default)]
     struct TestResponder {
         replies: Vec<String>,
         executed_commands: Vec<String>,
+        git_tasks: Vec<(PathBuf, String, Vec<String>, GitContinuation)>,
         last_applied_patch: Option<AppliedPatch>,
     }
 
@@ -808,12 +753,55 @@ mod tests {
             self.executed_commands.push(cmd.to_string());
         }
 
+        fn start_git_task(
+            &mut self,
+            repo_root: PathBuf,
+            label: &str,
+            args: Vec<String>,
+            continuation: GitContinuation,
+        ) {
+            self.git_tasks
+                .push((repo_root, label.into(), args, continuation));
+        }
+
         fn command_timeout_secs(&self) -> u64 {
             10
         }
 
         fn set_last_applied_patch(&mut self, patch: AppliedPatch) {
             self.last_applied_patch = Some(patch);
+        }
+    }
+
+    impl TestResponder {
+        async fn run_only_git_task(&mut self) -> GitContinuation {
+            assert_eq!(
+                self.git_tasks.len(),
+                1,
+                "one explicit task, no implicit shell chain"
+            );
+            let (cwd, _, args, continuation) = self.git_tasks.pop().unwrap();
+            let mut handle = task_runner::spawn(TaskSpec {
+                id: TaskId(1),
+                cwd,
+                program: "git".into(),
+                args,
+                environment: vec![("GIT_TERMINAL_PROMPT".into(), "0".into())],
+                timeout: Duration::from_secs(10),
+            });
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    let snapshot = handle.updates.borrow_and_update().clone();
+                    if let Some(outcome) = snapshot.outcome {
+                        assert_eq!(outcome, TaskOutcome::Succeeded, "{}", snapshot.stderr);
+                        break;
+                    }
+                    handle.updates.changed().await.expect("task must complete");
+                }
+            })
+            .await
+            .expect("bounded task completion");
+            continuation
         }
     }
 
@@ -827,15 +815,18 @@ mod tests {
         let root = repo.path();
         git(root, &["init", "-q"]);
         git(root, &["config", "user.name", "Workflow Test"]);
-        git(root, &["config", "user.email", "workflow-test@example.invalid"]);
+        git(
+            root,
+            &["config", "user.email", "workflow-test@example.invalid"],
+        );
         fs::write(root.join("README.md"), "# Test repository\n").expect("seed repository");
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-qm", "Initialize repository"]);
         repo
     }
 
-    #[test]
-    fn stage_workflow_stages_only_requested_file_in_a_real_repository() {
+    #[tokio::test]
+    async fn stage_workflow_stages_only_requested_file_in_a_real_repository() {
         let repo = initialized_repository();
         let root = repo.path();
         fs::write(root.join("staged.txt"), "stage this\n").expect("write staged file");
@@ -846,20 +837,33 @@ mod tests {
             &mut responder,
             WorkflowState {
                 kind: WorkflowKind::StagePlan {
-                    args: vec!["add".to_string(), "staged.txt".to_string()],
+                    args: vec![
+                        "add".to_string(),
+                        "--".to_string(),
+                        "staged.txt".to_string(),
+                    ],
                 },
                 repo_root: root.to_path_buf(),
             },
             "yes",
         );
 
-        assert_eq!(git(root, &["diff", "--cached", "--name-only"]).trim(), "staged.txt");
+        assert!(
+            git(root, &["diff", "--cached", "--name-only"])
+                .trim()
+                .is_empty(),
+            "responding only schedules the subprocess"
+        );
+        assert_eq!(responder.run_only_git_task().await, GitContinuation::None);
+        assert_eq!(
+            git(root, &["diff", "--cached", "--name-only"]).trim(),
+            "staged.txt"
+        );
         assert!(git(root, &["status", "--short"]).contains("?? unstaged.txt"));
-        assert!(responder.replies.iter().any(|reply| reply.contains("git add staged.txt ok")));
     }
 
-    #[test]
-    fn commit_workflow_creates_a_local_commit_without_pushing() {
+    #[tokio::test]
+    async fn commit_workflow_creates_a_local_commit_without_pushing() {
         let repo = initialized_repository();
         let root = repo.path();
         fs::write(root.join("notes.txt"), "A useful note.\n").expect("write note");
@@ -877,12 +881,157 @@ mod tests {
             "yes",
         );
 
-        assert_eq!(git(root, &["log", "-1", "--format=%s"]).trim(), "Add project note");
-        assert!(git(root, &["diff", "--cached", "--name-only"]).trim().is_empty());
-        assert!(responder
-            .replies
-            .iter()
-            .any(|reply| reply.contains("Commit completed (no push).")));
+        assert_eq!(
+            git(root, &["log", "-1", "--format=%s"]).trim(),
+            "Initialize repository"
+        );
+        assert_eq!(responder.run_only_git_task().await, GitContinuation::None);
+        assert_eq!(
+            git(root, &["log", "-1", "--format=%s"]).trim(),
+            "Add project note"
+        );
+        assert!(
+            git(root, &["diff", "--cached", "--name-only"])
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            responder
+                .replies
+                .iter()
+                .any(|reply| reply.contains("will not push"))
+        );
+    }
+
+    #[test]
+    fn cancelling_git_workflows_never_starts_a_task() {
+        for kind in [
+            WorkflowKind::SaveWorkPlan,
+            WorkflowKind::StagePlan {
+                args: vec!["add".into(), "-A".into()],
+            },
+            WorkflowKind::SaveWorkCommit {
+                suggested: "Save notes".into(),
+            },
+            WorkflowKind::CommitOnlyConfirm {
+                suggested: "Save notes".into(),
+            },
+            WorkflowKind::PushConfirm,
+        ] {
+            let mut responder = TestResponder::default();
+            handle_workflow_response(
+                &mut responder,
+                WorkflowState {
+                    kind,
+                    repo_root: PathBuf::from("intended-repository"),
+                },
+                "no",
+            );
+            assert!(responder.git_tasks.is_empty());
+        }
+    }
+
+    #[test]
+    fn save_work_stages_before_review_and_only_offers_push_after_commit() {
+        let mut responder = TestResponder::default();
+        let root = PathBuf::from("intended-repository");
+        handle_workflow_response(
+            &mut responder,
+            WorkflowState {
+                kind: WorkflowKind::SaveWorkPlan,
+                repo_root: root.clone(),
+            },
+            "yes",
+        );
+        assert_eq!(responder.git_tasks[0].0, root);
+        assert_eq!(responder.git_tasks[0].2, vec!["add", "-A"]);
+        assert_eq!(responder.git_tasks[0].3, GitContinuation::SaveWorkStaged);
+
+        responder.git_tasks.clear();
+        handle_workflow_response(
+            &mut responder,
+            WorkflowState {
+                kind: WorkflowKind::SaveWorkCommit {
+                    suggested: "Keep $(text) and 'quotes'\n- Preserve `data`".into(),
+                },
+                repo_root: root,
+            },
+            "yes",
+        );
+        assert_eq!(responder.git_tasks.len(), 1);
+        assert_eq!(
+            responder.git_tasks[0].2,
+            vec![
+                "commit",
+                "-m",
+                "Keep $(text) and 'quotes'",
+                "-m",
+                "- Preserve `data`"
+            ]
+        );
+        assert_eq!(responder.git_tasks[0].3, GitContinuation::OfferPush);
+    }
+
+    #[test]
+    fn push_requires_explicit_yes_and_is_a_separate_task() {
+        let mut responder = TestResponder::default();
+        let workflow = WorkflowState {
+            kind: WorkflowKind::PushConfirm,
+            repo_root: PathBuf::from("intended-repository"),
+        };
+        handle_workflow_response(&mut responder, workflow.clone(), "");
+        assert!(
+            responder.git_tasks.is_empty(),
+            "Enter must not publish a commit"
+        );
+        handle_workflow_response(&mut responder, workflow, "yes");
+        assert_eq!(responder.git_tasks.len(), 1);
+        assert_eq!(responder.git_tasks[0].2, vec!["push"]);
+        assert_eq!(responder.git_tasks[0].3, GitContinuation::None);
+    }
+
+    #[tokio::test]
+    async fn background_git_reads_reject_failures_and_truncated_output() {
+        let repo = initialized_repository();
+        let root = repo.path();
+        let output =
+            capture_git_output(root, &["log", "-1", "--format=%s"], Duration::from_secs(10)).await;
+        assert_eq!(
+            output.as_deref().map(str::trim),
+            Some("Initialize repository")
+        );
+        assert!(
+            capture_git_output(root, &["not-a-real-git-command"], Duration::from_secs(10))
+                .await
+                .is_none()
+        );
+        fs::write(
+            root.join("large.txt"),
+            "x".repeat(task_runner::OUTPUT_LIMIT_BYTES * 2),
+        )
+        .expect("large fixture");
+        git(root, &["add", "large.txt"]);
+        assert!(
+            capture_git_output(root, &["diff", "--cached"], Duration::from_secs(10))
+                .await
+                .is_none(),
+            "a retained output tail is not a complete diff"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_git_reads_observe_the_task_deadline() {
+        let repo = initialized_repository();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            capture_git_output(
+                repo.path(),
+                &["-c", "alias.task-read-test=!exec sleep 10", "task-read-test"],
+                Duration::from_millis(50),
+            ),
+        ).await.expect("timed-out Git preparation must clean up promptly");
+        assert!(result.is_none());
     }
 
     #[test]
@@ -908,10 +1057,12 @@ mod tests {
             fs::read_to_string(root.join("generated.txt")).expect("workflow output"),
             "created by the workflow\n"
         );
-        assert!(responder
-            .replies
-            .iter()
-            .any(|reply| reply.contains("Successfully created file")));
+        assert!(
+            responder
+                .replies
+                .iter()
+                .any(|reply| reply.contains("Successfully created file"))
+        );
     }
 
     #[test]
@@ -939,7 +1090,10 @@ mod tests {
             "yes",
         );
 
-        assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after\n");
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "after\n"
+        );
         assert!(responder.last_applied_patch.is_some());
     }
 
@@ -956,7 +1110,12 @@ mod tests {
 
         handle_workflow_response(&mut responder, workflow.clone(), "no");
         assert!(responder.executed_commands.is_empty());
-        assert!(responder.replies.iter().any(|reply| reply.contains("cancelled")));
+        assert!(
+            responder
+                .replies
+                .iter()
+                .any(|reply| reply.contains("cancelled"))
+        );
 
         handle_workflow_response(&mut responder, workflow.clone(), "");
         assert!(responder.executed_commands.is_empty());

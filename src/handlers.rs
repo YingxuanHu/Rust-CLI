@@ -3,9 +3,8 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
 
 use crate::{
-    audit,
     command_policy::{self, CommandRisk},
-    commands::{format_error, run_command_with_timeout, run_shell_command_with_timeout},
+    commands::{format_error, run_command_with_timeout, is_potentially_interactive},
     config::Config,
     custom_command_generator::expand_command_handlers,
     file_ops,
@@ -15,7 +14,7 @@ use crate::{
     repo::{ProjectType, RepoInfo},
     session::Role,
     tools::ToolArgs,
-    workflow::{generate_commit_message_async, WorkflowKind, WorkflowState},
+    workflow::{generate_commit_message_async, GitContinuation, WorkflowKind, WorkflowState},
 };
 
 pub enum AssistantEvent {
@@ -27,6 +26,7 @@ pub enum AssistantEvent {
     IntentResolved { idx: usize, intent: ParsedIntent, original_input: String, cwd: PathBuf },
     CommitPlanReady { idx: usize, suggested: String, repo_root: PathBuf, save_work: bool },
     CommitMessageReady { idx: usize, message: String },
+    ShellExpanded { idx: usize, command: Result<String, String>, cwd: PathBuf },
 }
 
 pub trait IntentDispatcher {
@@ -48,9 +48,11 @@ pub trait IntentDispatcher {
     fn clear_last_applied_patch(&mut self);
     fn has_active_task(&self) -> bool;
     fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]);
+    fn start_shell_task(&mut self, cwd: PathBuf, command: &str, risk: CommandRisk);
+    fn start_git_task(&mut self, cwd: PathBuf, label: &str, args: Vec<String>, continuation: GitContinuation);
 }
 
-const TASK_BUSY: &str = "Tests are still running. Press Ctrl+C or type `cancel task` to stop them before starting another command. You can still ask questions, use help, or change directories.";
+const TASK_BUSY: &str = "A task is still running. Press Ctrl+C or type `cancel task` before starting another command. You can still ask questions in Chat mode, use help, or change directories.";
 
 fn run_tool_command<D: IntentDispatcher>(
     dispatcher: &D,
@@ -73,10 +75,9 @@ pub fn dispatch_intent<D: IntentDispatcher>(
     intent: &ParsedIntent,
     original_input: &str,
 ) -> bool {
-    // Shell, Git, build, and file workflows still use the synchronous runner.
-    // Do not block the UI or modify files underneath an active test suite.
+    // Keep one command task active and avoid conflicting file/workflow changes.
     if dispatcher.has_active_task()
-        && !matches!(intent.tool.as_str(), "chat" | "help" | "getting_started" | "explain_project" | "run_tests")
+        && !matches!(intent.tool.as_str(), "chat" | "help" | "getting_started" | "explain_project" | "project_tasks")
     {
         dispatcher.reply(TASK_BUSY);
         return true;
@@ -108,6 +109,15 @@ pub fn dispatch_intent<D: IntentDispatcher>(
         }
         "status" => {
             handle_status_intent(dispatcher);
+            true
+        }
+        "show_diff" => {
+            if let Some(path) = &intent.args.path {
+                let root = dispatcher.get_session_repo_root().unwrap_or_else(|| dispatcher.get_session_cwd());
+                dispatcher.start_git_task(root, "Git file diff", vec!["diff".into(), "--no-ext-diff".into(), "--no-textconv".into(), "--".into(), path.clone()], GitContinuation::None);
+            } else {
+                dispatcher.reply("Usage: diff <file path>");
+            }
             true
         }
         "find_todos" => {
@@ -150,6 +160,10 @@ pub fn dispatch_intent<D: IntentDispatcher>(
             handle_build_intent(dispatcher);
             true
         }
+        "project_tasks" => {
+            handle_project_tasks(dispatcher);
+            true
+        }
         "explain_project" => {
             handle_explain_project_intent(dispatcher);
             true
@@ -188,9 +202,12 @@ pub fn getting_started_message(repo_info: Option<&RepoInfo>, has_git_repo: bool)
         .unwrap_or_else(|| "You're not in a recognized project yet.".to_string());
 
     let mut suggestions = vec![project, String::new(), "Try one of these:".to_string()];
-    if repo_info.is_some() {
+    if let Some(info) = repo_info {
+        suggestions.push("• `tasks` — see this project's test/build commands".to_string());
         suggestions.push("• `explain this project` — get a quick overview".to_string());
-        suggestions.push("• `run tests` — check that it works".to_string());
+        if info.test_task().is_some() {
+            suggestions.push("• `run tests` — check that it works".to_string());
+        }
     } else {
         suggestions.push("• `cd /path/to/project` — switch to your codebase".to_string());
         suggestions.push("• Ask a question in plain English".to_string());
@@ -219,28 +236,24 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
         return;
     }
 
-    // Expand composable handlers (like {{GEN_COMMIT_MSG}}) if present
-    let expanded_cmd = if cmd.contains("{{") && cmd.contains("}}") {
+    // Model-backed expansion must not run synchronous subprocesses on the UI
+    // thread. Expanded commands receive a fresh review before any execution.
+    if cmd.contains("{{GEN_COMMIT_MSG}}") {
         let repo_root = dispatcher.get_session_repo_root()
             .unwrap_or_else(|| dispatcher.get_session_cwd());
-        match expand_command_handlers(cmd, dispatcher.get_config(), &repo_root) {
-            Ok(expanded) => {
-                // Show the expanded command to the user
-                if expanded != cmd {
-                    dispatcher.reply(format!("📝 Expanded command:\n  {}", expanded));
-                }
-                expanded
-            }
-            Err(e) => {
-                dispatcher.reply(format!("Failed to expand command handlers: {}", e));
-                return;
-            }
-        }
-    } else {
-        cmd.to_string()
-    };
+        let cwd = dispatcher.get_session_cwd();
+        let config = dispatcher.get_config().clone();
+        let command = cmd.to_string();
+        let tx = dispatcher.get_assistant_tx();
+        let idx = dispatcher.pending_placeholder();
+        tokio::spawn(async move {
+            let command = expand_command_handlers(&command, &config, &repo_root).await.map_err(|error| error.to_string());
+            let _ = tx.send(AssistantEvent::ShellExpanded { idx, command, cwd });
+        });
+        return;
+    }
 
-    let assessment = command_policy::assess_shell_command(&expanded_cmd);
+    let assessment = command_policy::assess_shell_command(cmd);
     if assessment.requires_confirmation() {
         let reasons = assessment
             .reasons
@@ -250,11 +263,11 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
             .join("\n");
         dispatcher.reply(format!(
             "Approval required before running this {} shell command.\n\n{}\n\n$ {}\n\nType 'yes' to run it, or anything else to cancel.",
-            assessment.risk, reasons, expanded_cmd
+            assessment.risk, reasons, cmd
         ));
         dispatcher.set_pending_workflow(WorkflowState {
             kind: WorkflowKind::ShellCommandConfirm {
-                command: expanded_cmd,
+                command: cmd.to_string(),
                 assessment,
             },
             repo_root: dispatcher
@@ -264,7 +277,7 @@ pub fn handle_shell_dispatch<D: IntentDispatcher>(dispatcher: &mut D, cmd: &str)
         return;
     }
 
-    execute_shell_command(dispatcher, &expanded_cmd, assessment.risk);
+    execute_shell_command(dispatcher, cmd, assessment.risk);
 }
 
 /// Run a command that has already passed an explicit high-impact confirmation.
@@ -284,50 +297,11 @@ fn execute_shell_command<D: IntentDispatcher>(
     command: &str,
     risk: CommandRisk,
 ) {
-    let cwd = dispatcher.get_session_cwd();
-    let timeout = Duration::from_secs(dispatcher.get_config().cmd_timeout_secs);
-    match run_shell_command_with_timeout(&cwd, command, timeout) {
-        Ok(output) => {
-            record_shell_audit(dispatcher, &cwd, command, risk, "completed", output.len());
-            // Record output for semantic reference resolution
-            let summary = if output.trim().is_empty() {
-                format!("Ran: {} (no output)", command)
-            } else {
-                format!("Ran: {} (success)", command)
-            };
-            dispatcher.record_output("command", &summary, &output);
-            
-            if output.trim().is_empty() {
-                dispatcher.reply("(command completed with no output)");
-            } else {
-                dispatcher.reply(output);
-            }
-        }
-        Err(err) => {
-            record_shell_audit(dispatcher, &cwd, command, risk, "failed", 0);
-            dispatcher.reply(format!("Error: {}", format_error(&err)));
-        }
+    if is_potentially_interactive(command) {
+        dispatcher.reply("This command appears to need interactive input. Supply noninteractive arguments, such as git commit -m \"message\", or run it in your terminal.");
+        return;
     }
-}
-
-fn record_shell_audit<D: IntentDispatcher>(
-    dispatcher: &D,
-    cwd: &std::path::Path,
-    command: &str,
-    risk: CommandRisk,
-    outcome: &'static str,
-    output_bytes: usize,
-) {
-    if let Err(error) = audit::append_shell_execution(
-        &dispatcher.get_config().audit_path,
-        cwd,
-        command,
-        risk,
-        outcome,
-        output_bytes,
-    ) {
-        tracing::warn!(%error, "could not append shell audit record");
-    }
+    dispatcher.start_shell_task(dispatcher.get_session_cwd(), command, risk);
 }
 
 fn handle_shell_repeat<D: IntentDispatcher>(dispatcher: &mut D) {
@@ -354,28 +328,7 @@ fn handle_shell_repeat<D: IntentDispatcher>(dispatcher: &mut D) {
 
 fn handle_save_work_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_root) = dispatcher.get_session_repo_root() {
-        let status_preview = match run_tool_command(dispatcher, &repo_root, "git", &["status", "--short"]) {
-            Ok(out) => out,
-            Err(err) => format!("(git status failed: {err})"),
-        };
-        let plan = [
-            "Planned git workflow:",
-            "• git status (preview)",
-            "• git add -A",
-            "• git commit -m \"<generated message>\"",
-            "• git push",
-            "",
-            "Status preview:",
-            &status_preview,
-            "",
-            "Press Enter (or type 'yes') to run, anything else to cancel.",
-        ]
-        .join("\n");
-        dispatcher.reply(plan);
-        dispatcher.set_pending_workflow(WorkflowState {
-            kind: WorkflowKind::SaveWorkPlan,
-            repo_root,
-        });
+        dispatcher.start_git_task(repo_root, "Save-work preview", vec!["status".into(), "--short".into()], GitContinuation::SavePreview);
     } else {
         dispatcher.reply("No git repository detected; cannot save work.");
     }
@@ -405,24 +358,7 @@ fn handle_stage_intent<D: IntentDispatcher>(dispatcher: &mut D, args: &ToolArgs)
 
 fn handle_commit_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_root) = dispatcher.get_session_repo_root() {
-        let idx = dispatcher.pending_placeholder();
-        let tx = dispatcher.get_assistant_tx();
-        let config = dispatcher.get_config().clone();
-        dispatcher.set_pending_workflow(WorkflowState {
-            kind: WorkflowKind::CommitMessagePending,
-            repo_root: repo_root.clone(),
-        });
-        tokio::spawn(async move {
-            let suggested = generate_commit_message_async(&config, &repo_root)
-                .await
-                .unwrap_or_else(|| "chore: update".to_string());
-            let _ = tx.send(AssistantEvent::CommitPlanReady {
-                idx,
-                suggested,
-                repo_root,
-                save_work: false,
-            });
-        });
+        dispatcher.start_git_task(repo_root, "Staged changes", vec!["diff".into(), "--cached".into(), "--no-ext-diff".into(), "--no-textconv".into(), "--stat".into()], GitContinuation::CommitPreview { save_work: false });
     } else {
         dispatcher.reply("No git repository detected; cannot commit.");
     }
@@ -432,29 +368,7 @@ fn handle_status_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     let root = dispatcher
         .get_session_repo_root()
         .unwrap_or_else(|| dispatcher.get_session_cwd());
-    let status = run_tool_command(dispatcher, &root, "git", &["status", "--short"])
-        .unwrap_or_else(|e| format!("(git status failed: {})", format_error(&e)));
-    let diffstat = run_tool_command(dispatcher, &root, "git", &["diff", "--stat"])
-        .unwrap_or_else(|e| format!("(git diff --stat failed: {})", format_error(&e)));
-    
-    // Record output for semantic reference resolution
-    let summary = if status.trim().is_empty() {
-        "No changes".to_string()
-    } else {
-        let lines: Vec<&str> = status.lines().collect();
-        format!("Git status: {} file(s) changed", lines.len())
-    };
-    let combined = format!("{}\n\n{}", status, diffstat);
-    dispatcher.record_output("diff", &summary, &combined);
-    
-    dispatcher.set_pending_workflow(WorkflowState {
-        kind: WorkflowKind::DiffPreview { file: None },
-        repo_root: root,
-    });
-    dispatcher.reply(format!(
-        "Status preview:\n{}\n\nDiff stat:\n{}\nReply with a file path to view its diff, press Enter (or type 'yes') to continue, or anything else to cancel.",
-        status, diffstat
-    ));
+    dispatcher.start_git_task(root, "Git status", vec!["status".into(), "--short".into(), "--branch".into()], GitContinuation::StatusSummary);
 }
 
 fn handle_find_todos_intent<D: IntentDispatcher>(dispatcher: &mut D) {
@@ -483,12 +397,11 @@ fn handle_find_todos_intent<D: IntentDispatcher>(dispatcher: &mut D) {
 
 fn handle_run_tests_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_info) = dispatcher.get_session_repo_info() {
-        if repo_info.project_type == ProjectType::Unknown {
-            dispatcher.reply("No test command is known for this project.");
-            return;
+        if let Some((program, args)) = repo_info.test_task() {
+            dispatcher.start_command_task("Tests", repo_info.root.clone(), program, &args);
+        } else {
+            dispatcher.reply("No test command is configured for this project. Check its test script/package manager, or run an explicit shell command.");
         }
-        let (program, args) = repo_info.test_command();
-        dispatcher.start_command_task("Tests", repo_info.root.clone(), program, &args);
     } else {
         dispatcher.reply("No project detected; cannot run tests.");
     }
@@ -841,23 +754,37 @@ fn extract_path_from_list_command(input: &str) -> Option<String> {
 
 fn handle_build_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_info) = dispatcher.get_session_repo_info() {
-        let (program, args) = repo_info.build_command();
-        let args_refs: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
-        
-        match run_tool_command(dispatcher, &repo_info.root, program, &args_refs) {
-            Ok(out) => dispatcher.reply(format!("{} {} output:\n{}", program, args.join(" "), out)),
-            Err(err) => dispatcher.reply(format!("{} {} failed: {}", program, args.join(" "), format_error(&err))),
+        if let Some((program, args)) = repo_info.build_task() {
+            dispatcher.start_command_task("Build", repo_info.root.clone(), program, &args);
+        } else {
+            dispatcher.reply("No build command is configured for this project. Check its build script/package manager, or run an explicit shell command.");
         }
     } else {
         dispatcher.reply("No project detected; cannot build.");
     }
 }
 
+fn handle_project_tasks<D: IntentDispatcher>(dispatcher: &mut D) {
+    let Some(info) = dispatcher.get_session_repo_info() else {
+        dispatcher.reply("No project detected. Use `cd <project>` to choose one.");
+        return;
+    };
+    let mut lines = vec![format!("Project tasks in {}:", info.root.display())];
+    for (action, task) in [("run tests", info.test_task()), ("build", info.build_task())] {
+        match task {
+            Some((program, args)) => lines.push(format!("• `{action}` → {program} {}", args.join(" "))),
+            None => lines.push(format!("• `{action}` — not configured (check scripts/package manager)")),
+        }
+    }
+    lines.push("Type an available action to start it. Ctrl+C cancels an active task.".to_string());
+    dispatcher.reply(lines.join("\n"));
+}
+
 fn handle_explain_project_intent<D: IntentDispatcher>(dispatcher: &mut D) {
     if let Some(repo_info) = dispatcher.get_session_repo_info() {
         let type_str = match repo_info.project_type {
             ProjectType::Rust => "Rust (Cargo)",
-            ProjectType::Node => "Node.js (npm)",
+            ProjectType::Node => "Node.js",
             ProjectType::Python => "Python",
             ProjectType::Go => "Go",
             ProjectType::Unknown => "Unknown",
@@ -909,8 +836,8 @@ MODES
         • Macro expansion for composable workflows
 
 KEY BINDINGS
-    Esc                 Exit (stops the active test task first)
-    Ctrl+C              Cancel active tests; exit when no test task is active
+    Esc                 Exit (stops the active command task first)
+    Ctrl+C              Cancel the active command task; exit when idle
     Ctrl+S              Toggle between Chat and Shell mode
     Tab                 Autocomplete (context-aware)
     Enter               Submit current input
@@ -920,9 +847,10 @@ KEY BINDINGS
 COMMON COMMANDS
 
   Git Workflows
-    save work           Stage all, commit with AI message, and push
+    save work           Review staging, commit locally, then ask before pushing
     push changes        Same as 'save work'
     status              Show git status and diff summary
+    diff <path>         Show a file's unstaged diff (no modal prompt)
     commit              Commit staged changes (without push)
     stage all           Stage all changes with git add
     draft commit        Generate commit message for staged changes
@@ -937,9 +865,10 @@ COMMON COMMANDS
 
   Project Commands
     cd <directory>      Change the session directory and re-detect the project
-    build               Build the project (cargo/npm/etc.)
+    tasks               Show detected test/build commands for this project
+    build               Stream the project's configured build command
     run tests           Stream project tests with elapsed time and exit status
-    cancel task         Stop the active test task (also Ctrl+C while running)
+    cancel task         Stop the active command task (also Ctrl+C while running)
     explain project     Show project type and structure
 
   Shell Commands
@@ -948,6 +877,8 @@ COMMON COMMANDS
     !!                  Repeat last shell command
     High-impact commands are shown and require explicit confirmation.
     Direct shell executions are recorded in .llm-cli/audit.jsonl by default.
+    Build, tests, shell, and Git tasks stream output without freezing input.
+    Cancellation stops work; it does not undo file changes or remote effects.
 
   Other
     show me around      Show contextual starter actions
@@ -1002,13 +933,14 @@ mod tests {
 
     use super::{dispatch_intent, handle_approved_shell_dispatch, handle_run_tests_intent, handle_shell_dispatch, AssistantEvent, IntentDispatcher};
     use crate::{
+        command_policy::CommandRisk,
         config::Config,
         intent::ParsedIntent,
         patch::AppliedPatch,
         repo::{ProjectType, RepoInfo},
         session::Role,
         tools::ToolArgs,
-        workflow::{WorkflowKind, WorkflowState},
+        workflow::{GitContinuation, WorkflowKind, WorkflowState},
     };
 
     #[test]
@@ -1043,6 +975,8 @@ mod tests {
         active_task: bool,
         repo_info: Option<RepoInfo>,
         tasks: Vec<(String, PathBuf, String, Vec<String>)>,
+        shell_tasks: Vec<(PathBuf, String, CommandRisk)>,
+        git_tasks: Vec<(PathBuf, String, Vec<String>, GitContinuation)>,
     }
 
     impl TestDispatcher {
@@ -1058,6 +992,8 @@ mod tests {
                 active_task: false,
                 repo_info: None,
                 tasks: Vec::new(),
+                shell_tasks: Vec::new(),
+                git_tasks: Vec::new(),
             }
         }
     }
@@ -1126,14 +1062,23 @@ mod tests {
         fn start_command_task(&mut self, label: &str, cwd: PathBuf, program: &str, args: &[&str]) {
             self.tasks.push((label.to_string(), cwd, program.to_string(), args.iter().map(|arg| arg.to_string()).collect()));
         }
+
+        fn start_shell_task(&mut self, cwd: PathBuf, command: &str, risk: CommandRisk) {
+            self.shell_tasks.push((cwd, command.to_string(), risk));
+        }
+
+        fn start_git_task(&mut self, cwd: PathBuf, label: &str, args: Vec<String>, continuation: GitContinuation) {
+            self.git_tasks.push((cwd, label.to_string(), args, continuation));
+        }
     }
 
     #[test]
     fn run_tests_dispatches_explicit_arguments_at_the_detected_project_root() {
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("package.json"), r#"{"scripts":{"test":"vitest"}}"#).unwrap();
         for (project_type, program, args) in [
             (ProjectType::Rust, "cargo", vec!["test"]),
-            (ProjectType::Node, "npm", vec!["test"]),
+            (ProjectType::Node, "npm", vec!["run", "test"]),
             (ProjectType::Python, "pytest", vec![]),
             (ProjectType::Go, "go", vec!["test", "./..."]),
         ] {
@@ -1169,19 +1114,77 @@ mod tests {
     }
 
     #[test]
+    fn build_and_task_discovery_use_real_node_scripts_and_manager() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("package.json"),
+            r#"{"packageManager":"pnpm@10.0.0","scripts":{"build":"vite build"}}"#).unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        dispatcher.repo_info = RepoInfo::detect(directory.path());
+        dispatch_intent(&mut dispatcher, &ParsedIntent::new("project_tasks", 1.0), "tasks");
+        let listing = dispatcher.replies.last().unwrap();
+        assert!(listing.contains("pnpm run build"));
+        assert!(listing.contains("`run tests` — not configured"));
+        assert!(dispatcher.tasks.is_empty());
+        dispatch_intent(&mut dispatcher, &ParsedIntent::new("build", 1.0), "build");
+        assert_eq!(dispatcher.tasks, vec![("Build".into(), directory.path().to_path_buf(), "pnpm".into(), vec!["run".into(), "build".into()])]);
+        dispatch_intent(&mut dispatcher, &ParsedIntent::new("run_tests", 1.0), "run tests");
+        assert_eq!(dispatcher.tasks.len(), 1);
+        assert!(dispatcher.replies.last().unwrap().contains("No test command"));
+    }
+
+    #[test]
+    fn unconfigured_build_does_not_run_a_placeholder_command() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("pyproject.toml"), "[project]\nname = 'sample'").unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        dispatcher.repo_info = RepoInfo::detect(directory.path());
+        dispatch_intent(&mut dispatcher, &ParsedIntent::new("build", 1.0), "build");
+        assert!(dispatcher.tasks.is_empty());
+        assert!(dispatcher.replies.last().unwrap().contains("No build command"));
+    }
+
+    #[test]
+    fn direct_diff_is_nonmodal_and_separates_paths_from_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        for path in ["--output=secret", "src/My File.rs", "中文/🦀.rs"] {
+            let intent = crate::intent::quick_match(&format!("diff {path}")).unwrap();
+            dispatch_intent(&mut dispatcher, &intent, "diff");
+            let (cwd, _, args, next) = dispatcher.git_tasks.last().unwrap();
+            assert_eq!(cwd, directory.path());
+            assert_eq!(args, &["diff", "--no-ext-diff", "--no-textconv", "--", path]);
+            assert_eq!(*next, GitContinuation::None);
+            assert!(dispatcher.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn shell_dispatch_enqueues_work_and_warns_for_bare_git_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
+        handle_shell_dispatch(&mut dispatcher, "printf example");
+        assert_eq!(dispatcher.shell_tasks.len(), 1);
+        assert_eq!(dispatcher.shell_tasks[0].0, directory.path());
+        assert_eq!(dispatcher.shell_tasks[0].1, "printf example");
+        handle_approved_shell_dispatch(&mut dispatcher, "git commit");
+        assert_eq!(dispatcher.shell_tasks.len(), 1);
+        assert!(dispatcher.replies.last().unwrap().contains("interactive"));
+    }
+
+    #[test]
     fn active_tests_block_all_command_entry_points_before_side_effects() {
         let directory = tempfile::tempdir().unwrap();
         let mut dispatcher = TestDispatcher::new(directory.path().to_path_buf());
         dispatcher.active_task = true;
-        for tool in ["shell", "stage", "commit", "save_work", "build", "write_file", "edit_file", "rollback_edit", "status", "shell_repeat"] {
+        for tool in ["shell", "stage", "commit", "save_work", "build", "run_tests", "show_diff", "write_file", "edit_file", "rollback_edit", "status", "shell_repeat"] {
             assert!(dispatch_intent(&mut dispatcher, &ParsedIntent::new(tool, 1.0), tool));
-            assert!(dispatcher.replies.last().unwrap().contains("Tests are still running"));
+            assert!(dispatcher.replies.last().unwrap().contains("A task is still running"));
             assert!(dispatcher.pending.is_none());
         }
         handle_shell_dispatch(&mut dispatcher, "printf should-not-run");
-        assert!(dispatcher.replies.last().unwrap().contains("Tests are still running"));
+        assert!(dispatcher.replies.last().unwrap().contains("A task is still running"));
         handle_approved_shell_dispatch(&mut dispatcher, "printf should-not-run");
-        assert!(dispatcher.replies.last().unwrap().contains("Tests are still running"));
+        assert!(dispatcher.replies.last().unwrap().contains("A task is still running"));
         assert!(!dispatch_intent(&mut dispatcher, &ParsedIntent::new("chat", 1.0), "question"));
         assert!(dispatch_intent(&mut dispatcher, &ParsedIntent::new("help", 1.0), "help"));
         assert!(dispatcher.replies.last().unwrap().contains("COMMON COMMANDS"));
