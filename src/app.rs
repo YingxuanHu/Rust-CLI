@@ -331,8 +331,12 @@ impl App {
         let Some(task) = self.active_task.take() else { return; };
         // Latest-only snapshots bound both memory and work per UI tick. Read
         // even after the sender closes so the final result cannot be lost.
+        // Check closure before reading: if the worker finishes between these
+        // operations, we must read its final value, not mistake an earlier
+        // running snapshot for a worker failure.
+        let worker_closed = task.handle.updates.has_changed().is_err();
         let mut snapshot = task.handle.updates.borrow().clone();
-        if snapshot.outcome.is_none() && task.handle.updates.has_changed().is_err() {
+        if snapshot.outcome.is_none() && worker_closed {
             snapshot.outcome = Some(TaskOutcome::Error(
                 "Task worker stopped unexpectedly; completion could not be confirmed.".to_string()
             ));
