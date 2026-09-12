@@ -13,6 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test before publishing a release
+        run: cargo test --locked
       - name: Require a tag matching the package version
         shell: bash
         run: |
@@ -48,6 +51,21 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Smoke-test Unix binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/${{ matrix.target }}/release/llm_cli --version
+          target/${{ matrix.target }}/release/llm_cli --help
+      - name: Smoke-test Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/llm_cli.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "target/${{ matrix.target }}/release/llm_cli.exe" --help
+          exit $LASTEXITCODE
       - name: Package Unix binary
         if: matrix.archive == 'tar.gz'
         shell: bash

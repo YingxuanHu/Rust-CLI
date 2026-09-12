@@ -9,7 +9,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -17,3 +22,17 @@ jobs:
         run: cargo check --locked
       - name: Run unit tests
         run: cargo test --locked
+      - name: Check generated Bash completion syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/debug/llm_cli completions bash | bash -n
+
+  minimum-rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Check the declared minimum Rust version
+        run: cargo check --locked
