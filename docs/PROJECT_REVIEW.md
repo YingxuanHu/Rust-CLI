@@ -2,26 +2,40 @@
 
 Reviewed 2026-09-12. Baseline: `3c26eda` (before this revision).
 
-## Follow-up: first background-task slice
+## Follow-up: execution, discovery, and failure evidence
 
-The next implementation migrates **`run tests`** to a dedicated async runner:
-explicit command arguments and immutable directory/task identity, live bounded
-stdout/stderr tails (64 KiB each), elapsed time, exit status, cancellation, and
-deadline coverage for both process exit and output pipes. Ctrl+C cancels without
-closing the assistant; Escape waits for bounded cleanup before exit. Unix
-process-group cleanup covers ordinary descendants, not deliberately detached
-processes; the Windows fallback stops only the direct child.
+Current source now runs **tests, builds, shell commands, and built-in Git
+commands** through a dedicated async runner: explicit command arguments,
+immutable directory/task identity, live bounded stdout/stderr tails (64 KiB
+each), elapsed time, exit status, cancellation, and deadline coverage for both
+process exit and output pipes. Ctrl+C cancels an active command without closing
+the assistant; with no command task it exits. Escape waits for bounded cleanup
+before exit. Unix process-group cleanup covers ordinary descendants, not
+deliberately detached processes; Windows currently stops only the direct child.
 
-Only one test task runs at a time. Other command workflows are held back while
-it runs, while help, directory switching, and Chat-mode questions stay available.
-Task results remain attached to their original message and directory; changing
-directories clears old output context. Exact `run tests` and help commands bypass
-model classification. Fake-process and UI-state regressions cover streaming,
-cancellation, output limits, failures, input handling, and project isolation.
+One command task runs at a time. Help, directory switching, and Chat-mode
+questions stay available. Task results remain attached to their original
+message and directory; changing directories clears old output context. Git
+status is nonmodal, `diff <path>` shows an unstaged path diff, and `save work`
+requires a separate confirmation to push after its local commit. Cancellation
+does not undo completed staging, commits, file changes, or remote side effects.
+Shell tasks close stdin and have no PTY. Interactive-command warnings are
+heuristic, not complete detection. `diff <path>` is relative to the detected Git
+root and retains Git pathspec semantics.
 
-This is the first slice of Phase 1, not its completion: Git/shell/build/file
-execution and runtime probes still need migration; project task detection,
-output-backed explanations, and model-chat cancellation remain next work.
+`tasks` now lists actual test/build commands from the nearest supported project.
+Node scripts must exist, with a supported local package-manager declaration
+or unambiguous local lockfile; npm is the fallback when neither exists. Ancestor
+workspace manager inheritance and Python environment detection are not inferred.
+Recorded output now reaches explanation prompts: up to five labeled head/tail
+excerpts, strict byte limits, untrusted-data framing, and project isolation.
+
+Fake-process, Git-fixture, UI-state, project-fixture, and prompt regressions cover
+these contracts. This is progress through Phases 1 and 2, not their completion.
+TODO search and file/patch work still contain synchronous operations. Readiness
+probes, independent cancellation of model chat/pending model preparation,
+searchable task selection, and durable rerun/recipe history remain unfinished.
+These improvements are in source; no claim is made that v0.1.0 includes them.
 
 ## Recommendation
 
@@ -39,8 +53,8 @@ functionality or demonstrated superiority.
 
 The first revision fixes correctness problems that would undermine that goal.
 It does not complete all work in this review. The largest remaining efficiency
-gaps are synchronous command execution, weak context, basic editing, and
-incomplete task discovery.
+gaps are remaining synchronous operations, basic editing, incomplete task
+discovery/reuse, and source context beyond bounded recent output.
 
 ## Current market comparison
 
@@ -68,14 +82,14 @@ cloud-only, or unable to support local models.
 | Install and ask a first question | Verified binary archives, source installer, guided model download | Release v0.1.0 lags current source; PATH/setup requires manual steps; model checks may stall | Publish a tested follow-up release, bounded readiness probes, choose from installed models |
 | Discover what is possible | Starter suggestions, help, ghost completion | Suggestions are prose; long help competes with conversation | Searchable task picker with short descriptions and prefilled inputs |
 | Ask a quick question | `ask`, streaming, JSON | Name/type context only; no explicit file or stdin attachment | Bounded stdin and `--file`, readable source attribution and useful errors |
-| Understand a repo | Manifest identity, structure, file view | No code index; manifest parsing is shallow | Nearest project detection; selected README/manifest/source context with exclusions |
-| Explain a test error or file | Recent-output tracking and reference words | Prompt uses summaries and omits stored output; conversation history is absent | Include bounded actual output and recent turns, scoped to project |
-| Run tests/build | Fixed recipes for Rust, Node, Python, Go | Synchronous execution; wrong manifest in nested mixed projects; hardcoded npm/pytest | Detect actual scripts/lockfiles/environments and stream task execution |
-| Check changes | Git status/diff summary | Status creates a modal file prompt; staged and unstaged views are incomplete | Nonmodal status plus selectable files and explicit staged/unstaged drill-down |
-| Save work | Stage, draft message, commit, optional combined push workflow | All-file staging is easy to choose; upstream/auth errors lack guided recovery | Selected-file plan, verification step, clear local save vs publish |
+| Understand a repo | Nearest-manifest identity, parsed Rust/Node names, file view | No code index or automatic source reading | Selected README/manifest/source context with exclusions and provenance |
+| Explain a test error or file | Bounded actual recent output with labels and failure-reference detection | Excerpts omit some text; no conversation history or verified diagnostic quality | Selected evidence, recent turns, and failure-specific follow-up actions |
+| Run tests/build | Background execution; `tasks` listing; local Node script/manager detection | No searchable picker, workspace-manager inheritance, or Python environment detection | Searchable actions, project overrides, and environment-aware commands |
+| Check changes | Background nonmodal status and unstaged summary; explicit `diff <path>` | Staged/unstaged selection and file discovery remain basic | Selectable files and explicit staged/unstaged drill-down |
+| Save work | Reviewed all-file staging/local commit, then separate push confirmation | No selected-file save plan; upstream/auth errors lack guided recovery | Selected-file plan, optional verification, and guided publish recovery |
 | Edit code | Checked single-file patch; last reviewed edit reversal | Whitespace paths problematic; preview can truncate; no verification loop | Full diff review, content preconditions, opt-in tests, retained rollback records |
 | Create/overwrite a file | Path-constrained text writes and confirmation | Preview is partial; no stale-content check or atomic replacement | Full preview and write precondition; atomic save |
-| Run shell commands | Shell mode, bang shortcuts, heuristic risk review | POSIX child shell, blocking execution, incomplete process-tree cleanup | One async executor with job identity, cancellation and output bounds |
+| Run shell commands | Background POSIX shell task with review, job identity, cancellation, output bounds | Noninteractive; risk/interactive-command detection heuristic; Windows cleanup limited | Clearer structured proposals, broader platform tests, better unsupported-input guidance |
 | Repeat a successful operation | Learned aliases/workflows, input history, frecency | Exact phrases, hidden files, no arguments/step schema; concurrent writes can race | Parameterized recipes with list/edit/run, preconditions and outcomes |
 | Inspect past activity | Direct-shell audit tail | Other workflow steps absent; redaction incomplete; entire log read for tail | Structured task history, redaction consistency, bounded tolerant log reader |
 | Work without a network | Local Ollama inference after models are installed | Local host is default, but remote endpoints are configurable; optional models add startup work | Clearly show active endpoint/model; offline task mode for deterministic actions |
@@ -89,10 +103,10 @@ not a claim that every branch was executed or all defects were found.
 | Area and source modules | Assessment |
 | --- | --- |
 | `main`, `bootstrap`, `config`, `ollama`, `diagnostics` | Useful guided setup and read-only doctor. Consolidate runtime probes, distinguish readiness from installation, expose effective config and scope. |
-| `app`, `ui`, `input`, `session`, `model_stream` | Background model work is a useful base. Typed events and shared streaming now protect response identity. A job manager, editor, bounded state, and reliable terminal teardown remain needed. |
+| `app`, `ui`, `input`, `session`, `model_stream`, `task_runner` | Typed model events and one active background command protect response identity. The runner streams bounded output and cancels ordinary Unix descendants. Independent model cancellation, broader terminal/editor handling, bounded session history, and Windows process-tree handling remain needed. |
 | `intent`, `fuzzy`, `keyword_classifier`, `llm_classifier`, `embedding`, `tools` | Layered routing is reasonable. Cache use and exact classification were faulty. Confidence scores are heuristics, not calibrated probabilities; broad paraphrases still need argument extraction and evaluation. |
 | `handlers`, `workflow`, `commands`, `command_policy`, `custom_command_generator` | Workflows encode useful chores but mix UI decisions, subprocess work, and persistence. Replace shell-string composition with typed steps. The custom-command generation function is dormant; its live placeholder expansion is distinct. |
-| `repo`, `chat`, `context` | Manifest identity and output summaries are not repository understanding or conversation memory. Implement evidence selection and nearest-manifest logic before larger agent features. |
+| `repo`, `chat`, `context` | Nearest-manifest selection, real Rust/Node name parsing, script/manager detection, and bounded actual output now work together. This is still not repository understanding or conversation memory; evidence selection and workspace/environment configuration remain needed. |
 | `file_ops`, `patch` | Confinement and checked diffs help prevent accidents. Remaining work includes race-resistant writes, complete previews, Git quoted-path handling and multi-file transactions. |
 | `learned`, `frecency`, `audit` | Useful local memory, but persistence needs atomic, ordered, recoverable writes and explicit retention/redaction behavior. |
 | `ask`, `completion`, `shell_completion` | Useful shell ergonomics. Streaming/JSON/path issues are fixed in this revision; completions now derive from Clap instead of duplicated command lists. Input editing and pipeline context remain incomplete. |
@@ -144,14 +158,34 @@ not a claim that every branch was executed or all defects were found.
    differences and limitations are explicit. CI includes macOS and an MSRV
    check, and future releases must pass tests plus binary smoke checks.
 
+8. **Extend visible command execution.** Tests, builds, shell, and built-in Git
+   commands share task identity, bounded output, timeout, cancellation, and
+   cleanup. Git continuations advance only after successful uncancelled results
+   in the originating directory. Status no longer opens a modal file prompt;
+   saving work commits locally before a separate explicit push choice.
+
+9. **Make detected tasks inspectable.** `tasks` lists commands without executing
+   them. Nearest supported manifests beat distant projects of another language.
+   Node requires actual scripts and selects a supported declared manager before
+   unambiguous local lockfiles. Missing/ambiguous tasks report unavailable rather
+   than succeeding through an `echo` placeholder.
+
+10. **Explain captured evidence.** Session output uses 2,000-byte head/tail
+    captures. Prompt context includes actual content from at most five outputs
+    within 8 KiB total, with capped metadata and untrusted-data framing. Prompt
+    budgeting reuses unused metadata space, and whole-word reference matching
+    avoids false matches such as `it` inside `git`. Context clears on directory
+    change; model diagnostic quality still requires separate evaluation.
+
 ## Remaining engineering priorities
 
 | Priority | Concrete issue and source | Required outcome |
 | --- | --- | --- |
-| P1 | Synchronous execution from `handlers.rs`, `app.rs`, `workflow.rs`; unbounded probes in `ollama.rs` | Input/rendering stay responsive during slow tools and unavailable runtimes; timeouts cover the entire operation |
-| P1 | `commands.rs` kills a parent but joins readers that descendants can keep open; captures unbounded output | Cancel the process tree and bound/timebox capture, tested with inherited pipes and large output |
-| P1 | `context.rs` omits `RecentOutput.content`; `chat.rs` has no history; project changes retain old context | Answers use the actual selected evidence and never silently reuse another project's output |
-| P1 | `repo.rs` searches all ancestors for Cargo before nearer Node manifests | Nearest applicable project and correct task runner selected in mixed monorepos |
+| P1 | Remaining synchronous TODO search/file/patch execution; unbounded readiness probes in `ollama.rs` | Input/rendering stay responsive during every slow operation; timeouts cover preparation as well as child execution |
+| P1 | Legacy synchronous helper in `commands.rs` still kills a parent, joins potentially inherited pipes, and captures unbounded output | Finish migrating remaining callers or replace the helper with end-to-end bounded execution |
+| P1 | Model chat and pending commit/patch/model-backed command preparation have no independent cancellation | Cancel the intended request without quitting, stale completion, or accidental workflow continuation |
+| P1 | `repo.rs` does not infer workspace membership/ancestor manager or Python environments | Correct task selection for nested workspaces and configured environments, with inspectable overrides |
+| P2 | Output context is bounded recent evidence, not conversation memory or explicit source selection | Select relevant evidence with provenance and intentional retention instead of silently implying full repository knowledge |
 | P1 | `audit.rs` redaction misses forms such as quoted multiword values; raw input history retains secrets | Consistent redaction/retention policy across audit and history; do not promise secret-free logs |
 | P2 | `frecency.rs` unordered snapshot writes and `app.rs` history replacement | Concurrent sessions preserve newer data; atomic writes and recoverable corruption |
 | P2 | `ui.rs` raw-mode construction failure, character/cell-width mismatch; minimal editing in `app.rs` | Restored terminal on all exits, cursor editing, paste, horizontal scrolling and wide-character tests |
@@ -163,11 +197,15 @@ not a claim that every branch was executed or all defects were found.
 
 ### Phase 1 — Reliable task execution
 
-Introduce `TaskId`, immutable cwd/config context, typed command arguments,
-streamed stdout/stderr, exit status, elapsed time, and cancellation in one
-executor used by every tool. Keep workflow transitions separate from rendering
-and process management. Lazy-load optional embeddings after the first usable
-screen. Complete the P1 timeout/output/context issues above.
+Completed for test/build/shell/built-in Git commands: `TaskId`, immutable command
+cwd, explicit arguments, streamed stdout/stderr, status, elapsed time, and
+cancellation. Git workflow continuations are separate from the worker and
+publication requires its own confirmation.
+
+Remaining: migrate TODO/file/patch work, bound readiness probes, support model
+request/preparation cancellation, and lazy-load optional embeddings after the
+first usable screen. Finish the remaining timeout/output issues above before
+calling every tool responsive.
 
 Acceptance: a slow test suite leaves input usable; cancellation ends child
 processes; a disconnected model never leaves a permanent spinner; concurrent
@@ -176,10 +214,14 @@ never broadens. Test with fake processes and real temporary repositories.
 
 ### Phase 2 — Finish a task with fewer steps
 
-Add a task picker populated from the nearest manifest, package-manager lockfile,
-and project overrides. Start with test, lint, build, inspect changes and local
-save. Show the actual command before execution. Include output-backed
-`explain this failure`, `rerun`, and a bounded `ask --file`/stdin workflow.
+Completed first slice: nearest-manifest detection, local Node manager/script
+selection, a read-only `tasks` list, actual commands in task entries, nonmodal
+Git status, and output-backed failure explanations.
+
+Next: a searchable task picker with project overrides, lint and verification
+actions, environment/workspace awareness, explicit `rerun`, and bounded
+`ask --file`/stdin inputs. The current task list is not yet that picker, and
+failure explanations do not automatically fix or retry a command.
 
 Acceptance: a new user runs the correct task without knowing Cargo/npm/pnpm/uv
 syntax; an explanation quotes the captured error and identifies its source;

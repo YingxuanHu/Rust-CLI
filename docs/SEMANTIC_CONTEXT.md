@@ -1,114 +1,79 @@
-# Semantic Context Extension
+# Recent Output and Failure Explanations
 
-## Overview
+Interactive chat can use actual recorded output when you refer to a recent
+task. This describes current source, not the older v0.1.0 release.
 
-Enables natural reference resolution in conversation. After running a command like "show status", you can say "commit it" and the system understands "it" refers to the diff.
+## Use it
 
-**Approach**: Cursor-style - application tracks recent outputs and injects context into LLM prompts when references are detected.
+After `run tests`, `build`, a shell command, or a Git command finishes, ask:
 
-## Architecture
-
-```
-User: "show status"
-  ↓
-Handler executes → Records output to session.recent_outputs
-  ↓
-Shows result to user
-
-User: "commit it"
-  ↓
-Detects reference word ("it") → Injects recent context into LLM prompt
-  ↓
-LLM receives: "[Recent context] 1. [diff] Git status: 3 files changed"
-  ↓
-LLM understands reference and responds appropriately
+```text
+why did tests fail?
+explain the failure
+last build error
+explain the output
 ```
 
-## Key Components
+The prompt includes labeled recent output excerpts, such as the task's kind,
+result/directory summary, and captured diagnostics. A recorded file view or
+TODO search can also supply evidence. The model's explanation remains a
+generated answer, not a verified diagnosis or an automatic fix.
 
-### 1. Context Tracking (`src/context.rs`)
+## What is retained?
 
-- **`RecentOutput`**: Stores output type ("diff", "file", "command", etc.), summary, and a truncated content copy for future expansion
-- **`contains_reference()`**: Detects reference words ("it", "that", "the diff", etc.)
-- **`format_context_for_prompt()`**: Formats recent-output summaries for LLM injection
+- Session state keeps at most five outputs, newest first.
+- Each stored output body has a strict 2,000-byte limit, including its
+  truncation marker. Long captures preserve the opening and final sections;
+  the middle may be omitted. UTF-8 characters are not split.
+- Background tasks prepare a smaller, at-most-1,000-byte record containing
+  their outcome and independently shortened stdout/stderr. Both streams' final
+  diagnostics can survive the five-entry prompt budget instead of one noisy
+  stream hiding the other's error.
+- Prompt formatting uses at most 8 KiB total, including labels, summaries,
+  content, and markers. Oversized summaries cannot consume the whole budget.
+- Recorded text is framed as untrusted data for the model to use as evidence,
+  not as instructions. This framing is not a security sandbox or a guarantee
+  that a model cannot be influenced by malicious content.
+- Changing the session directory clears recent-output context. Results from
+  an older directory remain attached to their original task entry, but do not
+  become evidence for the new directory's requests.
 
-### 2. Session State (`src/session.rs`)
+The live task display has a separate retention limit: the latest 64 KiB per
+stdout/stderr stream. The model receives the smaller excerpt, not the full task
+entry. Consult the displayed output or run a narrower command when an omitted
+section matters. Captured output may contain sensitive text; model requests use
+the configured Ollama endpoint, which can be remote if you configured it so.
 
-- **`recent_outputs`**: VecDeque maintaining last 5 outputs (max 2000 chars each)
-- **`record_output()`**: Adds new output to the queue, auto-truncates old ones
+## When is context added?
 
-### 3. Handlers (`src/handlers.rs`)
+`context::contains_reference` recognizes complete words/phrases such as `it`,
+`that`, `the diff`, and `the output`, plus task-failure questions and requests
+to explain output. `it` no longer matches substrings in words such as `git` or
+`iteration`. This is heuristic reference detection, not a semantic selector;
+up to five recent outputs are supplied rather than one proven-relevant result.
 
-Each handler records relevant outputs:
-- **status** → "diff" (git status + diff stat)
-- **show_file** → "file" (file path + line count)
-- **shell** → "command" (command + output)
-- **find_todos** → "todos" (count + list)
-- **draft_commit** → "commit_msg" (generated message)
+`chat::compose_prompt` caps system and project metadata, preserves the current
+request before older evidence, and gives remaining space to recent context.
+The overall `max_context_tokens` setting is an approximate character-based
+budget, not an exact count from the chosen model's tokenizer. Smaller budgets
+or very long user requests can truncate or omit recent evidence.
 
-### 4. App Integration (`src/app.rs`)
+## What this does not do
 
-Before calling LLM in `submit_input()`:
-```rust
-let context_injection = if context::contains_reference(&prompt) {
-    context::format_context_for_prompt(&session.recent_outputs)
-} else {
-    String::new()
-};
-```
+Recent-output context is session-only. It is not conversation history, a source
+index, a durable task log, or cross-project memory. It does not resolve ambiguous
+filenames into permission to modify them: use `stage src/main.rs`, not `stage it`,
+when you intend to stage one path. It does not automatically rerun or repair
+a command. `ask` does not share the interactive session's output context.
 
-## Reference Words
+Clear explanation questions bypass action aliases and classifiers, so asking
+`why did tests fail?` cannot be routed to `run tests` or `build`. The explanation
+still needs the configured chat model; this is not an offline diagnostic engine.
 
-- Pronouns: `it`, `that`, `this`, `them`, `those`
-- Explicit: `the diff`, `the changes`, `the file`, `the output`, `the status`, `the result`, `the command`, `the message`
+## Regression coverage
 
-## Example Workflows
-
-### Workflow 1: Commit after status
-```
-> show status
-[Shows git diff]
-Context stored: [diff] Git status: 3 files changed
-
-> commit it
-Reference detected → Context injected
-LLM understands: commit the shown diff
-```
-
-### Workflow 2: Multiple outputs
-```
-> show file src/main.rs
-Context: [file] src/main.rs (150 lines)
-
-> show status
-Context: [file] src/main.rs, [diff] Git status: 2 files changed
-
-> commit the changes
-Reference detected → Both contexts available
-LLM prioritizes: "changes" → diff output
-```
-
-### Workflow 3: Shell command reference
-```
-> $ cargo test
-Context: [command] Ran: cargo test (success)
-
-> run it again
-Reference detected → Context shows last command
-LLM can suggest: cargo test
-```
-
-## Implementation Notes
-
-- **Session-only**: Context cleared on exit (not persisted)
-- **Max 5 outputs**: Oldest automatically removed
-- **Max 2000 bytes**: Long stored outputs are truncated with "[truncated]"; prompts currently receive summaries rather than full output text
-- **No extra LLM calls**: Main LLM handles disambiguation
-- **Fast**: Simple string matching + concatenation
-
-## Performance
-
-- Reference detection: O(1) - simple string contains check
-- Context formatting: O(n) where n ≤ 5 recent outputs
-- No blocking operations - all synchronous
-- Minimal memory overhead (~10KB for 5 outputs)
+Tests cover actual failure details reaching a default-budget prompt, all five
+newest outputs, directory isolation, head/tail retention, whole-word reference
+matching, empty captures, oversized metadata, and mixed-Unicode byte limits.
+These tests establish prompt construction and capture behavior, not live-model
+diagnostic accuracy.

@@ -23,7 +23,7 @@ llm_cli
 Install and open [Ollama](https://ollama.com) if it is not already available.
 The first launch checks the configured chat model and asks before downloading
 it. Run from the project you want to work on. Type `show me around` for starter
-actions. Esc exits; Ctrl+C cancels an active test task, or exits when none is running.
+actions. Esc exits; Ctrl+C cancels an active command task, or exits when none is running.
 
 Windows archives and platform details are in the
 [installation guide](docs/INSTALL.md). Binary releases can lag behind `main`:
@@ -42,12 +42,16 @@ Enter these in the interactive assistant:
 | What you need | What to type | What happens |
 | --- | --- | --- |
 | Get oriented | `show me around` | Suggestions based on the detected project |
+| Discover project commands | `tasks` | Show available test/build actions and their actual commands |
 | Understand the project | `project info` | Manifest-derived project information |
-| Inspect changes | `what changed` | Git status and a diff summary |
+| Inspect changes | `what changed` | Git status and an unstaged diff summary; no modal prompt |
+| Inspect one file's changes | `diff src/main.rs` | Stream its unstaged diff; use a repository-relative Git pathspec |
 | Check the project | `run tests` | Live test output, elapsed time, and pass/fail status |
+| Build the project | `build` | Stream the detected build command, when configured |
+| Understand a failed task | `why did tests fail?` | Ask the model using bounded recent output excerpts |
 | Prepare one file | `stage src/main.rs` | Review and stage the named path |
 | Commit staged work locally | `commit` or `save locally` | Review a message and commit; no push |
-| Stage, commit, and push | `save work` | Review the combined Git workflow |
+| Stage all and prepare publication | `save work` | Review all-file staging and a local commit; push only after a separate `yes` |
 | Read a file | `show src/main.rs` | Display that file |
 | Propose a small edit | `edit src/main.rs: describe the change` | Review a checked single-file diff |
 | Reverse that edit | `rollback last edit` | Check and reverse the latest reviewed patch |
@@ -58,13 +62,32 @@ learned workflows. Tab accepts ghost text; Up/Down recalls inputs. Ctrl+S
 switches between Chat and Shell modes. `cd path/to/project` changes the session
 directory. `help` lists available actions.
 
-`run tests` keeps the interface responsive and shows the command and its working
-directory. Press Ctrl+C or type `cancel task` to stop it without exiting. Output
-retains the latest 64 KiB from each of stdout and stderr, with a truncation
-notice when needed. Tests use `cmd_timeout_secs` (60 seconds by default); increase
-it in your configuration for longer suites. You can ask questions in Chat mode,
-use help, or change directories while tests run; other command workflows wait
-until the task finishes. Running `run tests` again uses the current project.
+Tests, builds, shell commands, and built-in Git commands run in the background,
+showing the command, working directory, live output, elapsed time, and result.
+Press Ctrl+C or type `cancel task` to stop the active command without exiting.
+**Cancellation does not undo completed side effects:** staged files, a local
+commit, or changes already sent to a remote may remain. Inspect the result before
+retrying. Esc exits after bounded command cleanup.
+
+One command task runs at a time. You can ask questions in Chat mode, use help,
+or change directories while it runs. Other commands are not queued; enter them
+after the active task finishes. Output retains the
+latest 64 KiB from each of stdout and stderr, with a truncation notice when
+needed. Tasks use `cmd_timeout_secs` (60 seconds by default); increase it for
+longer suites/builds. Shell tasks close stdin and do not provide a PTY. Warnings
+catch some interactive commands, not every editor or prompt; run those commands
+in your normal terminal.
+
+`tasks` detects the nearest supported manifest. Node test/build scripts must
+exist; the project’s declared package manager or unambiguous local lockfile
+selects npm, pnpm, Yarn, or Bun. See [project detection](docs/REPO_AWARENESS.md)
+for defaults, unsupported tasks, and workspace limitations.
+
+After a task finishes, try `explain the failure` or `explain the output`.
+Interactive chat includes bounded, labeled excerpts from up to five recent
+outputs. Long captures preserve their opening and final diagnostics; omitted
+text is marked. Changing directories clears this context. This is not full
+conversation memory or an automatic repair/retry action.
 
 For one answer in the current terminal (current source):
 
@@ -110,12 +133,12 @@ ancestor discovery and user-wide defaults are planned.
   or a full repository understanding system.
 - Reviewed edits cover one existing file. There is no automatic test-and-repair
   loop or durable multi-file rollback.
-- Tests now stream in the background with cancellation. Git, shell, build,
-  and file workflows still need migration to the background runner. Model-chat
-  cancellation remains planned.
-- Test cancellation stops the process group on macOS/Linux; processes that
+- Tests, builds, shell, and built-in Git commands use the background runner.
+  TODO searches and file/patch operations still have synchronous work. Model-chat
+  and pending model-preparation cancellation remain planned.
+- Command cancellation stops the process group on macOS/Linux; processes that
   deliberately leave that group are not covered. Windows currently stops only
-  the direct test process, not its descendants.
+  the direct command process, not its descendants.
 - Command-risk checks are heuristic, not a sandbox. Review the displayed
   command. The audit log covers direct shell execution, not every workflow step.
 - Input history can contain the text you entered, including shell arguments.

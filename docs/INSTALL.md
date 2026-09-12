@@ -53,12 +53,20 @@ downloads; run `llm_cli init` first if setup is incomplete.
 `ask` is read-only and does not execute natural-language requests as commands
 or workflows.
 
-In the interactive assistant, `run tests` shows live output and keeps input
-available. Ctrl+C (or `cancel task`) stops that test task without exiting. Esc
-exits after bounded task cleanup. Test tasks use `cmd_timeout_secs`, defaulting
-to 60 seconds; set a larger value in `.llm-cli/config.toml` for longer suites.
-These background-test controls require current source until a newer release
-is published. Git, shell, build, and file commands have not yet been migrated.
+In the interactive assistant, `tasks` lists the detected test/build commands.
+Tests, builds, shell commands, and built-in Git commands show live output while
+keeping input available. Ctrl+C (or `cancel task`) stops the active command
+without exiting; when no command task is active, Ctrl+C exits. Esc exits after
+bounded cleanup. Cancellation does not undo completed file, Git, or remote
+changes. Tasks use `cmd_timeout_secs`, defaulting to 60 seconds; set a larger
+value in `.llm-cli/config.toml` for longer work.
+
+Shell tasks have closed stdin and no PTY. Detection of interactive commands is
+heuristic; use a normal terminal for commands that need prompts or editors.
+
+These controls require current source until a newer release is published.
+TODO searches and file/patch operations still have synchronous work. Pending
+model preparation and model chat do not yet have independent cancellation.
 
 ## Binary release install (no Cargo required)
 

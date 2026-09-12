@@ -1,139 +1,82 @@
-# Repo Awareness Implementation
+# Project Detection and Tasks
 
-This document describes the repo awareness feature that has been implemented in the LLM CLI.
+This guide describes current source. Release v0.1.0 predates the current task
+discovery and background execution improvements.
 
-## Overview
+## Start with `tasks`
 
-The CLI now automatically detects the project type and provides context-aware commands and responses. This makes the assistant more intelligent about the codebase it's working with.
+Run `llm_cli` inside your project and type `tasks`. The assistant lists the
+detected root and available test/build commands without executing them. Type
+`run tests` or `build` to start an available action. `project info` shows the
+project type, name when available, root, and conventional source directories.
 
-## Features Implemented
+Commands run in the detected project root, which may differ from your current
+subdirectory. The task entry displays the actual command and working directory.
+No package manager or test runner is installed automatically by these actions.
 
-### 1. Project Type Detection
+## Which project is selected?
 
-The CLI automatically detects the following project types:
+Detection checks each directory for supported manifests before moving to its
+parent. A nested Node frontend therefore wins over a more distant Rust
+workspace. When multiple supported manifests occupy the same directory, the
+tie-break order is Rust, Node, Python, then Go.
 
-- **Rust** (detects `Cargo.toml`)
-- **Node.js** (detects `package.json`)
-- **Python** (detects `pyproject.toml` or `setup.py`)
-- **Go** (detects `go.mod`)
+| Project | Manifest | Test task | Build task |
+| --- | --- | --- | --- |
+| Rust | `Cargo.toml` | `cargo test` | `cargo build` |
+| Node | `package.json` | `<manager> run test`, if the script exists | `<manager> run build`, if the script exists |
+| Python | `pyproject.toml` or `setup.py` | `pytest` | Not configured |
+| Go | `go.mod` | `go test ./...` | `go build` |
+| Unrecognized | No supported manifest | Not configured | Not configured |
 
-Detection happens:
-- On startup
-- When using the CLI's `cd <directory>` command
+Project names are parsed from Cargo's `[package].name` or the top-level JSON
+`name`, not guessed from arbitrary matching lines. A malformed manifest can
+still identify a project type, but does not produce an invented name. Invalid
+Node JSON cannot supply a runnable script.
 
-### 2. Context-Aware Commands
+Project metadata refreshes on an in-app `cd`. Node task selection rereads the
+package manifest and lockfiles, so changing scripts does not require restarting
+the assistant. Git-root detection is separate from project-manifest detection.
 
-#### `run tests` / `test`
-Automatically uses the right test command based on project type:
-- Rust: `cargo test`
-- Node.js: `npm test`
-- Python: `pytest`
-- Go: `go test ./...`
+## Node package-manager rules
 
-#### `build` (NEW)
-Builds the project using the appropriate build system:
-- Rust: `cargo build`
-- Node.js: `npm run build`
-- Go: `go build`
+Only nonempty string values in `scripts.test` and `scripts.build` produce tasks.
+The assistant does not invent test/build scripts or use Bun's built-in test
+runner in place of the declared script.
 
-#### `explain project` / `project info` (NEW)
-Shows information about the current project:
-- Project name
-- Project type
-- Root directory
-- Source directories
+Selection uses the detected project's own directory:
 
-### 3. LLM Context Enhancement
+1. A supported `packageManager` declaration such as `pnpm@9.15.0` selects npm,
+   pnpm, Yarn, or Bun and takes precedence over lockfiles.
+2. Otherwise, an unambiguous lockfile selects the manager: `pnpm-lock.yaml`,
+   `yarn.lock`, `bun.lock`/`bun.lockb`, or
+   `package-lock.json`/`npm-shrinkwrap.json`.
+3. Without a declaration or lockfile, npm is the default.
 
-The LLM now receives project context in its prompts:
-```
-Current project: llm_cli (Rust)
-```
+Conflicting manager lockfiles, malformed declarations, and unsupported declared
+managers leave the task unconfigured instead of silently choosing another tool.
+Multiple lockfiles belonging to the same manager are not considered a conflict.
+The declaration selects a command name; the assistant does not install or pin
+that manager's version.
 
-This helps the assistant give more relevant answers. For example, if you ask "how do I run tests?", it knows you're in a Rust project and will suggest `cargo test`.
+**Workspace boundary:** an ancestor workspace's manager or lockfile is not
+inferred for a nested package. Declare its manager locally or run an explicit
+command when necessary. Workspace membership, project overrides, Python virtual
+environment/uv detection, and additional task types such as lint are future work.
 
-### 4. Diff-Based Workflow (Infrastructure)
+## Execution and limitations
 
-Added support for proposing code changes as diffs:
-- `ApplyDiff` workflow type added to `workflow.rs`
-- Supports preview, accept, and reject flow
-- Can be extended in the future for LLM-driven code suggestions
+Tests and builds stream bounded stdout/stderr with elapsed time and an exit
+result. Ctrl+C or `cancel task` cancels the active command; Esc exits after
+bounded cleanup. Only one command task runs at a time. Cancellation does not
+undo completed changes. Child stdin is closed and no PTY is provided. Warnings
+catch some interactive commands, not every editor or prompt; use your normal
+terminal for commands requiring input.
 
-## Implementation Details
+Manifest identity is not a repository source index. The assistant does not
+automatically read README files, inspect every script's behavior, or verify
+that dependencies are installed. `tasks` is a read-only listing, not yet a
+searchable picker. Run tasks only in projects whose code you intend to execute.
 
-### New Module: `src/repo.rs`
-
-Contains:
-- `ProjectType` enum (Rust, Node, Python, Go, Unknown)
-- `RepoInfo` struct with project metadata
-- Detection logic that walks up directory tree
-- Simple manifest parsing (Cargo.toml, package.json)
-- Project-specific command builders
-
-### Modified Files
-
-1. **`src/session.rs`**
-   - Added `repo_info: Option<RepoInfo>` field
-   - Refreshes project metadata after the in-app `cd` command
-
-2. **`src/handlers.rs`**
-   - Added `get_session_repo_info()` to `IntentDispatcher` trait
-   - Updated `handle_run_tests_intent()` to use project-specific commands
-   - Added `handle_build_intent()` for building projects
-   - Added `handle_explain_project_intent()` for project info
-
-3. **`src/tools.rs`**
-   - Added "build" tool with examples
-   - Added "explain_project" tool with examples
-
-4. **`src/workflow.rs`**
-   - Added `ApplyDiff` workflow variant
-   - Added handler for diff acceptance/rejection
-
-5. **`src/app.rs`**
-   - Implemented `get_session_repo_info()` method
-   - Enhanced LLM prompts with project context
-
-## Usage Examples
-
-```bash
-# The CLI automatically detects your project
-$ ./llm_cli
-
-# In a Rust project:
-> run tests
-cargo test output:
-...
-
-# In a Node.js project:
-> run tests
-npm test output:
-...
-
-# Get project info:
-> explain project
-Project: my-app
-Type: Node.js (npm)
-Root: /home/user/my-app
-Source dirs: /home/user/my-app/src, /home/user/my-app/lib
-
-# Build the project:
-> build
-cargo build output:
-...
-```
-
-## Design Principles
-
-- **Minimal overhead**: Simple parsing, no heavy dependencies
-- **Thin implementation**: Straightforward code, easy to maintain
-- **Graceful degradation**: Works even without project detection
-- **Extensible**: Easy to add new project types
-
-## Future Enhancements
-
-The infrastructure is in place for:
-- LLM-driven code fix proposals using the ApplyDiff workflow
-- More sophisticated project structure analysis
-- Integration with language servers for deeper code understanding
-- Support for additional project types (Java, Ruby, etc.)
+See [quick start](QUICKSTART.md) for daily workflows and
+[recent-output context](SEMANTIC_CONTEXT.md) for failure explanations.

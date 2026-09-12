@@ -6,13 +6,17 @@ probability model.
 
 ## Routing order
 
-1. Explicit syntax: shell prefixes, `edit path: instruction`, rollback and
-   starter-guide phrases have direct handling in `intent::quick_match`.
-2. Learned aliases, exact tool names, exact examples, then FZF subsequence
+1. Explicit syntax: shell prefixes, `edit path: instruction`, rollback,
+   `tasks`, test/build actions, explicit `diff path`, and starter-guide phrases
+   have direct handling before model classification.
+2. Clear output-explanation questions (such as `why did tests fail?`) and
+   supported last-result references resolve to chat, before any action alias
+   or classifier can interpret them as another command run.
+3. Learned aliases, exact tool names, exact examples, then FZF subsequence
    matching in `fuzzy.rs`.
-3. Keyword/embedding scoring in `keyword_classifier.rs` when the cache is ready.
-4. A small Ollama model classifies into an exact catalog tool name or `chat`.
-5. Unrecognized requests fall through to chat.
+4. Keyword/embedding scoring in `keyword_classifier.rs` when the cache is ready.
+5. A small Ollama model classifies into an exact catalog tool name or `chat`.
+6. Unrecognized requests fall through to chat.
 
 Arguments are extracted from supported forms and then validated. Classification
 does not currently supply a general structured argument schema. For staging,
@@ -23,7 +27,8 @@ staged-only `commit`, not the combined stage/commit/push workflow.
 ## Exact and fuzzy matching
 
 The catalog in `src/tools.rs` supplies examples and metadata. Learned aliases
-have highest precedence. Exact names/examples take priority over fuzzy matching.
+have highest precedence within this tier, after explicit syntax and the
+explanation guard. Exact names/examples take priority over fuzzy matching.
 FZF matches ordered subsequences; it is not a general spellchecker and cannot
 be assumed to handle every transposition. `staus` is a tested match for `status`.
 
@@ -80,5 +85,6 @@ reproducible benchmark in this repository and are not product guarantees.
 Measure p50/p95 and incorrect-action rates on a published corpus, recording
 hardware and warm/cold model state, before making comparative speed claims.
 
-The planned next step is structured task discovery and explicit arguments,
-followed by reusable verified recipes. See [the project review](PROJECT_REVIEW.md).
+The `tasks` command now exposes detected test/build commands without executing
+them. A searchable picker, richer task schemas/overrides, and reusable verified
+recipes remain planned. See [the project review](PROJECT_REVIEW.md).
